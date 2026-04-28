@@ -228,6 +228,14 @@ async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/failures` — last 10 failures with a per-phase breakdown.
+
+    Phase 2 (Decision C) added a `phase` field on every failure row:
+      - "capture"    → fetch / parse / process error (Phase 1 surfaces these
+                       inline already; this command shows the history)
+      - "enrichment" → Haiku call failed after retries (silent at capture
+                       time per Decision C, surfaces here)
+    """
     if not _is_allowed(update.effective_user) or update.effective_chat is None:
         return
     client: CaptureClient = context.bot_data["capture_client"]
@@ -235,12 +243,29 @@ async def cmd_failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         resp = await client._client.get(settings.backend_capture_url.replace("/capture", "/failures"))
         body = resp.json()
         recent = body.get("recent", [])
+        total = body.get("total", 0)
+        by_phase: dict[str, int] = body.get("by_phase") or {}
+
         if not recent:
             await update.effective_chat.send_message("✅ No recent failures.")
             return
-        lines = [f"⚠️ Last {len(recent)} failures (of {body.get('total', 0)} total):"]
+
+        # Header: "⚠️ 8 failures (3 capture, 5 enrichment) — last 10:"
+        if by_phase:
+            breakdown = ", ".join(
+                f"{n} {phase}" for phase, n in sorted(by_phase.items())
+            )
+            header = f"⚠️ {total} failures ({breakdown}) — last {len(recent)}:"
+        else:
+            header = f"⚠️ Last {len(recent)} failures (of {total} total):"
+
+        lines = [header]
         for r in recent[-10:]:
-            lines.append(f"• {r.get('timestamp','')} [{r.get('source','?')}] {r.get('reason','?')[:80]}")
+            phase = r.get("phase", "capture")
+            tag = "[enrich]" if phase == "enrichment" else f"[{r.get('source','?')}]"
+            lines.append(
+                f"• {r.get('timestamp','')} {tag} {r.get('reason','?')[:80]}"
+            )
         await update.effective_chat.send_message("\n".join(lines))
     except Exception as e:  # noqa: BLE001
         await update.effective_chat.send_message(f"⚠️ Couldn't reach backend: {e}")

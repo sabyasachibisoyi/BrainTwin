@@ -138,7 +138,7 @@
   <!-- LAYER 2: PROCESSING -->
   <div class="layer processing">
     <span class="layer-label">Phase 2</span>
-    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status proposed">Partial</span></h2>
+    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status built">Built (Phase 2 — awaiting smoke test)</span></h2>
     <div class="pipeline">
       <div class="step">
         <div class="step-icon">📄</div>
@@ -161,21 +161,21 @@
       <div class="step">
         <div class="step-icon">🧠</div>
         <div class="step-name">Enrich</div>
-        <div class="step-tech">Claude Haiku</div>
+        <div class="step-tech">Claude Haiku (async)</div>
       </div>
       <div class="pipe-arrow">→</div>
       <div class="step">
         <div class="step-icon">🔢</div>
         <div class="step-name">Embed</div>
-        <div class="step-tech">sentence-transformers</div>
+        <div class="step-tech">Phase 3 — sentence-transformers</div>
       </div>
     </div>
     <div style="margin-top: 16px;">
       <div class="cards">
         <div class="card">
           <h3>🏷️ LLM Enrichment Output</h3>
-          <p>Every piece of content gets: a 2-3 sentence summary, extracted entities (people, places, events), key facts & claims, topic tags, and connection mapping to broader themes.</p>
-          <div class="tech"><span>Claude Haiku</span><span>~$0.001/capture</span></div>
+          <p>Every successfully captured row gets a 4-field block: a 1–2 sentence <code>summary</code>, <code>entities</code> (person / org / place / event, transliterated to Latin script), <code>key_facts</code> (atomic claims with numbers, dates, names), and <code>topics</code> (3–5 lowercase hyphenated tags). Persisted as a sidecar <code>data/enrichments.jsonl</code>, joined to <code>captures.jsonl</code> by <code>capture_id</code>. Runs async via FastAPI BackgroundTasks — <code>/capture</code> never waits on Haiku. Failures log to <code>capture_failures.jsonl</code> with <code>phase: "enrichment"</code> and surface in <code>/failures</code>.</p>
+          <div class="tech"><span>Claude Haiku</span><span>~$0.003/capture</span><span>4-field schema</span><span>async BackgroundTasks</span></div>
         </div>
       </div>
     </div>

@@ -168,38 +168,46 @@ Custom parsers per platform  →  extract structured data from DOM
 
 #### B. LLM Enrichment
 
-Every piece of captured content goes through an enrichment step:
+> **Built in Phase 2.** See [phase2-design.md](phase2-design.md) for locked decisions and [phase2-smoke-test.md](phase2-smoke-test.md) for verification steps.
+
+Every successfully captured row goes through an async enrichment step (FastAPI BackgroundTasks → `enrichment_worker.enqueue_enrichment`). The schema dropped `connections` from the original sketch — it only means something once Phase 3 has other captures to point at, so it's deferred.
+
+**Locked v1 schema (4 fields):**
 
 ```python
-enrichment_prompt = """
-Analyze this content and return:
-1. SUMMARY: 2-3 sentence summary of key information
-2. ENTITIES: People, companies, places, events mentioned
-3. KEY_FACTS: Specific claims, facts, numbers, dates
-4. TOPICS: 3-5 topic tags
-5. CONNECTIONS: How this relates to broader themes
-   (politics, tech, sports, entertainment, etc.)
-
-Content:
-{captured_content}
-"""
-```
-
-**Output example:**
-```json
 {
-  "summary": "Poonam Pandey faked her death in Feb 2024 to raise cervical cancer awareness. The stunt was widely criticized despite its stated purpose.",
-  "entities": ["Poonam Pandey", "cervical cancer"],
-  "key_facts": [
-    "Faked death in February 2024",
-    "Purpose was cervical cancer awareness",
-    "Received major public backlash",
-    "Was active on OnlyFans"
-  ],
-  "topics": ["bollywood", "controversy", "health-awareness", "social-media"],
-  "connections": ["celebrity stunts", "cancer awareness campaigns", "OnlyFans creators"]
+    "summary":   str,                                    # 1-2 sentences, English
+    "entities":  list[{"name": str, "type": str}],      # type ∈ person|org|place|event
+    "key_facts": list[str],                              # atomic claims w/ numbers/dates
+    "topics":    list[str],                              # 3-5 lowercase hyphenated tags
 }
 ```
+
+Plus wrapper fields written by `wrap_enrichment_record`: `capture_id`, `enriched_at`, `model`, `related_captures` (reserved empty for Phase 3 cross-language linking — Decision I).
+
+**Language fidelity (Decision D):** All output strings are English with Latin script. Names from non-Latin scripts are **transliterated, not translated** (`दीपिका पादुकोण` → `Deepika Padukone`). Cultural keywords, idioms, and untranslatable phrases are preserved verbatim in their Romanized form (`jugaad`, `Schadenfreude`, movie titles like `Tamasha`). Source content can be in any of English / Hindi / Odia / Telugu / German.
+
+**Output example (HSR Layout rent article):**
+```json
+{
+  "summary": "A viral X post by a 28-year-old in Bengaluru complains that 1BHK rents in HSR Layout start at ₹25,000 vs her ₹15,000 budget; HT covered the post and quoted agents saying HSR rents are up ~40% in two years.",
+  "entities": [
+    {"name": "Bengaluru", "type": "place"},
+    {"name": "HSR Layout", "type": "place"},
+    {"name": "Hindustan Times", "type": "org"}
+  ],
+  "key_facts": [
+    "1BHK rents in HSR Layout start at ~₹25,000",
+    "Renter's stated budget was ₹15,000",
+    "HSR rents up ~40% over the past two years"
+  ],
+  "topics": ["bengaluru", "rent-crisis", "indian-cities", "real-estate", "viral-post"]
+}
+```
+
+**Persistence model:** sidecar JSONL. `data/captures.jsonl` holds the raw row (Phase 1) keyed by an added `capture_id` UUID4. `data/enrichments.jsonl` holds one enrichment row per `capture_id`. Append-only — no in-place updates, no JSONL locking. Phase 3 collapses both into ChromaDB + SQLite, but the same `capture_id` will continue to be the join key.
+
+**Failure / retry policy (Decision H):** transient errors retry 3× with 0.5s/1s/2s backoff; permanent errors and post-retry malformed JSON skip immediately. All failures append to `data/capture_failures.jsonl` with `phase: "enrichment"` so the existing `/failures` endpoint and bot command surface them. Crash recovery: on FastAPI startup, scan for `capture_id`s in captures.jsonl with no row in enrichments.jsonl and re-queue them.
 
 #### C. Embedding Generation
 
@@ -435,10 +443,13 @@ sabya-brain/
 │   │   ├── processor.py        # Content processing pipeline
 │   │   ├── extractors.py       # Platform-specific extractors
 │   │   └── vision.py           # Image/meme understanding
-│   ├── knowledge/
-│   │   ├── store.py            # ChromaDB + SQLite operations
-│   │   ├── enrichment.py       # LLM tagging/summarization
-│   │   └── embeddings.py       # Embedding generation
+│   ├── knowledge/              # Built in Phase 2
+│   │   ├── llm_client.py       # Model-agnostic async wrapper (Anthropic SDK)
+│   │   ├── prompts.py          # System / user prompts + retry reminder
+│   │   ├── enrichment.py       # Pure enrich(processed) → 4-field dict
+│   │   ├── enrichment_worker.py# Async retry + sidecar JSONL persistence
+│   │   ├── store.py            # Phase 3 — ChromaDB + SQLite operations
+│   │   └── embeddings.py       # Phase 3 — embedding generation
 │   ├── agent/
 │   │   ├── retrieval.py        # RAG retrieval logic
 │   │   ├── reasoning.py        # Agent LLM calls
