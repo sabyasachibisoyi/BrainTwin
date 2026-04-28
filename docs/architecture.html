@@ -124,6 +124,7 @@
         <div class="tech"><span>python-telegram-bot</span><span>Long polling</span><span>Allowlist auth</span><span>Media-group batching</span><span>Catch-up on reconnect</span></div>
         <a class="doc-link" href="phase1-design.md">→ Design + locked decisions: phase1-design.md (Parts 2-5)</a>
         <a class="doc-link" href="phase1-smoke-test.md">→ Smoke test: phase1-smoke-test.md (Part B)</a>
+        <a class="doc-link" href="phase2.5-capture-hydration.md">→ Phase 2.5 — capture-time hydration for IG/FB URLs (in design)</a>
       </div>
       <div class="card">
         <h3>🎯 What Gets Captured</h3>
@@ -138,7 +139,7 @@
   <!-- LAYER 2: PROCESSING -->
   <div class="layer processing">
     <span class="layer-label">Phase 2</span>
-    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status built">Built (Phase 2 — awaiting smoke test)</span></h2>
+    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status built">Phase 2 LIVE</span> <span class="build-status proposed">Phase 2.5 in design</span></h2>
     <div class="pipeline">
       <div class="step">
         <div class="step-icon">📄</div>
@@ -176,6 +177,12 @@
           <h3>🏷️ LLM Enrichment Output</h3>
           <p>Every successfully captured row gets a 4-field block: a 1–2 sentence <code>summary</code>, <code>entities</code> (person / org / place / event, transliterated to Latin script), <code>key_facts</code> (atomic claims with numbers, dates, names), and <code>topics</code> (3–5 lowercase hyphenated tags). Persisted as a sidecar <code>data/enrichments.jsonl</code>, joined to <code>captures.jsonl</code> by <code>capture_id</code>. Runs async via FastAPI BackgroundTasks — <code>/capture</code> never waits on Haiku. Failures log to <code>capture_failures.jsonl</code> with <code>phase: "enrichment"</code> and surface in <code>/failures</code>.</p>
           <div class="tech"><span>Claude Haiku</span><span>~$0.003/capture</span><span>4-field schema</span><span>async BackgroundTasks</span></div>
+        </div>
+        <div class="card">
+          <h3>🪡 Capture Hydration Tiers <span class="build-status proposed">Phase 2.5</span></h3>
+          <p>Closes the gap surfaced by Phase 2 smoke testing — IG reels and FB share links forwarded via Telegram landed as <code>empty_content</code> failures because the bot can only send the URL and the backend has no fetcher beyond YouTube. Phase 2.5 adds a tiered capture-time hydration: <strong>(1)</strong> use raw text if present, <strong>(2)</strong> use Telegram's link preview if present (free), <strong>(3)</strong> fetch <code>og:title</code>/<code>og:description</code>/<code>og:image</code>, <strong>(4)</strong> for video URLs run <code>yt-dlp</code> + local <code>whisper.cpp</code>, <strong>(5)</strong> tag <code>phase: "enrichment_skipped"</code> so genuine failures stop drowning in noise.</p>
+          <div class="tech"><span>httpx + selectolax</span><span>yt-dlp</span><span>whisper.cpp small.en</span><span>$0/mo</span><span>~250 MB disk</span></div>
+          <a class="doc-link" href="phase2.5-capture-hydration.md">→ Design: phase2.5-capture-hydration.md</a>
         </div>
       </div>
     </div>
@@ -243,8 +250,8 @@
     <div class="vs-container">
       <div class="player">
         <div class="avatar">🧑</div>
-        <h3>Sabya</h3>
-        <p>Answers from memory & intuition</p>
+        <h3>You</h3>
+        <p>Answer from memory & intuition</p>
       </div>
       <div class="vs">VS</div>
       <div class="player">

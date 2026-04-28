@@ -105,7 +105,9 @@ BrainTwin/
 │   │   ├── __init__.py
 │   │   ├── processor.py        # Content processing pipeline
 │   │   ├── extractors.py       # Platform-specific text extractors
-│   │   └── vision.py           # Image/meme understanding (Claude Vision)
+│   │   ├── vision.py           # Image/meme understanding (Claude Vision)
+│   │   ├── og_fetcher.py       # Phase 2.5 — Open Graph / Twitter Card fallback (planned)
+│   │   └── video_transcriber.py# Phase 2.5 — yt-dlp + whisper.cpp local transcription (planned)
 │   ├── knowledge/              # Phase 2 — built
 │   │   ├── __init__.py
 │   │   ├── llm_client.py       # Async Anthropic SDK wrapper, typed errors
@@ -136,22 +138,32 @@ BrainTwin/
 ├── data/
 │   ├── captures.jsonl          # Phase 1 — raw captures (one per line, with capture_id)
 │   ├── enrichments.jsonl       # Phase 2 — Haiku enrichment sidecar (joined by capture_id)
-│   ├── capture_failures.jsonl  # Failures tagged with phase: capture | enrichment
+│   ├── capture_failures.jsonl  # Failures tagged with phase: capture | enrichment | enrichment_skipped (Phase 2.5)
 │   ├── chroma/                 # Phase 3 — ChromaDB storage (auto-created)
 │   ├── images/                 # Captured images/memes
+│   ├── models/                 # Phase 2.5 — whisper.cpp models (gitignored, ~250 MB)
 │   └── braintwin.db            # Phase 3 — SQLite database (auto-created)
+├── bin/
+│   └── whisper-cli             # Phase 2.5 — local whisper.cpp binary (gitignored)
 ├── scripts/
 │   ├── mock_capture.py         # Phase 1 smoke test — POST a synthetic capture
 │   ├── mock_phase2_capture.py  # Phase 2 smoke test — POST + poll for enrichment
 │   ├── mock_telegram_capture.py# Phase 1 — exercise the Telegram capture path
 │   ├── backfill_enrichment.py  # Idempotent backfill over existing captures
-│   └── retry_failed_enrichments.py  # On-demand catch-up for unenriched rows
+│   ├── retry_failed_enrichments.py  # On-demand catch-up for unenriched rows
+│   └── replay_failed_urls.py   # Phase 2.5 — re-POST URLs from capture_failures.jsonl (planned)
 ├── tests/
 │   ├── test_capture.py
 │   ├── test_enrichment.py
 │   └── test_agent.py
 ├── docs/
-│   └── architecture.html       # Visual architecture diagram
+│   ├── architecture.html       # Visual architecture diagram
+│   ├── architecture-detailed.md
+│   ├── phase1-design.md        # Phase 1 — locked decisions
+│   ├── phase1-smoke-test.md
+│   ├── phase2-design.md        # Phase 2 — enrichment design
+│   ├── phase2-smoke-test.md
+│   └── phase2.5-capture-hydration.md  # Phase 2.5 — IG/FB hydration + hygiene fixes
 ├── .env.example                # Environment variables template
 ├── .gitignore
 ├── requirements.txt

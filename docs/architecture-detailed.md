@@ -1,4 +1,4 @@
-# SabyaBrain — Knowledge Twin Agent
+# BrainTwin — Knowledge Twin Agent
 
 ## Overview
 
@@ -166,6 +166,24 @@ Claude Vision API  →  describe image, extract text, identify context
 Custom parsers per platform  →  extract structured data from DOM
 ```
 
+##### A.1. Capture Hydration Tiers (Phase 2.5 — in design)
+
+> **Built in Phase 2.5.** See [phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
+
+Phase 1 + 2 left a real gap: when the Telegram bot forwards a URL (Instagram reel, Facebook share link, news article), the bot can only send `text=""` because Telegram's Bot API delivers just the URL, not the rendered preview. The backend's `extract()` only special-cases YouTube, so everything else lands at the enricher with empty content and gets refused.
+
+Phase 2.5 closes the gap with a tiered hydration model that runs at capture time, before the row is persisted:
+
+```
+1. Use raw_text if non-empty                  (Chrome extension already extracted)
+2. Else use Telegram preview if present        (FREE — Telegram already crawled)
+3. Else fetch og:title / og:description / og:image from URL  (one HTTP GET)
+4. Else if video URL → yt-dlp + whisper.cpp local transcription
+5. Else mark `phase: "enrichment_skipped"` — nothing left to try
+```
+
+Tiers 1-2 are zero-cost. Tier 3 is one HTTP request via `httpx` + `selectolax` parser. Tier 4 uses local `whisper.cpp` `small.en` (~5s per 30s reel on M-series Mac, $0/month). Tier 5 is a logging-only sentinel separate from real failures (Phase 2.5 hygiene Fix 1).
+
 #### B. LLM Enrichment
 
 > **Built in Phase 2.** See [phase2-design.md](phase2-design.md) for locked decisions and [phase2-smoke-test.md](phase2-smoke-test.md) for verification steps.
@@ -208,6 +226,8 @@ Plus wrapper fields written by `wrap_enrichment_record`: `capture_id`, `enriched
 **Persistence model:** sidecar JSONL. `data/captures.jsonl` holds the raw row (Phase 1) keyed by an added `capture_id` UUID4. `data/enrichments.jsonl` holds one enrichment row per `capture_id`. Append-only — no in-place updates, no JSONL locking. Phase 3 collapses both into ChromaDB + SQLite, but the same `capture_id` will continue to be the join key.
 
 **Failure / retry policy (Decision H):** transient errors retry 3× with 0.5s/1s/2s backoff; permanent errors and post-retry malformed JSON skip immediately. All failures append to `data/capture_failures.jsonl` with `phase: "enrichment"` so the existing `/failures` endpoint and bot command surface them. Crash recovery: on FastAPI startup, scan for `capture_id`s in captures.jsonl with no row in enrichments.jsonl and re-queue them.
+
+**Phase 2.5 update — `enrichment_skipped` vs `enrichment`:** "nothing to enrich" cases (`EmptyContentError`, `ContentTooLongError`) are tagged `phase: "enrichment_skipped"` and excluded from the default failure count. Real failures (network, auth, malformed JSON after retry) keep `phase: "enrichment"`. This separation is the hygiene Fix 1 in [phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
 
 #### C. Embedding Generation
 
@@ -343,7 +363,7 @@ Third Person (Quizmaster)
     │
     ├──── asks question ────► Agent (answers from knowledge base)
     │
-    └──── asks same question ► Sabya (answers from memory)
+    └──── asks same question ► You (answer from memory)
     
     Compare answers → Score
 ```
@@ -436,7 +456,7 @@ Third Person (Quizmaster)
 ## Folder Structure
 
 ```
-sabya-brain/
+BrainTwin/
 ├── backend/
 │   ├── main.py                 # FastAPI app
 │   ├── capture/
@@ -470,7 +490,7 @@ sabya-brain/
 │   └── readability.js          # Mozilla Readability library
 ├── data/
 │   ├── chroma/                 # ChromaDB storage
-│   ├── sabya.db                # SQLite database
+│   ├── braintwin.db            # SQLite database
 │   └── images/                 # Captured images/memes
 ├── tests/
 │   ├── test_capture.py
