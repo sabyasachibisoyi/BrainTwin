@@ -43,8 +43,24 @@ class Settings(BaseSettings):
 
     # Telegram bot state (pause flag, last-seen timestamp)
     telegram_state_path: str = "./data/telegram_state.json"
-    # Persistent failure log (used by both Chrome and Telegram clients)
+    # Persistent failure log (used by both Chrome and Telegram clients).
+    # Phase 2 also writes to this file with `phase: "enrichment"` for
+    # enrichment failures.
     capture_failures_path: str = "./data/capture_failures.jsonl"
+
+    # ----- Phase 2 (LLM enrichment) -----
+    # Sidecar to captures.jsonl — one row per successful enrichment, keyed
+    # by capture_id. Joined at read time. See docs/phase2-design.md.
+    enrichments_path: str = "./data/enrichments.jsonl"
+    # Roughly the upper bound on what we'll send to Haiku in one shot.
+    # Above this, enrichment skips with reason "content_too_long" (rare —
+    # only multi-hour transcripts and books exceed this).
+    enrichment_max_input_chars: int = 200_000  # ~50k tokens
+    # The user's languages — fed verbatim into the enrichment system prompt
+    # so Haiku knows to expect code-switching across these. Add/remove as
+    # the user's consumption profile changes. Phase-5+ improvement: load
+    # from .env per Decision D's portability note.
+    user_languages: str = "English, Hindi, Odia, Telugu, German"
 
     class Config:
         env_file = ".env"

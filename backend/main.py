@@ -2,18 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.capture.processor import CaptureInput, process
 from backend.config import settings
+from backend.knowledge.enrichment_worker import (
+    enqueue_enrichment,
+    find_unenriched_capture_ids,
+    hydrate_processed,
+)
+from backend.knowledge.llm_client import LLMClient, PermanentLLMError
 
 
 logging.basicConfig(
@@ -40,22 +48,38 @@ app.add_middleware(
 
 
 # Phase 1 persistence: append each processed capture to a JSONL file.
-# Phase 2 will replace this with ChromaDB + SQLite.
+# Phase 3 will replace this with ChromaDB + SQLite.
 CAPTURES_LOG = Path("./data/captures.jsonl")
 FAILURES_LOG = Path(settings.capture_failures_path)
+ENRICHMENTS_LOG = Path(settings.enrichments_path)
+
+
+# ---- Phase 2: shared LLM client (constructed at startup) ------------
+#
+# Single AsyncAnthropic client is reused across requests so we don't
+# pay TCP/TLS handshake on every capture. None when no API key is set
+# (local dev without enrichment) — `/capture` will skip enrichment in
+# that case rather than crash.
+_llm_client: LLMClient | None = None
+
+
+def _get_llm_client() -> LLMClient | None:
+    return _llm_client
 
 
 def _log_failure(*, source: str, reason: str, payload: dict[str, Any]) -> None:
-    """Append a structured failure row to data/capture_failures.jsonl.
+    """Append a structured capture-phase failure row to data/capture_failures.jsonl.
 
     Best-effort — never raises. Used by both Chrome and Telegram clients;
-    the `source` field tells them apart. Phase 2's failure-summary agent
-    reads this file.
+    the `source` field tells them apart. Enrichment-phase failures are
+    written by `enrichment_worker._log_enrichment_failure` with
+    `phase: "enrichment"`. Phase 2's `/failures` endpoint groups by phase.
     """
     try:
         FAILURES_LOG.parent.mkdir(parents=True, exist_ok=True)
         row = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
+            "phase": "capture",              # Decision C — phase tag for grouping
             "source": source,                # "chrome" | "telegram" | "unknown"
             "url": payload.get("url"),
             "title": payload.get("title"),
@@ -81,6 +105,10 @@ class CapturePayload(BaseModel):
     timestamp: datetime | None = None
     dwell_time_seconds: int = 0
     metadata: dict[str, Any] = {}
+    # Phase 2 join key. Optional from clients (extension/bot don't need
+    # to generate one); we'll mint a UUID4 if omitted. Persisted in the
+    # captures.jsonl row and used to join against enrichments.jsonl.
+    capture_id: str | None = None
 
 
 class QuestionPayload(BaseModel):
@@ -106,6 +134,82 @@ async def health():
     }
 
 
+# ---- Startup / shutdown hooks --------------------------------------
+
+async def _recover_unenriched() -> None:
+    """At startup, find captures with no enrichment and re-queue them.
+
+    Decision H — crash recovery. Runs once per process boot; emits one
+    asyncio task per unenriched capture. Bounded by the number of
+    unenriched rows in captures.jsonl, which is small in normal operation.
+    """
+    client = _get_llm_client()
+    if client is None:
+        return
+    if not CAPTURES_LOG.exists():
+        return
+
+    unenriched_ids = set(find_unenriched_capture_ids(
+        captures_path=CAPTURES_LOG,
+        enrichments_path=ENRICHMENTS_LOG,
+    ))
+    if not unenriched_ids:
+        return
+
+    logger.info("Recovering %d unenriched captures from previous runs", len(unenriched_ids))
+    queued = 0
+    with CAPTURES_LOG.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            cid = row.get("capture_id")
+            if not cid or cid not in unenriched_ids:
+                continue
+            processed = hydrate_processed(row)
+            if processed is None:
+                logger.debug("Skipping recovery for %s — could not hydrate row", cid)
+                continue
+            asyncio.create_task(enqueue_enrichment(cid, processed, client))
+            queued += 1
+            unenriched_ids.discard(cid)
+    if queued:
+        logger.info("Re-queued %d unenriched captures", queued)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _llm_client
+    if not settings.anthropic_api_key:
+        logger.warning(
+            "ANTHROPIC_API_KEY is empty — Phase 2 enrichment is DISABLED. "
+            "Captures will still be persisted; set the key in .env to enable."
+        )
+        return
+    try:
+        _llm_client = LLMClient()
+    except PermanentLLMError as e:
+        logger.error("LLM client init failed: %s", e)
+        return
+    # Crash recovery — re-queue work that was in flight when we died.
+    await _recover_unenriched()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    global _llm_client
+    if _llm_client is not None:
+        try:
+            await _llm_client.aclose()
+        except Exception:  # noqa: BLE001
+            logger.exception("Error closing LLM client")
+        _llm_client = None
+
+
 def _detect_source(payload: CapturePayload) -> str:
     """Best-effort guess at which client sent this capture, for failure logs."""
     plat = (payload.platform or "").lower()
@@ -119,14 +223,20 @@ def _detect_source(payload: CapturePayload) -> str:
 
 
 @app.post("/capture")
-async def capture_content(payload: CapturePayload):
+async def capture_content(payload: CapturePayload, background_tasks: BackgroundTasks):
     """Receive captured content from Chrome extension or Telegram bot.
 
-    Phase 1: runs the extraction + vision pipeline and appends the
-    processed result to data/captures.jsonl. Phase 2 will add enrichment
-    and proper storage (ChromaDB + SQLite).
+    Pipeline (Phase 1 + Phase 2):
+      1. Extract + vision (synchronous, in the request).
+      2. Append the raw row to data/captures.jsonl with a capture_id.
+      3. Schedule enrichment in the background — never blocks the
+         response. Decision H — async enrichment via BackgroundTasks.
+
+    Phase 3 will swap step 2 for ChromaDB + SQLite writes; the
+    capture_id stays the join key.
     """
     source = _detect_source(payload)
+    capture_id = payload.capture_id or str(uuid.uuid4())
     try:
         capture = CaptureInput(
             url=payload.url,
@@ -148,17 +258,32 @@ async def capture_content(payload: CapturePayload):
         _log_failure(source=source, reason=f"processing: {e}", payload=payload.model_dump(mode="json"))
         raise HTTPException(status_code=500, detail=f"processing failed: {e}")
 
-    # Append to JSONL log (Phase 2 will migrate this into ChromaDB/SQLite)
+    # Append to JSONL log. Phase 2: include capture_id so enrichments.jsonl
+    # can be joined back to the raw row. Phase 3 will migrate this into
+    # ChromaDB/SQLite.
+    persisted = False
     try:
         CAPTURES_LOG.parent.mkdir(parents=True, exist_ok=True)
+        row = {"capture_id": capture_id, **processed.to_dict()}
         with CAPTURES_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(processed.to_dict(), ensure_ascii=False) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        persisted = True
     except OSError as e:
         logger.warning("Failed to persist capture: %s", e)
         _log_failure(source=source, reason=f"persist: {e}", payload=payload.model_dump(mode="json"))
 
+    # Phase 2 — schedule enrichment. Skipped if:
+    #   - persistence failed (no row to enrich against)
+    #   - no LLM client (no API key in env)
+    enrichment_scheduled = False
+    client = _get_llm_client()
+    if persisted and client is not None:
+        background_tasks.add_task(enqueue_enrichment, capture_id, processed, client)
+        enrichment_scheduled = True
+
     return {
         "status": "captured",
+        "capture_id": capture_id,
         "url": processed.url,
         "title": processed.title,
         "platform": processed.platform,
@@ -167,6 +292,7 @@ async def capture_content(payload: CapturePayload):
         "has_transcript": bool(processed.transcript),
         "images_processed": len(processed.image_descriptions),
         "vision_skipped": skip_vision,
+        "enrichment_scheduled": enrichment_scheduled,
     }
 
 
@@ -194,6 +320,7 @@ async def get_stats():
     total = 0
     platforms: dict[str, int] = {}
     last_capture: str | None = None
+    capture_ids: set[str] = set()
     if CAPTURES_LOG.exists():
         with CAPTURES_LOG.open("r", encoding="utf-8") as f:
             for line in f:
@@ -205,31 +332,73 @@ async def get_stats():
                 plat = rec.get("platform", "unknown")
                 platforms[plat] = platforms.get(plat, 0) + 1
                 last_capture = rec.get("timestamp") or last_capture
+                cid = rec.get("capture_id")
+                if isinstance(cid, str) and cid:
+                    capture_ids.add(cid)
+
+    # Phase 2 — enrichment counts.
+    enriched_ids: set[str] = set()
+    total_entities = 0
+    if ENRICHMENTS_LOG.exists():
+        with ENRICHMENTS_LOG.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cid = rec.get("capture_id")
+                if isinstance(cid, str) and cid:
+                    enriched_ids.add(cid)
+                ents = (rec.get("enrichment") or {}).get("entities") or []
+                if isinstance(ents, list):
+                    total_entities += len(ents)
+    pending_enrichment = max(0, len(capture_ids - enriched_ids))
 
     return {
         "total_captures": total,
-        "total_entities": 0,  # Populated once Phase 2 enrichment lands.
+        "total_entities": total_entities,
         "platforms": platforms,
         "last_capture": last_capture,
+        "enrichments": {
+            "total": len(enriched_ids),
+            "pending": pending_enrichment,
+        },
     }
 
 
 @app.get("/failures")
-async def get_failures(limit: int = 10):
+async def get_failures(limit: int = 10, phase: str | None = None):
     """Last N capture failures from data/capture_failures.jsonl.
 
     Read by the bot's `/failures` command and (later) by the digest agent.
+    Phase 2 (Decision C): rows include `phase: "capture"` (default if
+    missing — older Phase 1 rows) or `phase: "enrichment"`. The bot can
+    filter or group by phase.
     """
     rows: list[dict[str, Any]] = []
     if FAILURES_LOG.exists():
         with FAILURES_LOG.open("r", encoding="utf-8") as f:
             for line in f:
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # Default older rows to phase=capture so the breakdown
+                # always sums to the total.
+                row.setdefault("phase", "capture")
+                rows.append(row)
+
+    if phase:
+        rows = [r for r in rows if r.get("phase") == phase]
+
+    by_phase: dict[str, int] = {}
+    for r in rows:
+        p = r.get("phase", "capture")
+        by_phase[p] = by_phase.get(p, 0) + 1
+
     return {
         "total": len(rows),
+        "by_phase": by_phase,
         "recent": rows[-limit:],
     }
 
