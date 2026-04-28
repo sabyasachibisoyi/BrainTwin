@@ -2,6 +2,7 @@
 .env
 venv/
 .venv/
+.testvenv/
 
 # Data (don't commit your knowledge base)
 data/chroma/
@@ -11,6 +12,7 @@ data/*.db
 data/captures.jsonl
 data/capture_failures.jsonl
 data/telegram_state.json
+data/enrichments.jsonl
 
 # Python
 __pycache__/
