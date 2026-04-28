@@ -1,0 +1,42 @@
+# BrainTwin Dependencies
+
+# Backend
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+pydantic-settings
+
+# LLM & AI
+anthropic
+sentence-transformers
+
+# Vector Database
+chromadb
+
+# Content Extraction
+readability-lxml
+lxml
+beautifulsoup4
+newspaper3k
+youtube-transcript-api
+
+# Image Processing
+Pillow
+
+# Telegram Bot
+python-telegram-bot
+
+# HTTP
+httpx
+aiohttp
+
+# Database
+aiosqlite
+
+# Testing
+pytest
+pytest-asyncio
+
+# Utilities
+rich

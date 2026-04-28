@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { width: 280px; padding: 16px; font-family: system-ui, sans-serif; background: #0f0f17; color: #e0e0e0; }
+  h1 { font-size: 1.1rem; margin: 0 0 12px; background: linear-gradient(135deg, #6366f1, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .stat { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #222; font-size: 0.85rem; }
+  .stat .label { color: #888; }
+  .stat .value { font-weight: 600; color: #a5b4fc; }
+  .toggle { margin-top: 14px; width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .toggle.on { background: #6366f1; color: white; }
+  .toggle.off { background: #333; color: #888; }
+  .toggle:hover { opacity: 0.85; }
+  .footer { margin-top: 12px; font-size: 0.7rem; color: #555; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>BrainTwin</h1>
+  <div class="stat">
+    <span class="label">Captured today</span>
+    <span class="value" id="count">0</span>
+  </div>
+  <div class="stat">
+    <span class="label">Status</span>
+    <span class="value" id="status">Active</span>
+  </div>
+  <button class="toggle on" id="toggleBtn">Pause Capture</button>
+  <div class="footer">Dwell threshold: 30 seconds</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

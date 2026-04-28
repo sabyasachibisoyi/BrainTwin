@@ -1,0 +1,36 @@
+# BrainTwin — Cursor IDE Rules
+
+## Project Overview
+BrainTwin is a personal knowledge twin agent that captures everything the user consumes digitally (via Chrome extension + Telegram bot), processes it through an LLM enrichment pipeline, stores it in ChromaDB + SQLite, and enables a RAG-powered agent that competes against the user in knowledge battles.
+
+## Tech Stack
+- Python 3.11+ with FastAPI backend
+- ChromaDB for vector search
+- SQLite for structured data
+- Claude API (Anthropic) for LLM enrichment and agent reasoning
+- sentence-transformers for local embeddings
+- Chrome Extension (Manifest V3) for browser content capture
+- python-telegram-bot for mobile capture
+
+## Code Style
+- Use type hints everywhere
+- Use async/await for all I/O operations
+- Use pydantic models for data validation
+- Keep functions small and focused
+- Write docstrings for all public functions
+- Use the `rich` library for CLI output/logging
+
+## Architecture
+- `/backend/capture/` — Content capture and extraction
+- `/backend/knowledge/` — Storage, enrichment, embeddings
+- `/backend/agent/` — RAG retrieval and LLM reasoning
+- `/backend/competition/` — Game logic and scoring
+- `/backend/telegram_bot/` — Mobile capture via Telegram
+- `/extension/` — Chrome extension (JavaScript)
+
+## Important Notes
+- All data stays local (ChromaDB + SQLite in /data/)
+- Use Claude Haiku for cheap enrichment tasks
+- Use Claude Sonnet for agent reasoning (needs strong lateral thinking)
+- Chrome extension talks to localhost:8000
+- Skip sensitive sites (banking, email, login pages)

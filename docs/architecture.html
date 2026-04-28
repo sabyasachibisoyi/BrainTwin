@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BrainTwin — System Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; padding: 40px 20px; }
+
+  h1 { text-align: center; font-size: 2.2rem; margin-bottom: 8px; background: linear-gradient(135deg, #6366f1, #a855f7, #ec4899); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { text-align: center; color: #888; font-size: 1rem; margin-bottom: 50px; }
+
+  .architecture { max-width: 1100px; margin: 0 auto; position: relative; }
+
+  /* Flow arrows */
+  .flow-arrow { text-align: center; padding: 12px 0; color: #6366f1; font-size: 1.8rem; letter-spacing: 4px; }
+  .flow-arrow span { display: inline-block; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+  /* Layer boxes */
+  .layer { border-radius: 16px; padding: 28px; margin-bottom: 16px; position: relative; }
+  .layer-label { position: absolute; top: -12px; left: 24px; padding: 4px 14px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; }
+  .layer h2 { font-size: 1.1rem; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; }
+  .layer h2 .icon { font-size: 1.4rem; }
+
+  /* Capture Layer */
+  .capture { background: linear-gradient(135deg, #1a1a2e, #16213e); border: 1px solid #2a2a4a; }
+  .capture .layer-label { background: #6366f1; color: white; }
+
+  /* Processing Layer */
+  .processing { background: linear-gradient(135deg, #1a2e1a, #1e3a2e); border: 1px solid #2a4a2a; }
+  .processing .layer-label { background: #22c55e; color: white; }
+
+  /* Storage Layer */
+  .storage { background: linear-gradient(135deg, #2e1a1a, #3e2116); border: 1px solid #4a2a2a; }
+  .storage .layer-label { background: #f97316; color: white; }
+
+  /* Agent Layer */
+  .agent { background: linear-gradient(135deg, #2e1a2e, #3e1640); border: 1px solid #4a2a4a; }
+  .agent .layer-label { background: #a855f7; color: white; }
+
+  /* Competition Layer */
+  .competition { background: linear-gradient(135deg, #1a2e2e, #163e3e); border: 1px solid #2a4a4a; }
+  .competition .layer-label { background: #ec4899; color: white; }
+
+  /* Cards inside layers */
+  .cards { display: flex; gap: 16px; flex-wrap: wrap; }
+  .card { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 16px; flex: 1; min-width: 200px; }
+  .card h3 { font-size: 0.9rem; color: #fff; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .card p { font-size: 0.78rem; color: #aaa; line-height: 1.5; }
+  .card .tech { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .card .tech span { background: rgba(99,102,241,0.2); color: #a5b4fc; padding: 2px 8px; border-radius: 10px; font-size: 0.65rem; font-weight: 600; }
+
+  /* Pipeline steps */
+  .pipeline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .step { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); border-radius: 10px; padding: 10px 16px; text-align: center; flex: 1; min-width: 120px; }
+  .step .step-icon { font-size: 1.5rem; margin-bottom: 4px; }
+  .step .step-name { font-size: 0.75rem; font-weight: 600; color: #fff; }
+  .step .step-tech { font-size: 0.65rem; color: #888; margin-top: 2px; }
+  .pipe-arrow { color: #22c55e; font-size: 1.2rem; flex-shrink: 0; }
+
+  /* DB visual */
+  .db-container { display: flex; gap: 20px; flex-wrap: wrap; }
+  .db { flex: 1; min-width: 200px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 20px; text-align: center; }
+  .db .db-icon { font-size: 2.2rem; margin-bottom: 8px; }
+  .db h3 { font-size: 0.95rem; margin-bottom: 6px; }
+  .db p { font-size: 0.75rem; color: #aaa; }
+  .db .db-use { margin-top: 10px; font-size: 0.72rem; color: #f97316; font-style: italic; }
+
+  /* VS section */
+  .vs-container { display: flex; align-items: center; gap: 20px; justify-content: center; flex-wrap: wrap; }
+  .player { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 24px 32px; text-align: center; min-width: 180px; flex: 1; max-width: 300px; }
+  .player .avatar { font-size: 3rem; margin-bottom: 8px; }
+  .player h3 { font-size: 1rem; margin-bottom: 4px; }
+  .player p { font-size: 0.75rem; color: #aaa; }
+  .vs { font-size: 2rem; font-weight: 900; background: linear-gradient(135deg, #ec4899, #f97316); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+  /* Tech stack section */
+  .tech-stack { max-width: 1100px; margin: 50px auto 0; }
+  .tech-stack h2 { font-size: 1.3rem; margin-bottom: 20px; text-align: center; color: #fff; }
+  .tech-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .tech-item { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 14px; display: flex; align-items: center; gap: 12px; }
+  .tech-item .t-icon { font-size: 1.5rem; width: 40px; text-align: center; flex-shrink: 0; }
+  .tech-item .t-name { font-size: 0.82rem; font-weight: 600; color: #fff; }
+  .tech-item .t-desc { font-size: 0.7rem; color: #888; }
+
+  /* Cost badge */
+  .cost-bar { max-width: 1100px; margin: 30px auto; background: linear-gradient(135deg, rgba(34,197,94,0.1), rgba(99,102,241,0.1)); border: 1px solid rgba(34,197,94,0.3); border-radius: 12px; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .cost-bar .cost-label { font-size: 0.85rem; color: #22c55e; font-weight: 600; }
+  .cost-bar .cost-detail { font-size: 0.75rem; color: #aaa; }
+
+  /* Build status pill */
+  .build-status { display: inline-block; margin-left: 10px; padding: 2px 10px; border-radius: 12px; font-size: 0.62rem; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; vertical-align: middle; }
+  .build-status.built { background: rgba(34,197,94,0.18); color: #4ade80; border: 1px solid rgba(34,197,94,0.4); }
+  .build-status.proposed { background: rgba(249,115,22,0.18); color: #fb923c; border: 1px solid rgba(249,115,22,0.4); }
+  .build-status.notbuilt { background: rgba(255,255,255,0.06); color: #888; border: 1px solid rgba(255,255,255,0.12); }
+  .doc-link { display: block; margin-top: 8px; font-size: 0.7rem; color: #a5b4fc; text-decoration: none; }
+  .doc-link:hover { color: #c7d2fe; text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>BrainTwin</h1>
+<p class="subtitle">Your Knowledge Twin — Capture, Process, Compete</p>
+
+<div class="architecture">
+
+  <!-- LAYER 1: CAPTURE -->
+  <div class="layer capture">
+    <span class="layer-label">Phase 1</span>
+    <h2><span class="icon">📡</span> Capture Layer <span class="build-status built">Built &amp; verified end-to-end</span></h2>
+    <div class="cards">
+      <div class="card">
+        <h3>🖥️ Chrome Extension <span class="build-status built">Built</span></h3>
+        <p>Runs on every page. Tracks dwell time (30s threshold) and POSTs to <code>/capture</code> when you've actively read for the full window. Popup shows today's count; Pause/Resume toggle backed by <code>chrome.storage.local</code> so it survives the MV3 service worker dying. Skip-list excludes banking and auth domains.</p>
+        <div class="tech"><span>Manifest V3</span><span>chrome.storage</span><span>Pause/Resume</span><span>Skip-list</span></div>
+        <a class="doc-link" href="phase1-design.md">→ Design: phase1-design.md (Part 1)</a>
+        <a class="doc-link" href="phase1-smoke-test.md">→ Smoke test: phase1-smoke-test.md</a>
+      </div>
+      <div class="card">
+        <h3>📱 Telegram Bot <span class="build-status built">Built</span></h3>
+        <p>Mobile capture inbox. Share / forward anything from any phone app to the bot. Acks within ~1s with <code>📥 Captured</code>; replies inline with <code>⚠️ Couldn't process</code> on failure. Same <code>POST /capture</code> contract as the extension. Runs as a separate process via <code>python -m backend.telegram_bot.bot</code>; allowlist auth via <code>ALLOWED_TELEGRAM_USER_IDS</code>; long-polling so no public URL needed. Decision 3: drops your interpretive layer (typed thoughts, your own captions on forwards) so the system has to infer connections from observed consumption alone.</p>
+        <div class="tech"><span>python-telegram-bot</span><span>Long polling</span><span>Allowlist auth</span><span>Media-group batching</span><span>Catch-up on reconnect</span></div>
+        <a class="doc-link" href="phase1-design.md">→ Design + locked decisions: phase1-design.md (Parts 2-5)</a>
+        <a class="doc-link" href="phase1-smoke-test.md">→ Smoke test: phase1-smoke-test.md (Part B)</a>
+      </div>
+      <div class="card">
+        <h3>🎯 What Gets Captured</h3>
+        <p>News articles, YouTube videos (transcripts), X/Twitter threads, Instagram posts, Reddit discussions, memes (via vision AI), WhatsApp forwards, any web content you spend 30+ seconds on. Phone-side: anything you can hit Share → Telegram on. Failures (paywall, fetch errors, etc.) persist to <code>data/capture_failures.jsonl</code> and surface via <code>/failures</code> in the bot.</p>
+        <div class="tech"><span>30s dwell time</span><span>All platforms</span><span>Failure log</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-arrow"><span>▼ ▼ ▼</span></div>
+
+  <!-- LAYER 2: PROCESSING -->
+  <div class="layer processing">
+    <span class="layer-label">Phase 2</span>
+    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status proposed">Partial</span></h2>
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-icon">📄</div>
+        <div class="step-name">Extract</div>
+        <div class="step-tech">readability-lxml</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="step">
+        <div class="step-icon">👁️</div>
+        <div class="step-name">Vision AI</div>
+        <div class="step-tech">Claude Vision</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="step">
+        <div class="step-icon">🎬</div>
+        <div class="step-name">Transcribe</div>
+        <div class="step-tech">youtube-transcript-api</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="step">
+        <div class="step-icon">🧠</div>
+        <div class="step-name">Enrich</div>
+        <div class="step-tech">Claude Haiku</div>
+      </div>
+      <div class="pipe-arrow">→</div>
+      <div class="step">
+        <div class="step-icon">🔢</div>
+        <div class="step-name">Embed</div>
+        <div class="step-tech">sentence-transformers</div>
+      </div>
+    </div>
+    <div style="margin-top: 16px;">
+      <div class="cards">
+        <div class="card">
+          <h3>🏷️ LLM Enrichment Output</h3>
+          <p>Every piece of content gets: a 2-3 sentence summary, extracted entities (people, places, events), key facts & claims, topic tags, and connection mapping to broader themes.</p>
+          <div class="tech"><span>Claude Haiku</span><span>~$0.001/capture</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-arrow"><span>▼ ▼ ▼</span></div>
+
+  <!-- LAYER 3: STORAGE -->
+  <div class="layer storage">
+    <span class="layer-label">Phase 3</span>
+    <h2><span class="icon">💾</span> Knowledge Store <span class="build-status notbuilt">Not built</span></h2>
+    <div class="db-container">
+      <div class="db">
+        <div class="db-icon">🔮</div>
+        <h3>ChromaDB</h3>
+        <p>Vector database for semantic search. Stores embeddings of all processed content.</p>
+        <div class="db-use">"Find content related to cryptocurrency fraud" → semantic match</div>
+      </div>
+      <div class="db">
+        <div class="db-icon">🗃️</div>
+        <h3>SQLite</h3>
+        <p>Structured storage for raw content, metadata, entities, tags, and relationships.</p>
+        <div class="db-use">"Show everything about Deepika from last week" → exact query</div>
+      </div>
+      <div class="db">
+        <div class="db-icon">🖼️</div>
+        <h3>Local Files</h3>
+        <p>Captured images, memes, and screenshots stored on disk with references in SQLite.</p>
+        <div class="db-use">Memes and visual content preserved for future retrieval</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-arrow"><span>▼ ▼ ▼</span></div>
+
+  <!-- LAYER 4: AGENT -->
+  <div class="layer agent">
+    <span class="layer-label">Phase 4</span>
+    <h2><span class="icon">🤖</span> Agent Layer (RAG) <span class="build-status notbuilt">Not built</span></h2>
+    <div class="cards">
+      <div class="card">
+        <h3>🔍 Retrieval</h3>
+        <p>When a question comes in, semantic search finds the top 20 relevant knowledge chunks from ChromaDB. Entity search pulls structured data from SQLite. Results are merged and deduplicated.</p>
+        <div class="tech"><span>ChromaDB query</span><span>SQLite lookup</span><span>Top-K fusion</span></div>
+      </div>
+      <div class="card">
+        <h3>💭 Reasoning</h3>
+        <p>Retrieved knowledge is injected into Claude Sonnet's context. The agent reasons across multiple pieces of knowledge to make connections — just like connecting "Kingfisher" to "Deepika Padukone" to "Vijay Mallya fled India."</p>
+        <div class="tech"><span>Claude Sonnet</span><span>~$0.01/query</span></div>
+      </div>
+      <div class="card">
+        <h3>📋 System Prompt</h3>
+        <p>"You are a knowledge agent. You have consumed the same content as your human counterpart. Answer using ONLY the knowledge provided. Make connections. Think step by step."</p>
+        <div class="tech"><span>RAG prompt</span><span>Knowledge-grounded</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-arrow"><span>▼ ▼ ▼</span></div>
+
+  <!-- LAYER 5: COMPETITION -->
+  <div class="layer competition">
+    <span class="layer-label">Phase 5</span>
+    <h2><span class="icon">⚔️</span> Competition Mode <span class="build-status notbuilt">Not built</span></h2>
+    <div class="vs-container">
+      <div class="player">
+        <div class="avatar">🧑</div>
+        <h3>Sabya</h3>
+        <p>Answers from memory & intuition</p>
+      </div>
+      <div class="vs">VS</div>
+      <div class="player">
+        <div class="avatar">🤖</div>
+        <h3>BrainTwin</h3>
+        <p>Answers from knowledge base + reasoning</p>
+      </div>
+    </div>
+    <div style="margin-top: 20px;">
+      <div class="cards">
+        <div class="card">
+          <h3>🎮 How It Works</h3>
+          <p>A third person (or you) asks open-ended questions to both. Riddle games, "who is this?", "what do you know about X?", current events — any format. Both answer independently, then compare.</p>
+          <div class="tech"><span>Telegram Group</span><span>Web UI</span><span>CLI</span></div>
+        </div>
+        <div class="card">
+          <h3>📊 Scoring</h3>
+          <p>Correct: +1 | Partial: +0.5 | Wrong: 0. Running scoreboard tracks You vs Agent over time. The quizmaster (or an LLM judge) decides correctness.</p>
+          <div class="tech"><span>Score tracking</span><span>History log</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- TECH STACK -->
+<div class="tech-stack">
+  <h2>Tech Stack & Tools</h2>
+  <div class="tech-grid">
+    <div class="tech-item">
+      <div class="t-icon">🐍</div>
+      <div><div class="t-name">Python 3.11+</div><div class="t-desc">Backend, processing, agent, bot</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">⚡</div>
+      <div><div class="t-name">FastAPI + Uvicorn</div><div class="t-desc">REST API backend server</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🔮</div>
+      <div><div class="t-name">ChromaDB</div><div class="t-desc">Local vector database</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🗃️</div>
+      <div><div class="t-name">SQLite</div><div class="t-desc">Structured metadata store</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🤖</div>
+      <div><div class="t-name">Claude API (Anthropic)</div><div class="t-desc">Enrichment (Haiku) + Agent (Sonnet)</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🔢</div>
+      <div><div class="t-name">sentence-transformers</div><div class="t-desc">Local embedding generation</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🌐</div>
+      <div><div class="t-name">Chrome Extension (Manifest V3)</div><div class="t-desc">Browser content capture</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">📱</div>
+      <div><div class="t-name">python-telegram-bot</div><div class="t-desc">Mobile capture via Telegram</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">📝</div>
+      <div><div class="t-name">Cursor IDE</div><div class="t-desc">AI-powered development environment</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">📄</div>
+      <div><div class="t-name">readability-lxml</div><div class="t-desc">Web page content extraction</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🎬</div>
+      <div><div class="t-name">youtube-transcript-api</div><div class="t-desc">YouTube video transcripts</div></div>
+    </div>
+    <div class="tech-item">
+      <div class="t-icon">🧪</div>
+      <div><div class="t-name">pytest</div><div class="t-desc">Testing framework</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="cost-bar">
+  <div>
+    <div class="cost-label">Estimated Monthly Cost: $5 – $15</div>
+    <div class="cost-detail">Claude API calls only. Everything else runs free on your local machine.</div>
+  </div>
+  <div>
+    <div class="cost-label">Hosting: Local First</div>
+    <div class="cost-detail">Runs on your laptop. Move to cloud later if needed.</div>
+  </div>
+</div>
+
+</body>
+</html>

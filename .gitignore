@@ -1,0 +1,37 @@
+# Environment
+.env
+venv/
+.venv/
+
+# Data (don't commit your knowledge base)
+data/chroma/
+data/images/
+data/*.db
+# Local capture pipeline (URLs, text previews, browsing-derived content)
+data/captures.jsonl
+data/capture_failures.jsonl
+data/telegram_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
