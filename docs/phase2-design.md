@@ -1,8 +1,12 @@
 # Phase 2 Design — Processing Pipeline (LLM Enrichment)
 
-> **Status as of 2026-04-27 — IMPLEMENTATION COMPLETE, AWAITING SMOKE TEST.**
+> **Status as of 2026-04-28 — PHASE 2 LIVE. Follow-up Phase 2.5 in design.**
 >
-> All 10 decisions (A, B, C, D, E, F, G, H, I, J) signed off in interview-format discussion. All planned files in the file map below are written and compile. Pending: end-to-end smoke test on Sabya's laptop with a real ANTHROPIC_API_KEY against `tests/test_enrichment.py` and a live `/capture` POST. Cross-check against `docs/architecture.html` (Phase 2 card) and `docs/architecture-detailed.md` (LLM Enrichment section) for the broader system context.
+> All 10 decisions (A, B, C, D, E, F, G, H, I, J) signed off, all files built, unit tests green, end-to-end smoke test passed on your laptop. Phase 2's enrichment pipeline runs as designed.
+>
+> **Smoke testing surfaced one real gap that's not an enrichment bug:** forwarding Instagram reels and Facebook share links from Telegram lands those captures in `capture_failures.jsonl` with `reason: "empty_content"`. Phase 2 correctly refused to call Haiku on `""` — but the empty content was a Phase 1 capture-layer hole (the bot sends URL-only payloads, the backend has no fetcher for non-YouTube URLs). Fixing it cleanly requires capture-time hydration plus enrichment-failure-log hygiene, which together are scoped as **[Phase 2.5 — Capture Hydration & Enrichment Hygiene](phase2.5-capture-hydration.md)**.
+>
+> Cross-check against `docs/architecture.html` (Phase 2 + Phase 2.5 cards) and `docs/architecture-detailed.md` (LLM Enrichment section) for the broader system context.
 
 ---
 
@@ -68,7 +72,7 @@ Deliberately deferred from this list:
 | F | Model choice | ✅ | Haiku for enrichment, Sonnet for the agent. Both behind a model-agnostic `LLMClient` interface so a local Llama can be swapped in later. No fine-tuning, no training from scratch. | Fine-tuning teaches *style* not *changing facts*. RAG is the right tool when your knowledge base updates daily. Local-Llama A/B test is a post-Phase-5 experiment. |
 | G | Article extraction strategy | ✅ | Send full text up to ~50k tokens. No pre-filtering / keyword extraction / chunking at MVP. Map-reduce only if a single capture exceeds 50k tokens (rare — basically only multi-hour podcasts and books). | Haiku context is 200k. A 1000-word article is 0.6% of that. Pre-filtering saves no money and loses nuance. |
 | E | Hallucination control in Phase 4 agent | ✅ | **v1: inline citations in the same Sonnet call.** System prompt forces the agent to cite a snippet ID for every claim or omit the claim. Adds ~10% output tokens. **v2: two-pass verification** is deferred — only build it if v1 leaks visibly during real quiz play. | "Doubles cost" framing was wrong (corrected: verification adds ~50%, not 100%). But cheaper-and-good-enough beats expensive-and-pre-emptive. Measure first, decide second. |
-| D | Language fidelity (multi-language consumption: English / Hindi / Odia / Telugu / German) | ✅ | **One unified rule for all languages.** Enrichment output in English with Latin script throughout. Names transliterated (Romanized), not translated — `दीपिका पादुकोण` becomes `Deepika Padukone`, `ఎన్టీఆర్` becomes `NTR`. Cultural keywords, idioms, untranslatable phrases preserved verbatim in their Romanized form within summaries and key_facts (`jugaad`, `kal mein soya tha`, `Schadenfreude`). System prompt explicitly tells Haiku that source content can be in any of these five languages, often code-switched. | Translation loses meaning; transliteration loses only script. Latin-script-everywhere is the lowest-common-denominator that Sabya can read across all five languages and that the agent can retrieve over consistently. Per-language exceptions are brittle. Native-script storage (`name_native`) deferred to Phase 5 if a real use case demands it (e.g., quizzing on Hindi spelling literacy). |
+| D | Language fidelity (multi-language consumption: English / Hindi / Odia / Telugu / German) | ✅ | **One unified rule for all languages.** Enrichment output in English with Latin script throughout. Names transliterated (Romanized), not translated — `दीपिका पादुकोण` becomes `Deepika Padukone`, `ఎన్టీఆర్` becomes `NTR`. Cultural keywords, idioms, untranslatable phrases preserved verbatim in their Romanized form within summaries and key_facts (`jugaad`, `kal mein soya tha`, `Schadenfreude`). System prompt explicitly tells Haiku that source content can be in any of these five languages, often code-switched. | Translation loses meaning; transliteration loses only script. Latin-script-everywhere is the lowest-common-denominator that you can read across all five languages and that the agent can retrieve over consistently. Per-language exceptions are brittle. Native-script storage (`name_native`) deferred to Phase 5 if a real use case demands it (e.g., quizzing on Hindi spelling literacy). |
 | B | Backfill existing JSONL rows | ✅ | **Backfill but skip test rows.** `scripts/backfill_enrichment.py` reads `data/captures.jsonl`, skips rows that look like test fixtures (URL contains `example.com`, `metadata.source` missing, `clean_text` empty, title is `"Telegram link"` with no body), enriches the rest. Idempotent — re-running skips already-enriched rows. | Preserves real captures (HSR rent article, etc.) without polluting the agent's knowledge base with mock-script fixtures. ~$0.05 in Haiku calls total. The test-row classifier is ~10 lines of conditional checks. |
 | H | Retry policy on enrichment failure + sync vs async | ✅ | **Enrichment runs ASYNC via FastAPI `BackgroundTasks`, not in the `/capture` request path.** `/capture` writes the raw row to `data/captures.jsonl` (with a generated `capture_id`) and returns 200 immediately. Background task calls Haiku with internal retry logic: 3 attempts on transient errors (network, 5xx, rate limit) with 0.5s/1s/2s backoff, 1 retry on malformed JSON with stricter prompt, no retry on permanent errors (4xx auth, content-too-long). On success, appends to sibling file `data/enrichments.jsonl` keyed by `capture_id`. On all-retries-exhausted, logs to `capture_failures.jsonl` with `phase: "enrichment"` and the row stays unenriched. **Crash recovery**: on FastAPI startup, scan for `capture_id`s in `captures.jsonl` that have no matching `enrichments.jsonl` row and re-queue them. **Manual catch-up**: `scripts/retry_failed_enrichments.py` does the same scan on demand. | Async is the right architectural answer — enrichment latency must not block capture. Two-file append-only design avoids JSONL update locking, matches Phase 3's natural SQLite shape (INSERT then UPDATE). BackgroundTasks is fine for single-worker FastAPI; multi-worker would need a real queue (Redis+RQ) but that's a Phase 5+ cloud-move concern. |
 | I | Cross-language duplicates of the same content | ✅ | **Phase 2: don't try to detect. Store both as separate captures.** Reserve `related_captures: []` empty field in the enrichment schema so Phase 3 can populate it without migration. Phase 3 adds embedding-based linking when ChromaDB lands: when a new capture is enriched, query ChromaDB for anything within last 7 days >0.85 cosine similarity, store mutual `related_captures` IDs. | Detecting duplicates pre-Chroma requires building parallel embedding infra; Chroma is Phase 3 anyway. Storing both loses no data — agent will surface both via topic/entity overlap even without explicit link. Merging would lose framing differences (Hindi version vs English version emphasize different things). |
@@ -113,7 +117,7 @@ Plus:
 
 | Item | What | Why deferred |
 |---|---|---|
-| **Per-user language config** | Move the "5 languages" list out of the hardcoded enrichment prompt and into a `.env` setting (`USER_LANGUAGES=english,hindi,odia,telugu,german`). The prompt builds dynamically from this list. Lets a friend who reads Mandarin / Tamil / Spanish fork the repo and configure for their own consumption profile without touching code. | BrainTwin-the-product is currently a single-user system tuned for Sabya. Open-sourcing for friends is a Phase 5+ concern. The hardcoded prompt for v1 is fine — it lifts cleanly into a configurable prompt later (one variable substitution). |
+| **Per-user language config** | Move the "5 languages" list out of the hardcoded enrichment prompt and into a `.env` setting (`USER_LANGUAGES=english,hindi,odia,telugu,german`). The prompt builds dynamically from this list. Lets a friend who reads Mandarin / Tamil / Spanish fork the repo and configure for their own consumption profile without touching code. | BrainTwin-the-product is currently a single-user system tuned for one operator. Open-sourcing for friends is a Phase 5+ concern. The hardcoded prompt for v1 is fine — it lifts cleanly into a configurable prompt later (one variable substitution). |
 | **Native-script entity field** | Optional `name_native` per entity — preserves source-script spelling alongside the Romanized form. Backfilled via a re-enrichment pass when needed. | Locked Decision D's "Latin script everywhere" rule covers all current use cases. Add `name_native` only when a real Phase 5 quiz use case demands it (e.g., script-literacy quizzes). |
 | **Per-language summary variants** | `summary_native` field for content where preserving cultural tone in the source language is more useful than English-only. | Same logic — solve when a real use case shows up, not pre-emptively. |
 
@@ -126,10 +130,29 @@ Plus:
 
 ---
 
-## Next: smoke-test on Sabya's laptop
+## Next: smoke-test on your laptop
 
 All planned files in the file map above are written, compile, and the unit tests are in place. To turn the green-light on Phase 2:
 
 1. Set `ANTHROPIC_API_KEY=sk-ant-...` in `.env`.
 2. Follow [docs/phase2-smoke-test.md](phase2-smoke-test.md) — 7 numbered passes from offline unit tests through bot `/failures` integration.
 3. When all 7 are green, flip this doc's status from "AWAITING SMOKE TEST" to "PHASE 2 LIVE" and start Phase 3 (storage layer — ChromaDB + SQLite).
+
+---
+
+## Phase 2.5 follow-up (2026-04-28)
+
+Smoke testing passed all 7 numbered passes, but real-world use immediately surfaced an issue that Phase 2 cleanly refused to mask:
+
+**Bug:** Forwarding Instagram reels (`/reel/...`, `/p/...`) and Facebook share links (`/share/...`) to the Telegram bot writes capture rows with `text=""`, `images=[]`, `title="Telegram link"` — and the enrichment worker then logs them as `phase: "enrichment", reason: "empty_content"` failures.
+
+**Diagnosis:** Not an enrichment bug. The bot sends URL-only payloads; the backend's `extract()` only knows YouTube; nothing fetches IG/FB content; the enricher correctly refuses to call Haiku on nothing. The misleading comment `"backend fetches the page itself"` in `handlers.py:333` is a smoking gun — it claims behavior the backend never had.
+
+**Fix scope:** [Phase 2.5 — Capture Hydration & Enrichment Hygiene](phase2.5-capture-hydration.md) — four ordered, independently shippable fixes (~6 hours total, ~$0 recurring):
+
+1. **Hygiene:** re-tag `EmptyContentError` / `ContentTooLongError` as `phase: "enrichment_skipped"` so the failure log only counts real failures.
+2. **Free metadata layer:** Telegram link-preview pickup + Open Graph fetcher in `processor.py`. Hydrates ~80% of URL-only captures for $0.
+3. **Local video transcription:** `yt-dlp` + `whisper.cpp small.en` for IG reels / FB videos. Captures actual spoken content for $0/mo (250 MB disk).
+4. **Verify + doc:** replay the original failure URLs, document the new tier order in `docs/phase2-smoke-test.md`.
+
+Phase 3 (storage layer) starts after Phase 2.5 is green.

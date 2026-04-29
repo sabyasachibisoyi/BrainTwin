@@ -1,6 +1,6 @@
 # Phase 2 Smoke Test — Enrichment End-to-End
 
-Phase 2 adds an LLM enrichment step to the capture pipeline. This guide walks through proving it works on Sabya's laptop, in numbered passes, so when something breaks you know exactly which seam.
+Phase 2 adds an LLM enrichment step to the capture pipeline. This guide walks through proving it works on your laptop, in numbered passes, so when something breaks you know exactly which seam.
 
 What we're proving: **`/capture` → `data/captures.jsonl` (with `capture_id`) → FastAPI BackgroundTasks → enrichment_worker → Claude Haiku → `data/enrichments.jsonl`**.
 

@@ -219,7 +219,7 @@ Mirror `phase1-smoke-test.md`'s structure:
 
 The bot acks every received message with `📥 Captured` within ~1s. On successful processing it stays silent — no false-confidence summary. On failure it replies with one short line: `⚠️ Couldn't fetch — paywall` (or whatever the reason). Every failure also gets persisted to `data/capture_failures.jsonl` so a future agent can surface them on laptop wake or as a daily Telegram digest.
 
-> *Rationale: Sabya's brain doesn't tell him "I remembered that"; the only true test is the quiz. So the bot mirrors that — silent on success, vocal only when the data didn't make it in.*
+> *Rationale: your brain doesn't tell you "I remembered that"; the only true test is the quiz. So the bot mirrors that — silent on success, vocal only when the data didn't make it in.*
 
 ### Decision 2 — Voice notes → **Out of scope for Phase 1**
 
@@ -238,7 +238,7 @@ Rule of thumb: **capture what arrived in your stream of consumption; ignore your
 | Quote-reply on an earlier capture: "this connects to the Tata thing" | Ignore. (Pure spoonfed connection.) |
 | Bare typed text, no URL/image | Ignore. (Your thought.) |
 
-> *Rationale: BrainTwin must develop its own emotional intelligence and connection-sense from observed consumption patterns — forwarding-chat origin, time of day, frequency clusters, dwell time, content's own emotional valence. Hand-feeding labels would corrupt the test of whether the system can think like Sabya on its own.*
+> *Rationale: BrainTwin must develop its own emotional intelligence and connection-sense from observed consumption patterns — forwarding-chat origin, time of day, frequency clusters, dwell time, content's own emotional valence. Hand-feeding labels would corrupt the test of whether the system can think like you on its own.*
 
 ---
 
@@ -255,7 +255,7 @@ All shipped:
 7. ✅ Wrote `scripts/mock_telegram_capture.py` — offline simulator with 4 scenarios (text/image/album/forward), stdlib-only.
 8. ✅ Updated `docs/phase1-smoke-test.md` with Part B — 7 numbered Telegram passes from BotFather setup through laptop-sleep catch-up.
 9. ✅ Hardened bot replies — removed `quote=True` (incompatible with python-telegram-bot v21+) and `parse_mode="Markdown"` (fragile with user data) so failures are loud, not silent.
-10. ✅ Verified end-to-end: Sabya forwarded a real article from his phone → `📥 Captured` reply → `data/captures.jsonl` gained a row with `metadata.source: "telegram"`.
+10. ✅ Verified end-to-end: a real article forwarded from your phone → `📥 Captured` reply → `data/captures.jsonl` gained a row with `metadata.source: "telegram"`.
 
 ### Known open polish items (small, optional, not blocking Phase 2)
 
@@ -269,9 +269,9 @@ These were considered and explicitly deferred. Each is a self-contained later-se
 | Item | What | Why deferred |
 |---|---|---|
 | **Cloud / always-on bot** | Move the bot (and eventually backend) to a free Render / Railway / fly.io instance and switch from polling to webhook. Telegram POSTs to the public URL → bot processes → POSTs into your backend over a tunnel or hosted backend. Eliminates the ~24h Telegram getUpdates retention limit and the "laptop was off" gap entirely. | Phase 1 only needs to prove the capture pipeline works. ~24h queue is more than enough for a laptop on most of the day. Cloud move adds deployment + tunneling complexity that isn't needed yet. |
-| **Voice transcription** | Local Whisper (free, slow on CPU) or OpenAI Whisper API (~$0.006/min, fast). Adds a `voice` content type and runs the audio through transcription before posting. | Adds a dependency, latency budget, and (for cloud Whisper) a second API key. Most of mobile consumption is text/image. Revisit when WhatsApp voice forwards become a real chunk of what Sabya consumes. |
-| **Failure-summary agent** | Small daemon (or extension popup hook) that reads `data/capture_failures.jsonl` and on laptop wake sends Sabya a Telegram digest: *"Yesterday: 23 captures, 2 failures (paywall ×1, timeout ×1)."* Maybe also surfaces in the Chrome popup. | Phase 1 already persists every failure to `capture_failures.jsonl` and replies inline on the failing message; the digest is a quality-of-life add, not load-bearing. |
-| **Style / voice corpus** | Capture Sabya's typed text into a separate `data/style_corpus.jsonl` (firewalled from the knowledge graph) so the Phase 5 quiz bot can mirror his actual texting style — emoji choices, sparseness, "lol" sarcasm vs. sincerity. | Phase 5 problem. Phase 1's "don't capture thoughts" rule preserves test integrity; style mirroring sits at generation time, not knowledge time. |
+| **Voice transcription** | Local Whisper (free, slow on CPU) or OpenAI Whisper API (~$0.006/min, fast). Adds a `voice` content type and runs the audio through transcription before posting. | Adds a dependency, latency budget, and (for cloud Whisper) a second API key. Most of mobile consumption is text/image. Revisit when WhatsApp voice forwards become a real chunk of what you consume. |
+| **Failure-summary agent** | Small daemon (or extension popup hook) that reads `data/capture_failures.jsonl` and on laptop wake sends you a Telegram digest: *"Yesterday: 23 captures, 2 failures (paywall ×1, timeout ×1)."* Maybe also surfaces in the Chrome popup. | Phase 1 already persists every failure to `capture_failures.jsonl` and replies inline on the failing message; the digest is a quality-of-life add, not load-bearing. |
+| **Style / voice corpus** | Capture your typed text into a separate `data/style_corpus.jsonl` (firewalled from the knowledge graph) so the Phase 5 quiz bot can mirror your actual texting style — emoji choices, sparseness, "lol" sarcasm vs. sincerity. | Phase 5 problem. Phase 1's "don't capture thoughts" rule preserves test integrity; style mirroring sits at generation time, not knowledge time. |
 | **Emoji-reaction feedback** | Treat 👍 / 👎 reactions on bot quiz answers as labeled feedback ("the twin got this right / wrong"). | Phase 5 problem — no quiz exists yet. Worth knowing the data path is reserved. |
 | **Webhook + zero-loss buffering** | Even before full cloud move, switching to webhook mode behind ngrok / Cloudflare Tunnel removes the polling delay and the 24h Telegram retention cap. | Same logic as cloud move — overkill for Phase 1 personal-laptop use. |
 
@@ -289,7 +289,7 @@ Right now `/capture` does only what Phase 1 needs: text normalization, optional 
 
 1. **Re-read the phasing.** Open `docs/architecture.html` and confirm the Processing Pipeline card matches your current intent — it's the source of truth for what fields enrichment must produce.
 2. **Audit the stub.** `backend/knowledge/` exists but is largely empty. List what's there, decide what stays, what's renamed, what's new.
-3. **Design the enrichment schema.** A new pydantic model (e.g. `EnrichedCapture`) on top of `CapturePayload` with: `summary` (1-2 sentence), `entities` (people / orgs / places), `topics` (free-text tags), `sentiment` (the consumed content's emotional valence — *not* Sabya's), `content_type_refined` (e.g. "news/politics/india", "meme/text-on-image"), and `language`. Keep it small — every field must earn its place by being something the Phase 4 agent will actually query on.
+3. **Design the enrichment schema.** A new pydantic model (e.g. `EnrichedCapture`) on top of `CapturePayload` with: `summary` (1-2 sentence), `entities` (people / orgs / places), `topics` (free-text tags), `sentiment` (the consumed content's emotional valence — *not* yours), `content_type_refined` (e.g. "news/politics/india", "meme/text-on-image"), and `language`. Keep it small — every field must earn its place by being something the Phase 4 agent will actually query on.
 4. **Pick the model.** `.env` already has `ENRICHMENT_MODEL=claude-haiku-4-5-20251001`. Haiku is cheap enough to run on every capture; Sonnet is for the agent. Stick with the split.
 5. **Wire it into `/capture`.** The natural seam is *after* JSONL append (so raw capture is never lost if enrichment fails) and *before* any later phase's storage write. Enrichment failure should land its own row in `capture_failures.jsonl` with `phase: "enrichment"` so the existing `/failures` endpoint and Decision-1 telegram digest both surface it.
 6. **Write a smoke test.** Add Part C to `docs/phase1-smoke-test.md` (or start `phase2-smoke-test.md`) with: text-only article in → enriched fields out; image-only meme in → vision description fed to enricher → topics out; YouTube link in → transcript-driven topics out.
@@ -310,7 +310,7 @@ Neither blocks Phase 2; both make the system slightly more pleasant to live with
 - **Don't start the Chrome popup redesign / extension polish.** It works; leave it.
 - **Don't add voice-note transcription yet.** It's deferred for a reason (Part 5 — voice forwards aren't a big enough share of mobile consumption to justify the dependency).
 - **Don't move the bot to cloud yet.** Same reason — laptop-on-most-of-the-day + 24h Telegram queue covers the gap. Revisit when Phase 3 storage is in place and you actually need 24/7 ingestion for accuracy.
-- **Don't capture typed thoughts.** Decision 3 stays locked through Phase 4. If Phase 5 quiz mode needs Sabya's voice, that's a separate `style_corpus.jsonl` (Part 5), not a relaxation of the capture rule.
+- **Don't capture typed thoughts.** Decision 3 stays locked through Phase 4. If Phase 5 quiz mode needs your voice, that's a separate `style_corpus.jsonl` (Part 5), not a relaxation of the capture rule.
 
 ---
 

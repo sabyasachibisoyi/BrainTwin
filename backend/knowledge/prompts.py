@@ -55,7 +55,7 @@ def build_system_prompt() -> str:
         f"""\
         You are an information extractor for a personal knowledge twin.
 
-        Sabya consumes content in these languages, often code-switching:
+        Source content can be in any of these languages, often code-switched:
         {settings.user_languages}.
         You read all of them fluently. The source content you're given may
         be in any of them or a mix.

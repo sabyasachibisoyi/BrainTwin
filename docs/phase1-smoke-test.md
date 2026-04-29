@@ -143,7 +143,7 @@ Goal: prove **phone (forward / share)  →  Telegram cloud  →  bot polling on 
 
 These steps happen once per machine — you only repeat them if you switch bots.
 
-1. **Create the bot.** In the Telegram app on your phone, open a chat with `@BotFather`. Send `/newbot`, give it a display name (e.g. *"Sabya BrainTwin"*) and a unique username ending in `bot` (e.g. `sabya_braintwin_bot`). BotFather will reply with a token like `123456789:ABCdef...`.
+1. **Create the bot.** In the Telegram app on your phone, open a chat with `@BotFather`. Send `/newbot`, give it a display name (e.g. *"<your-name> BrainTwin"*) and a unique username ending in `bot` (e.g. `<your-name>_braintwin_bot`). Telegram requires bot usernames to be globally unique, so substitute your own name. BotFather will reply with a token like `123456789:ABCdef...`.
 2. **Save the token.** Open `~/Desktop/LLM/BrainTwin/.env` and set:
    ```
    TELEGRAM_BOT_TOKEN=123456789:ABCdef...
