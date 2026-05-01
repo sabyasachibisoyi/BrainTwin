@@ -20,6 +20,15 @@ lxml
 beautifulsoup4
 newspaper3k
 youtube-transcript-api
+# Phase 2.5 Fix 2 — fast HTML parser for OG / Twitter Card metadata.
+# 5x faster than BeautifulSoup, no lxml C-ext dependency footprint
+# beyond what readability-lxml already pulls in.
+selectolax
+# Phase 2.5 Fix 3 — pulls audio-only streams from IG/FB/TikTok/YouTube
+# for local Whisper transcription. Update with `pip install -U yt-dlp`
+# every 2-4 weeks when extractors break — that's the maintenance cost
+# we accepted at sign-off.
+yt-dlp
 
 # Image Processing
 Pillow

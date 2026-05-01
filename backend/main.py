@@ -352,7 +352,24 @@ async def get_stats():
                 ents = (rec.get("enrichment") or {}).get("entities") or []
                 if isinstance(ents, list):
                     total_entities += len(ents)
-    pending_enrichment = max(0, len(capture_ids - enriched_ids))
+
+    # Phase 2.5 Fix 1 — capture_ids deliberately skipped (empty / oversized
+    # content). Subtract these from `pending` so the metric reflects real
+    # backlog, not nothing-to-do work. Surface separately as `skipped`.
+    skipped_ids: set[str] = set()
+    if FAILURES_LOG.exists():
+        with FAILURES_LOG.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("phase") != "enrichment_skipped":
+                    continue
+                cid = rec.get("capture_id")
+                if isinstance(cid, str) and cid:
+                    skipped_ids.add(cid)
+    pending_enrichment = max(0, len(capture_ids - enriched_ids - skipped_ids))
 
     return {
         "total_captures": total,
@@ -362,18 +379,31 @@ async def get_stats():
         "enrichments": {
             "total": len(enriched_ids),
             "pending": pending_enrichment,
+            "skipped": len(skipped_ids),
         },
     }
 
 
 @app.get("/failures")
-async def get_failures(limit: int = 10, phase: str | None = None):
+async def get_failures(
+    limit: int = 10,
+    phase: str | None = None,
+    include_skipped: bool = False,
+):
     """Last N capture failures from data/capture_failures.jsonl.
 
     Read by the bot's `/failures` command and (later) by the digest agent.
-    Phase 2 (Decision C): rows include `phase: "capture"` (default if
-    missing — older Phase 1 rows) or `phase: "enrichment"`. The bot can
-    filter or group by phase.
+    Phase tags (Decision C + Phase 2.5 Fix 1):
+      - `capture`             — capture-side failure (default for legacy rows
+                                that pre-date the phase field).
+      - `enrichment`          — real enrichment failure (network, auth,
+                                malformed JSON after retry, etc.).
+      - `enrichment_skipped`  — nothing-to-enrich case (empty / oversized).
+                                Excluded from the default response so the
+                                failure metric reflects real failures only.
+
+    Pass `?include_skipped=true` to see them in the breakdown, or
+    `?phase=enrichment_skipped` to see only those rows.
     """
     rows: list[dict[str, Any]] = []
     if FAILURES_LOG.exists():
@@ -389,7 +419,12 @@ async def get_failures(limit: int = 10, phase: str | None = None):
                 rows.append(row)
 
     if phase:
+        # Explicit filter wins — caller asked for one phase.
         rows = [r for r in rows if r.get("phase") == phase]
+    elif not include_skipped:
+        # Phase 2.5 Fix 1 — by default, hide skipped rows from the
+        # failures view so they don't pollute the real failure metric.
+        rows = [r for r in rows if r.get("phase") != "enrichment_skipped"]
 
     by_phase: dict[str, int] = {}
     for r in rows:
