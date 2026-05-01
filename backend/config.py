@@ -62,6 +62,48 @@ class Settings(BaseSettings):
     # from .env per Decision D's portability note.
     user_languages: str = "English, Hindi, Odia, Telugu, German"
 
+    # ----- Phase 2.5 (capture hydration) -----
+    # Sidecar to captures.jsonl — one row per hydration that filled in
+    # an empty capture from OG / Twitter Card / HTML metadata or (Fix 3)
+    # video transcription. Original captures.jsonl row stays untouched
+    # as audit trail; consumers join via capture_id. See
+    # docs/phase2.5-capture-hydration.md.
+    hydrations_path: str = "./data/hydrations.jsonl"
+    # OG fetcher network budget. 5s is generous for the first byte and
+    # tight enough that one slow site doesn't stall a worker.
+    og_fetch_timeout_seconds: float = 5.0
+    # Cap redirects so we don't get strung along chain-of-shorteners.
+    og_fetch_max_redirects: int = 2
+    # Toggle for the OG fetcher. Set false to fall back to pre-Phase-2.5
+    # behaviour (empty captures land in enrichment_skipped immediately).
+    # Useful if a particular site hangs the worker and we want to ship
+    # the disable without a redeploy.
+    og_fetch_enabled: bool = True
+
+    # ----- Phase 2.5 Fix 3 (local video transcription) -----
+    # Master kill-switch for yt-dlp + whisper.cpp pipeline. Set false to
+    # fully bypass video transcription (useful when whisper-cli isn't
+    # installed yet, or when shipping the code before the model is
+    # downloaded). Default true — let the orchestrator decide per URL.
+    video_transcribe_enabled: bool = True
+    # Hard cap on video length in seconds. Anything longer is logged as
+    # enrichment_skipped with reason "video_too_long" — most reels are
+    # <90s, podcast clips <10 min; longer than that probably wants its
+    # own handling (multi-chunk transcribe, summarize-then-merge).
+    video_max_duration_seconds: int = 600  # 10 minutes
+    # Where the whisper.cpp model lives. Downloaded once via
+    # scripts/setup_whisper.sh after `brew install whisper-cpp`.
+    # Gitignored — too big and per-machine.
+    whisper_model_path: str = "./data/models/ggml-small.en.bin"
+    # Path to the whisper-cli binary. Default matches `brew install
+    # whisper-cpp` on Apple-silicon Macs (Intel Macs use /usr/local/bin).
+    # Override via .env if your homebrew prefix differs.
+    whisper_binary_path: str = "/usr/local/bin/whisper-cli"
+    # Where yt-dlp drops the temp audio file before whisper consumes it.
+    # System /tmp is fine; we delete after each transcription. Configurable
+    # so a future on-disk-encrypted /tmp doesn't slow runs unexpectedly.
+    video_temp_dir: str = "/tmp"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

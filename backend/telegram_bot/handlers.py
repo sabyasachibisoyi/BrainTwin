@@ -262,7 +262,14 @@ async def cmd_failures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines = [header]
         for r in recent[-10:]:
             phase = r.get("phase", "capture")
-            tag = "[enrich]" if phase == "enrichment" else f"[{r.get('source','?')}]"
+            # Phase 2.5 Fix 1 — distinguish skipped (not-applicable) from
+            # real enrichment failures and capture-side failures.
+            if phase == "enrichment_skipped":
+                tag = "[skipped]"
+            elif phase == "enrichment":
+                tag = "[enrich]"
+            else:
+                tag = f"[{r.get('source','?')}]"
             lines.append(
                 f"• {r.get('timestamp','')} {tag} {r.get('reason','?')[:80]}"
             )

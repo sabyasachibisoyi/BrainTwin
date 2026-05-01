@@ -166,23 +166,26 @@ Claude Vision API  →  describe image, extract text, identify context
 Custom parsers per platform  →  extract structured data from DOM
 ```
 
-##### A.1. Capture Hydration Tiers (Phase 2.5 — in design)
+##### A.1. Capture Hydration Tiers (Phase 2.5)
 
-> **Built in Phase 2.5.** See [phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
+> **In progress (2026-04-29):** Fix 1 + Fix 2.A shipped, Fix 2.B cancelled (Bot API limitation), Fix 3 next. See [phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
 
 Phase 1 + 2 left a real gap: when the Telegram bot forwards a URL (Instagram reel, Facebook share link, news article), the bot can only send `text=""` because Telegram's Bot API delivers just the URL, not the rendered preview. The backend's `extract()` only special-cases YouTube, so everything else lands at the enricher with empty content and gets refused.
 
-Phase 2.5 closes the gap with a tiered hydration model that runs at capture time, before the row is persisted:
+Phase 2.5 closes the gap with a tiered hydration model. Hydration runs **inside the enrichment BackgroundTask, before `enrich()` is called** (revised from the original "at capture time" design — keeps the bot's `📥 Captured` ack fast and keeps `captures.jsonl` immutable):
 
 ```
-1. Use raw_text if non-empty                  (Chrome extension already extracted)
-2. Else use Telegram preview if present        (FREE — Telegram already crawled)
-3. Else fetch og:title / og:description / og:image from URL  (one HTTP GET)
-4. Else if video URL → yt-dlp + whisper.cpp local transcription
-5. Else mark `phase: "enrichment_skipped"` — nothing left to try
+1. Use raw_text if non-empty                                    (Chrome extension already extracted)  ✅ Phase 1
+2. Else fetch og:title / og:description from URL  (one HTTP GET)                                       ✅ Fix 2.A shipped
+3. Else if video URL → yt-dlp + whisper.cpp local transcription                                        ⏭️ Fix 3 next
+4. Else mark `phase: "enrichment_skipped"` — nothing left to try                                       ✅ Fix 1 shipped
 ```
 
-Tiers 1-2 are zero-cost. Tier 3 is one HTTP request via `httpx` + `selectolax` parser. Tier 4 uses local `whisper.cpp` `small.en` (~5s per 30s reel on M-series Mac, $0/month). Tier 5 is a logging-only sentinel separate from real failures (Phase 2.5 hygiene Fix 1).
+(Originally a 5-tier plan with a "Telegram preview pickup" tier between 1 and 2. That tier was cancelled when we discovered the Bot API doesn't expose preview content — it only exposes `LinkPreviewOptions` settings. The OG fetcher provides the same content via one HTTP GET.)
+
+When tier 2 or 3 fires, the orchestrator writes a sidecar row to `data/hydrations.jsonl` (one row per capture_id, joined to `captures.jsonl` and `enrichments.jsonl` at read time). The `tier` field tags which layer hydrated each capture so future debugging knows where to look. The original `captures.jsonl` row stays as the immutable record of what arrived from the client.
+
+Tier 1 is zero-cost. Tier 2 is one HTTP request via `httpx` + `selectolax` parser. Tier 3 uses local `whisper.cpp` `small.en` (~5s per 30s reel on M-series Mac, $0/month). Tier 4 is a logging-only sentinel separate from real failures (Phase 2.5 hygiene Fix 1).
 
 #### B. LLM Enrichment
 

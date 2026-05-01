@@ -13,6 +13,13 @@ data/captures.jsonl
 data/capture_failures.jsonl
 data/telegram_state.json
 data/enrichments.jsonl
+# Phase 2.5 Fix 2 — capture hydration sidecar (joined to captures.jsonl)
+data/hydrations.jsonl
+# Phase 2.5 Fix 3 — Whisper model files (~250 MB each, per-machine)
+data/models/
+# Phase 2.5 Fix 3 — vendored binaries if a future setup ever drops them
+# here. Default install uses brew so this dir stays empty for most.
+bin/
 
 # Python
 __pycache__/

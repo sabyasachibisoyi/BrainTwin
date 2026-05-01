@@ -258,6 +258,140 @@ The `[enrich]` tag identifies enrichment-phase failures; `[chrome]` / `[telegram
 
 ---
 
-## When all 7 passes are green
+## Pass 8 — Capture hydration (Phase 2.5)
 
-You're done with Phase 2. Update [docs/phase2-design.md](phase2-design.md) status from "AWAITING SMOKE TEST" to "PHASE 2 LIVE" and move on to Phase 3 (storage layer — ChromaDB + SQLite).
+Goal: prove the tiered hydration model (OG metadata + local video transcription) actually closes the gap that surfaced after Pass 1 — IG/FB URL forwards landing in `capture_failures.jsonl` with `reason: "empty_content"`. Design + per-fix file lists are in [docs/phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
+
+### Pass 8.0 — One-time setup
+
+```bash
+cd ~/Desktop/LLM/BrainTwin
+source venv/bin/activate
+
+# Phase 2.5 deps: selectolax (HTML parser) + yt-dlp (audio extractor)
+pip install -r requirements.txt
+
+# whisper.cpp + small.en model + ffmpeg (idempotent)
+bash scripts/setup_whisper.sh
+```
+
+The setup script installs `whisper-cpp` and `ffmpeg` via Homebrew if not already present, downloads `ggml-small.en.bin` (~244 MB) into `data/models/`, and sanity-checks both. ffmpeg is mandatory — whisper.cpp can't decode m4a/webm/opus, so we pre-convert via ffmpeg.
+
+### Pass 8.1 — Unit tests (offline)
+
+```bash
+pytest tests/test_og_fetcher.py tests/test_video_transcriber.py tests/test_replay_failed_urls.py -v 2>&1 | tail -20
+# Re-run the existing enrichment suite too — Phase 2.5 added merge tests:
+pytest tests/test_enrichment.py -v 2>&1 | tail -20
+```
+
+All-green expected on every suite. The video-transcriber tests use mocked subprocesses, so this works even before Pass 8.0 is finished.
+
+### Pass 8.2 — Single fresh IG/FB reel forward (live, end-to-end)
+
+Backend + bot both running. From your phone, open Instagram or Facebook, find any reel with spoken content, share to your BrainTwin bot.
+
+```bash
+# Terminal — watch the hydration sidecar in real time
+tail -f data/hydrations.jsonl
+```
+
+Expected log lines (in the uvicorn terminal):
+
+```
+INFO  Processing capture: platform=instagram url=https://...
+INFO  hydrate[xxxxxxxx] hydrated tier=video_transcript tiers_used=['og_metadata', 'video_transcript'] title_replaced=True clean_text_chars=1247
+INFO  enrich[xxxxxxxx] enriched (N entities, N facts, N topics)
+```
+
+| Check | What you should see |
+|---|---|
+| `data/hydrations.jsonl` last row | `tier: "video_transcript"`, `tiers_used: ["og_metadata", "video_transcript"]`, `transcript.chars > 0`, `og.source` populated. |
+| `data/enrichments.jsonl` last row | Non-empty `summary`, `key_facts`, `topics` that reference what was *said* in the reel — not just the post caption. |
+| `/tmp/braintwin_yt_*` after the run | Empty / removed. The orchestrator cleans up its temp dir. |
+| `/stats` | `enrichments.total` increased by 1, `enrichments.skipped` unchanged. |
+
+### Pass 8.3 — Article URL falls through to OG only
+
+Forward (or paste in browser → bookmarklet) any news article URL — something with proper `og:title` + `og:description`. The hydration row should be:
+
+```
+tier: "og_metadata"
+tiers_used: ["og_metadata"]
+og: { source: "og", description_chars: NN, ... }
+# no transcript block — non-video URL, transcription tier didn't fire
+```
+
+### Pass 8.4 — YouTube URL still uses the existing transcript path
+
+Forward a YouTube video URL. The Phase 1 YouTube transcript extractor runs first inside `processor.process()`, so `clean_text` is non-empty before hydration is even reached. You should see:
+
+```
+INFO  Processing capture: platform=youtube url=...
+# NO hydrate[...] line — _needs_hydration() returned False because content already present
+INFO  enrich[xxxxxxxx] enriched (...)
+```
+
+`data/hydrations.jsonl` gains no row for this capture. The Phase 1 path is preserved.
+
+### Pass 8.5 — Replay the historical IG/FB failures
+
+Now the four IG/FB URLs from the original Pass-1 bug (and any similar URL-only forwards that landed in `enrichment_skipped` since Fix 1 shipped) deserve a re-run through the now-fixed pipeline.
+
+```bash
+# Backend must be running.
+
+# 1. Dry-run first — shows what would be replayed without POSTing.
+python -m scripts.replay_failed_urls --dry-run
+
+# 2. Real run — replays each unique URL through /capture in bot-style.
+#    Throttled by default to be polite to the backend + Anthropic API.
+python -m scripts.replay_failed_urls
+
+# 3. Restrict to one phase if you want:
+python -m scripts.replay_failed_urls --phase enrichment_skipped --limit 10
+```
+
+What it does:
+
+- Reads `data/capture_failures.jsonl`, keeps rows tagged `enrichment` or `enrichment_skipped` (skips `capture` — those need different fixes).
+- Dedupes by URL (first occurrence wins).
+- Skips URLs whose original `capture_id` already has a successful row in `data/enrichments.jsonl` (idempotent — safe to re-run any number of times).
+- POSTs each survivor to `/capture` with the bot's payload shape, so the full Phase 2.5 hydration pipeline runs end-to-end.
+
+Expected summary line:
+
+```
+Replay summary: N ok, 0 failed, M skipped (already enriched).
+```
+
+Verification after the replay:
+
+```bash
+# How many IG/FB URLs from the original bug now have hydrations?
+grep -c '"tier": "video_transcript"' data/hydrations.jsonl
+grep -c '"tier": "og_metadata"' data/hydrations.jsonl
+
+# /stats should show enrichments.total ticked up by N, skipped unchanged
+curl -s http://127.0.0.1:8000/stats | python -m json.tool
+
+# Spot-check that what was previously empty now has content
+tail -1 data/enrichments.jsonl | python -m json.tool
+```
+
+### Common Pass-8 failure modes
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| Hydration log shows `tier=og_metadata` for an IG reel (no transcript) | whisper-cli, ffmpeg, or the model file isn't where the backend expects | Run Pass 8.0 again. Check `which whisper-cli && which ffmpeg && ls -la data/models/`. If paths differ from defaults, set `WHISPER_BINARY_PATH` in `.env`. |
+| Log says `whisper-cli succeeded but produced no readable transcript` with `decode time = 0.00 ms` | whisper.cpp got an encoded audio it can't decode (m4a/webm/opus) | ffmpeg conversion is missing. `brew install ffmpeg`, restart uvicorn. |
+| Log says `yt-dlp probe failed for ...` | yt-dlp's IG/FB extractor broke (they ship breakage every few weeks) | `pip install -U yt-dlp` and re-forward. |
+| `replay_failed_urls.py` reports "Backend not reachable" | Backend isn't running | Start uvicorn in another terminal. |
+| `replay_failed_urls.py` reports "0 ok" with everything skipped | Every URL in failures.jsonl already has an enrichment row | Working as designed. Add `--force`-equivalent in a future ship if you need to re-enrich. |
+| Reel forward produces a transcript but enrichment row's `summary` ignores it | LLM prompt doesn't surface transcript content well — separate concern from hydration | Inspect with `tail -1 data/enrichments.jsonl`; if recurring, tune `backend/knowledge/prompts.py`. |
+
+---
+
+## When all 8 passes are green
+
+You're done with Phase 2 + Phase 2.5. Update [docs/phase2-design.md](phase2-design.md) status from "AWAITING SMOKE TEST" to "PHASE 2 LIVE" and [docs/phase2.5-capture-hydration.md](phase2.5-capture-hydration.md) status to "PHASE 2.5 LIVE", then move on to Phase 3 (storage layer — ChromaDB + SQLite).
