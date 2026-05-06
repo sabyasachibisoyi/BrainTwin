@@ -42,6 +42,11 @@ aiohttp
 
 # Database
 aiosqlite
+# Phase 3 storage layer — SQLAlchemy Core (not the Declarative ORM) for
+# query building + dialect handling, with aiosqlite (local) and asyncpg
+# (cloud) as async drivers. Same schema works in both.
+sqlalchemy[asyncio]>=2.0
+asyncpg                            # Postgres async driver, pulled in for cloud migration
 
 # Testing
 pytest
