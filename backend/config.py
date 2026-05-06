@@ -104,6 +104,33 @@ class Settings(BaseSettings):
     # so a future on-disk-encrypted /tmp doesn't slow runs unexpectedly.
     video_temp_dir: str = "/tmp"
 
+    # ----- Phase 3 (storage layer — SQL + Vector) -----
+    # Per docs/phase3-design.md A.1: SQLite locally, Postgres in cloud.
+    # The url string is the only thing that changes between the two —
+    # `sqlite:///./data/braintwin.db` locally, `postgresql://...` in cloud.
+    # We translate `sqlite://` → `sqlite+aiosqlite://` and `postgresql://`
+    # → `postgresql+asyncpg://` automatically inside backend/storage/db.py.
+    database_url: str = "sqlite:///./data/braintwin.db"
+    # Echo SQL queries to stdout. Useful when debugging slow queries or
+    # checking what SQLAlchemy generates from a Core expression. Off by
+    # default — can be flipped without a redeploy.
+    database_echo: bool = False
+    # Phase 3 dual-write window (B.1). When true, /capture and the
+    # enrichment worker write to BOTH the existing JSONLs AND the new
+    # SQL/Chroma store. Phase 3.5 will set this false and remove the
+    # JSONL writers entirely.
+    storage_dual_write: bool = True
+    # Phase 3 controlled-vocabulary threshold (B.7). When the enrichment
+    # LLM proposes a topic/entity, we look up the K most similar existing
+    # ones via embedding cosine similarity. Anything above this threshold
+    # is considered a match (the LLM may not coin a new slug). Lower =
+    # more permissive, more topics. Higher = more aggressive reuse.
+    vocabulary_match_threshold: float = 0.75
+    # How many candidate existing topics/entities to surface to the LLM
+    # per enrichment call. Higher = more LLM input tokens but better
+    # reuse. Start small; tune if dedup quality is poor.
+    vocabulary_candidate_top_k: int = 30
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
