@@ -317,6 +317,11 @@ async def enqueue_enrichment(
         # / topics / entities into SQL + Chroma. Best-effort: any
         # SQL/Chroma failure is caught inside sync_enrichment, logged,
         # and swallowed so the JSONL path stays unaffected.
+        #
+        # TODO(Phase 5+): when fallback models are wired (e.g.
+        # haiku → sonnet on transient errors), record the model that
+        # actually responded — `settings.enrichment_model` is the
+        # configured primary, not necessarily the one that ran.
         await sync_enrichment(
             capture_id=capture_id,
             summary=enrichment.get("summary"),
