@@ -36,6 +36,18 @@ from backend.storage.db import (
     init_db,
     session_scope,
 )
+from backend.storage.chunking import (
+    ALL_SOURCE_KINDS,
+    DEFAULT_MAX_CHAPTER_TOKENS,
+    DEFAULT_OVERLAP_TOKENS,
+    DEFAULT_WINDOW_TOKENS,
+    SHORT_TRANSCRIPT_SECONDS,
+    SOURCE_KIND_ARTICLE_PARAGRAPH,
+    SOURCE_KIND_IMAGE_CAPTION,
+    SOURCE_KIND_SUMMARY,
+    SOURCE_KIND_TRANSCRIPT_SEGMENT,
+    chunk,
+)
 from backend.storage.embedder import (
     DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL,
     EMBEDDING_BYTES,
@@ -79,6 +91,12 @@ from backend.storage.repositories import (
     TopicRepository,
     UserRepository,
     normalize_slug,
+)
+from backend.storage.sync import (
+    DEFAULT_USER_ID,
+    sync_capture,
+    sync_enrichment,
+    sync_hydration,
 )
 from backend.storage.schema import (
     captures,
@@ -152,4 +170,20 @@ __all__ = [
     "COLLECTION_TOPICS",
     "COLLECTION_ENTITIES",
     "ALL_COLLECTIONS",
+    # chunking
+    "chunk",
+    "SOURCE_KIND_ARTICLE_PARAGRAPH",
+    "SOURCE_KIND_TRANSCRIPT_SEGMENT",
+    "SOURCE_KIND_IMAGE_CAPTION",
+    "SOURCE_KIND_SUMMARY",
+    "ALL_SOURCE_KINDS",
+    "DEFAULT_WINDOW_TOKENS",
+    "DEFAULT_OVERLAP_TOKENS",
+    "DEFAULT_MAX_CHAPTER_TOKENS",
+    "SHORT_TRANSCRIPT_SECONDS",
+    # sync (Step 4 dual-write seam)
+    "sync_capture",
+    "sync_hydration",
+    "sync_enrichment",
+    "DEFAULT_USER_ID",
 ]
