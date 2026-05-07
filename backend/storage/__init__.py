@@ -36,6 +36,24 @@ from backend.storage.db import (
     init_db,
     session_scope,
 )
+from backend.storage.embedder import (
+    DEFAULT_MODEL as DEFAULT_EMBEDDING_MODEL,
+    EMBEDDING_BYTES,
+    EMBEDDING_DIM,
+    Embedder,
+    get_embedder,
+)
+from backend.storage.vector_store import (
+    ALL_COLLECTIONS,
+    COLLECTION_CHUNKS,
+    COLLECTION_ENTITIES,
+    COLLECTION_TOPICS,
+    ChromaVectorStore,
+    VectorHit,
+    VectorStore,
+    get_vector_store,
+    reset_vector_store,
+)
 from backend.storage.models import (
     Capture,
     CaptureWithEnrichment,
@@ -118,4 +136,20 @@ __all__ = [
     "EntityRepository",
     "normalize_slug",
     "ENTITY_TYPES",
+    # embedder
+    "Embedder",
+    "DEFAULT_EMBEDDING_MODEL",
+    "EMBEDDING_DIM",
+    "EMBEDDING_BYTES",
+    "get_embedder",
+    # vector store
+    "VectorStore",
+    "ChromaVectorStore",
+    "VectorHit",
+    "get_vector_store",
+    "reset_vector_store",
+    "COLLECTION_CHUNKS",
+    "COLLECTION_TOPICS",
+    "COLLECTION_ENTITIES",
+    "ALL_COLLECTIONS",
 ]
