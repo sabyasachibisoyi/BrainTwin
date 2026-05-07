@@ -63,6 +63,7 @@ from backend.knowledge.llm_client import (
     PermanentLLMError,
     TransientLLMError,
 )
+from backend.storage.sync import sync_enrichment, sync_hydration
 
 
 logger = logging.getLogger(__name__)
@@ -209,6 +210,17 @@ async def enqueue_enrichment(
 
     if hydration.hydrated and hydration.record is not None:
         _persist_hydration(hydration.record)
+        # Phase 3 Step 4b — dual-write the hydration row into SQL.
+        # Best-effort: sync_hydration catches all errors internally.
+        await sync_hydration(
+            capture_id=capture_id,
+            tier=hydration.record.get("tier", "unknown"),
+            source_payload_json=json.dumps(hydration.record, ensure_ascii=False),
+            hydrated_at=hydration.record.get(
+                "timestamp",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
     processed = hydration.processed
 
     last_transient: TransientLLMError | None = None
@@ -301,6 +313,22 @@ async def enqueue_enrichment(
 
         # Success path — break out of retry loop.
         _persist_enrichment(capture_id=capture_id, enrichment=enrichment)
+        # Phase 3 Step 4b — dual-write the enrichment + derived chunks
+        # / topics / entities into SQL + Chroma. Best-effort: any
+        # SQL/Chroma failure is caught inside sync_enrichment, logged,
+        # and swallowed so the JSONL path stays unaffected.
+        await sync_enrichment(
+            capture_id=capture_id,
+            summary=enrichment.get("summary"),
+            key_facts_json=json.dumps(
+                enrichment.get("key_facts") or [], ensure_ascii=False,
+            ),
+            topics=enrichment.get("topics") or [],
+            entities=enrichment.get("entities") or [],
+            model=settings.enrichment_model,
+            enriched_at=datetime.now(timezone.utc).isoformat(),
+            processed=processed,
+        )
         logger.info(
             "%s enriched (%d entities, %d facts, %d topics)",
             log_prefix,

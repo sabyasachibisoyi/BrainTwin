@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
+from backend.config import settings
 from backend.storage.chunking import (
     SOURCE_KIND_ARTICLE_PARAGRAPH,
     SOURCE_KIND_IMAGE_CAPTION,
@@ -104,7 +105,13 @@ async def sync_capture(
     is caught, logged, and swallowed so the JSONL path is unaffected.
 
     Returns True on a successful insert, False on duplicate or error.
+
+    Honors `settings.storage_dual_write` — when False, the dual-write
+    is disabled wholesale (used by Phase 3.5 cutover and by tests that
+    don't want to touch SQL/Chroma).
     """
+    if not settings.storage_dual_write:
+        return False
     try:
         async with session_scope() as session:
             cap_repo = CaptureRepository(session)
@@ -148,7 +155,9 @@ async def sync_hydration(
     Best-effort like `sync_capture`. Caller is responsible for verifying
     the parent capture exists — we don't pre-check, the FK constraint
     will catch it if the order is wrong (and we'll log the failure
-    instead of raising)."""
+    instead of raising). Honors `settings.storage_dual_write`."""
+    if not settings.storage_dual_write:
+        return False
     try:
         async with session_scope() as session:
             hyd_repo = HydrationRepository(session)
@@ -207,7 +216,13 @@ async def sync_enrichment(
     pipeline emits them this way.
 
     `topics` shape: list of strings (labels). Slug-normalized internally.
+
+    Honors `settings.storage_dual_write` — when False, the entire
+    pipeline is skipped (used by Phase 3.5 cutover and by tests that
+    don't want to touch SQL/Chroma).
     """
+    if not settings.storage_dual_write:
+        return False
     embedder = embedder if embedder is not None else get_embedder()
     vector_store = vector_store if vector_store is not None else get_vector_store()
 

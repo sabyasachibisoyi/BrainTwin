@@ -237,6 +237,11 @@ def tmp_jsonl(tmp_path, monkeypatch):
     # Default off — see docstring above. Hydration tests opt back in.
     monkeypatch.setattr(worker_mod.settings, "og_fetch_enabled", False)
     monkeypatch.setattr(worker_mod.settings, "video_transcribe_enabled", False)
+    # Phase 3 Step 4b — enrichment worker now also calls sync_enrichment
+    # / sync_hydration on the success / hydration paths. These tests
+    # don't initialise SQL or Chroma, so disable dual-write to keep
+    # them focused on the JSONL behavior they were written to verify.
+    monkeypatch.setattr(worker_mod.settings, "storage_dual_write", False)
     return enrich_path, failures_path
 
 
