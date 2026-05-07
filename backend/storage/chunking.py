@@ -41,7 +41,6 @@ Edge cases
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 
 # ---- Source-kind constants (must match SOURCE_KIND values used in
@@ -117,14 +116,41 @@ def _chunk_paragraphs(text: str) -> list[str]:
     """Split article body on blank-line paragraph breaks.
 
     Strips per-paragraph whitespace and drops empty results. Single
-    paragraph (no blank lines) returns a single-element list."""
+    paragraph (no blank lines) returns a single-element list.
+
+    Paragraphs longer than DEFAULT_MAX_CHAPTER_TOKENS fall through to
+    the token-window strategy — the embedding model (all-MiniLM-L6-v2,
+    A.6) caps at 512 tokens, so a wall-of-text paragraph would
+    otherwise truncate at embed time."""
     if not text or not text.strip():
         return []
-    paragraphs = _PARAGRAPH_RE.split(text)
-    return [p.strip() for p in paragraphs if p.strip()]
+    max_chars = _tokens_to_chars(DEFAULT_MAX_CHAPTER_TOKENS)
+    out: list[str] = []
+    for p in _PARAGRAPH_RE.split(text):
+        s = p.strip()
+        if not s:
+            continue
+        if len(s) <= max_chars:
+            out.append(s)
+        else:
+            out.extend(_chunk_token_window(s))
+    return out
 
 
 # ---- Strategy: fixed token window with overlap (long transcripts) ----
+
+# Any whitespace counts as a word boundary — transcripts and stripped
+# HTML can contain \n / \t inside the body, not just spaces.
+_WHITESPACE_RE = re.compile(r"\s")
+
+
+def _last_whitespace(text: str, start: int, end: int) -> int:
+    """Index of the last whitespace char in text[start:end], or -1."""
+    last = -1
+    for m in _WHITESPACE_RE.finditer(text, start, end):
+        last = m.start()
+    return last
+
 
 def _chunk_token_window(
     text: str,
@@ -165,7 +191,7 @@ def _chunk_token_window(
             # don't cut a word in half. If no whitespace found in the
             # window (unusual — extremely long word), fall through to
             # the raw cut.
-            ws = text.rfind(" ", i, end)
+            ws = _last_whitespace(text, i, end)
             if ws > i:
                 end = ws
         chunk = text[i:end].strip()
@@ -173,14 +199,18 @@ def _chunk_token_window(
             chunks.append(chunk)
         if end >= text_len:
             break
-        # Advance with overlap. Snap forward to a word boundary so the
-        # next chunk also starts cleanly.
-        i = end - overlap_chars
-        if i < 0:
-            i = 0
+        # Advance with overlap. If the word-boundary backup pulled
+        # `end` so close to `i` that overlap would land us at or before
+        # the previous start (e.g. one ultra-long token like a URL or
+        # base64 blob fills most of the window), skip overlap and start
+        # fresh at `end` so we always make forward progress.
+        next_i = end - overlap_chars
+        if next_i <= i:
+            next_i = end
         # Skip leading whitespace at the new start position.
-        while i < text_len and text[i].isspace():
-            i += 1
+        while next_i < text_len and text[next_i].isspace():
+            next_i += 1
+        i = next_i
     return chunks
 
 
@@ -241,8 +271,8 @@ def chunk(
     *,
     source_kind: str,
     text: str,
-    chapter_texts: Optional[list[str]] = None,
-    transcript_duration_seconds: Optional[float] = None,
+    chapter_texts: list[str] | None = None,
+    transcript_duration_seconds: float | None = None,
 ) -> list[str]:
     """Apply the A.5 chunking rule for the given source_kind.
 
