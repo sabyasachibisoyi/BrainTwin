@@ -92,6 +92,12 @@ from backend.storage.repositories import (
     UserRepository,
     normalize_slug,
 )
+from backend.storage.sync import (
+    DEFAULT_USER_ID,
+    sync_capture,
+    sync_enrichment,
+    sync_hydration,
+)
 from backend.storage.schema import (
     captures,
     chunk_entities,
@@ -175,4 +181,9 @@ __all__ = [
     "DEFAULT_OVERLAP_TOKENS",
     "DEFAULT_MAX_CHAPTER_TOKENS",
     "SHORT_TRANSCRIPT_SECONDS",
+    # sync (Step 4 dual-write seam)
+    "sync_capture",
+    "sync_hydration",
+    "sync_enrichment",
+    "DEFAULT_USER_ID",
 ]
