@@ -108,7 +108,14 @@ async def sync_capture(
     try:
         async with session_scope() as session:
             cap_repo = CaptureRepository(session)
-            if await cap_repo.exists(capture_id):
+            # Tenant-scoped check. CaptureRepository.exists() is a
+            # cross-tenant existence probe (per its docstring, B.5
+            # migration use only) and would leak existence between
+            # users if used here. Use get() instead — None either
+            # means truly new OR owned by another tenant; the global
+            # TEXT PK on captures.id will surface a cross-tenant
+            # collision as an IntegrityError, caught below.
+            if await cap_repo.get(capture_id, user_id=user_id) is not None:
                 logger.debug("sync_capture: %s already in SQL, skipping", capture_id)
                 return False
             await cap_repo.create(Capture(
@@ -282,7 +289,27 @@ async def _sync_chunks_and_vectors(
     embed in one batch (faster than per-chunk), then write atomically
     to SQL followed by Chroma. If SQL succeeds and Chroma fails, the
     SQL chunks remain (with embedding bytes); a future retry / repair
-    job can replay the Chroma write."""
+    job can replay the Chroma write.
+
+    Re-enrichment safety: if chunks already exist for this capture
+    (Phase 5+ when the agent updates summaries triggers a second
+    sync_enrichment call), this path is a no-op. chunks have a
+    UNIQUE(capture_id, chunk_index) constraint and chunk_index here
+    restarts at 0 — re-running would integrity-error and cascade-roll
+    back the whole batch. Preserving the existing chunks is the
+    pragmatic v1 behavior; targeted refresh of summary chunks is a
+    Phase 5 follow-up when re-enrichment actually goes live."""
+    async with session_scope() as session:
+        existing = await ChunkRepository(session).list_by_capture(
+            capture_id, user_id=user_id,
+        )
+    if existing:
+        logger.debug(
+            "_sync_chunks_and_vectors: %s already has %d chunks, skipping",
+            capture_id, len(existing),
+        )
+        return
+
     # Collect (source_kind, chunk_text) pairs in order.
     pending: list[tuple[str, str]] = []
 
