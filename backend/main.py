@@ -22,6 +22,14 @@ from backend.knowledge.enrichment_worker import (
     hydrate_processed,
 )
 from backend.knowledge.llm_client import LLMClient, PermanentLLMError
+from backend.storage import (
+    DEFAULT_USER_ID,
+    UserRepository,
+    aclose as aclose_storage,
+    init_db as init_storage_db,
+    session_scope,
+    sync_capture,
+)
 
 
 logging.basicConfig(
@@ -181,8 +189,57 @@ async def _recover_unenriched() -> None:
         logger.info("Re-queued %d unenriched captures", queued)
 
 
+async def _ensure_default_user() -> None:
+    """Phase 3 Step 4b — seed user_id=1 (Sabya, per B.5.4) on first
+    startup if missing. Idempotent: silently no-op if already present.
+    Required because the dual-write path stamps every capture with
+    user_id=1 and chunks join through users via captures."""
+    async with session_scope() as session:
+        repo = UserRepository(session)
+        existing = await repo.get(DEFAULT_USER_ID)
+        if existing is None:
+            await repo.create(
+                email="sabya.bisoyi@gmail.com",
+                display_name="Sabya",
+                user_id=DEFAULT_USER_ID,
+            )
+            logger.info("Seeded default user_id=%s (Sabya)", DEFAULT_USER_ID)
+        else:
+            logger.debug("Default user_id=%s already present", DEFAULT_USER_ID)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
+    # Phase 3 Step 4b — initialize SQL schema + seed default user.
+    # Runs even when ANTHROPIC_API_KEY is empty because /capture's
+    # dual-write path mirrors into SQL regardless of enrichment status.
+    # Best-effort: a SQL hiccup must not block app startup; the JSONL
+    # path still works for the dual-write window.
+    #
+    # The flag short-circuit means "we are not writing to SQL this
+    # run" — so don't even create the schema or seed users (avoids
+    # touching the DB file at all when the operator is debugging a
+    # broken SQL setup with dual_write off).
+    if settings.storage_dual_write:
+        # Independent try-blocks: a user-seed failure must not look
+        # like an init failure, and vice versa. If init fails the
+        # seed will too — that's fine, both get logged.
+        try:
+            await init_storage_db()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Phase 3 SQL schema init failed "
+                "(dual-write to SQL effectively disabled this run): %s", e,
+            )
+        try:
+            await _ensure_default_user()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Phase 3 default-user seed failed "
+                "(sync_capture writes will FK-violate on user_id=%s): %s",
+                DEFAULT_USER_ID, e,
+            )
+
     global _llm_client
     if not settings.anthropic_api_key:
         logger.warning(
@@ -208,6 +265,11 @@ async def _shutdown() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Error closing LLM client")
         _llm_client = None
+    # Phase 3 Step 4b — drain the SQL connection pool cleanly.
+    try:
+        await aclose_storage()
+    except Exception:  # noqa: BLE001
+        logger.exception("Error closing storage layer")
 
 
 def _detect_source(payload: CapturePayload) -> str:
@@ -259,8 +321,9 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         raise HTTPException(status_code=500, detail=f"processing failed: {e}")
 
     # Append to JSONL log. Phase 2: include capture_id so enrichments.jsonl
-    # can be joined back to the raw row. Phase 3 will migrate this into
-    # ChromaDB/SQLite.
+    # can be joined back to the raw row. Phase 3 dual-write also mirrors
+    # into SQL via sync_capture below; once the dual-write window closes
+    # (Phase 3.5) the JSONL writer goes away and SQL becomes the sole path.
     persisted = False
     try:
         CAPTURES_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +334,31 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
     except OSError as e:
         logger.warning("Failed to persist capture: %s", e)
         _log_failure(source=source, reason=f"persist: {e}", payload=payload.model_dump(mode="json"))
+
+    # Phase 3 Step 4b — dual-write the capture row into SQL. Best-effort
+    # by design (sync_capture catches all errors internally) — a SQL
+    # outage MUST NOT break the JSONL path during the dual-write window.
+    # Idempotent on duplicate capture_id (silent no-op).
+    #
+    # Gated on `persisted`: JSONL is the authoritative store during
+    # the dual-write window, so a JSONL failure means the capture
+    # is logged-as-failed and we don't mirror an orphaned row into
+    # SQL. Once the window closes (Phase 3.5) this gate goes away.
+    sql_synced = False
+    if persisted:
+        sql_synced = await sync_capture(
+            capture_id=capture_id,
+            url=processed.url,
+            title=processed.title,
+            platform=processed.platform,
+            content_type=processed.content_type,
+            captured_at=processed.timestamp,
+            dwell_seconds=processed.dwell_time_seconds,
+            raw_metadata_json=(
+                json.dumps(processed.metadata, ensure_ascii=False)
+                if processed.metadata else None
+            ),
+        )
 
     # Phase 2 — schedule enrichment. Skipped if:
     #   - persistence failed (no row to enrich against)
@@ -293,6 +381,10 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         "images_processed": len(processed.image_descriptions),
         "vision_skipped": skip_vision,
         "enrichment_scheduled": enrichment_scheduled,
+        # Phase 3 Step 4b — dual-write status. False during the window
+        # is non-fatal (capture is in JSONL); persistent False signals
+        # SQL/Chroma trouble worth investigating.
+        "sql_synced": sql_synced,
     }
 
 

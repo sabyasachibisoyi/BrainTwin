@@ -237,6 +237,11 @@ def tmp_jsonl(tmp_path, monkeypatch):
     # Default off — see docstring above. Hydration tests opt back in.
     monkeypatch.setattr(worker_mod.settings, "og_fetch_enabled", False)
     monkeypatch.setattr(worker_mod.settings, "video_transcribe_enabled", False)
+    # Phase 3 Step 4b — enrichment worker now also calls sync_enrichment
+    # / sync_hydration on the success / hydration paths. These tests
+    # don't initialise SQL or Chroma, so disable dual-write to keep
+    # them focused on the JSONL behavior they were written to verify.
+    monkeypatch.setattr(worker_mod.settings, "storage_dual_write", False)
     return enrich_path, failures_path
 
 
@@ -690,6 +695,166 @@ class TestVideoTranscriptMerge:
 
 async def _noop_sleep(_seconds: float) -> None:
     return None
+
+
+# ---- Phase 3 Step 4b — positive dual_write=True wiring ----------------
+# The other tests in this file run with storage_dual_write=False so they
+# can stay focused on JSONL behavior. We need at least one test that
+# flips it on and verifies sync_enrichment / sync_hydration actually
+# fire — otherwise the wiring is only verified by manual smoke tests.
+
+class TestEnqueueEnrichmentDualWrite:
+    """Verify enqueue_enrichment writes to SQL + Chroma when
+    storage_dual_write=True. Pre-creates the parent capture row (the
+    /capture endpoint does this in production; here we call sync_capture
+    directly), then asserts the enrichment + chunks + topics show up
+    in SQL and Chroma after the worker runs."""
+
+    @pytest.fixture
+    def dual_write_env(self, tmp_path, tmp_jsonl, monkeypatch):
+        chromadb = pytest.importorskip("chromadb")  # noqa: F841
+
+        from backend.storage import db as db_module
+        from backend.storage import embedder as embedder_mod
+        from backend.storage import vector_store as vs_mod
+        from backend.storage.embedder import EMBEDDING_DIM
+        from backend.storage.vector_store import ChromaVectorStore
+
+        import numpy as np
+
+        # File-backed SQLite under tmp_path so state is fully isolated
+        # per test. Using sqlite:///:memory: would leak across tests
+        # because SQLAlchemy's default pool keeps the connection alive
+        # even after we null the engine global; the next test then
+        # finds the old DB still populated.
+        db_path = tmp_path / "dual_write.db"
+        monkeypatch.setattr(
+            db_module.settings, "database_url", f"sqlite:///{db_path}",
+        )
+        # Reset SQL singletons so the new database_url takes effect.
+        monkeypatch.setattr(db_module, "_engine", None)
+        monkeypatch.setattr(db_module, "_session_factory", None)
+        # tmp Chroma path so the test doesn't pollute data/chroma.
+        monkeypatch.setattr(
+            vs_mod.settings, "chroma_path", str(tmp_path / "chroma"),
+        )
+        monkeypatch.setattr(vs_mod, "_default_store", None)
+
+        # Stub embedder — deterministic, no model download. Same shape
+        # as test_storage_sync.py's _StubEmbedder.
+        class _StubEmbedder:
+            @property
+            def model_name(self) -> str: return "stub"
+            @property
+            def dim(self) -> int: return EMBEDDING_DIM
+            def _vec(self, text: str) -> np.ndarray:
+                seed = abs(hash(text)) % (2**32)
+                rng = np.random.default_rng(seed)
+                v = rng.standard_normal(EMBEDDING_DIM, dtype=np.float32)
+                return (v / max(float(np.linalg.norm(v)), 1e-9)).astype(np.float32)
+            def embed(self, text: str) -> np.ndarray: return self._vec(text or "")
+            def embed_many(self, texts: list[str]) -> list[np.ndarray]:
+                return [self._vec(t or "") for t in texts]
+
+        stub = _StubEmbedder()
+        monkeypatch.setattr(embedder_mod, "_default_embedder", stub)
+        # ChromaVectorStore takes the embedder via constructor; we
+        # pre-create the singleton so sync_enrichment's get_vector_store()
+        # returns this one (with the stub) rather than building a fresh
+        # default Chroma that would try to load the real embedder.
+        monkeypatch.setattr(
+            vs_mod, "_default_store",
+            ChromaVectorStore(embedder=stub, path=str(tmp_path / "chroma")),
+        )
+
+        # Re-enable dual-write (tmp_jsonl turns it off).
+        monkeypatch.setattr(worker_mod.settings, "storage_dual_write", True)
+
+        yield tmp_path
+
+        # Explicit teardown — dispose the engine so the next test
+        # creates a fresh one. monkeypatch only restores the global
+        # references; the live engine + connection pool need an
+        # explicit aclose() to drop the SQLite file handle cleanly.
+        try:
+            asyncio.run(db_module.aclose())
+        except Exception:
+            pass
+
+    def test_enrichment_worker_writes_to_sql_and_chroma(
+        self, dual_write_env, tmp_jsonl,
+    ):
+        from backend.storage import (
+            DEFAULT_USER_ID,
+            CaptureRepository,
+            ChunkRepository,
+            EnrichmentRepository,
+            TopicRepository,
+            UserRepository,
+            init_db,
+            session_scope,
+            sync_capture,
+        )
+        from backend.storage.vector_store import COLLECTION_CHUNKS, get_vector_store
+
+        async def go():
+            await init_db()
+            async with session_scope() as session:
+                await UserRepository(session).create(
+                    email="sabya@example.com",
+                    display_name="Sabya",
+                    user_id=DEFAULT_USER_ID,
+                )
+            # Capture row first (the /capture endpoint does this in prod).
+            await sync_capture(
+                capture_id="cid-dw",
+                url="https://example.com/article",
+                title="Test",
+                platform="general",
+                content_type="article",
+                captured_at="2026-05-08T10:00:00+00:00",
+                dwell_seconds=10,
+                raw_metadata_json=None,
+            )
+            # Worker runs.
+            client = StubLLMClient([GOOD_RESPONSE])
+            await enqueue_enrichment(
+                "cid-dw",
+                make_processed(
+                    clean_text=(
+                        "Para one about kanban.\n\n"
+                        "Para two about WIP limits.\n\n"
+                        "Para three closing."
+                    ),
+                ),
+                client,
+            )
+            # Verify SQL state.
+            async with session_scope() as session:
+                cap = await CaptureRepository(session).get(
+                    "cid-dw", user_id=DEFAULT_USER_ID,
+                )
+                enr = await EnrichmentRepository(session).get_by_capture(
+                    "cid-dw", user_id=DEFAULT_USER_ID,
+                )
+                chunk_rows = await ChunkRepository(session).list_by_capture(
+                    "cid-dw", user_id=DEFAULT_USER_ID,
+                )
+                topic_rows = await TopicRepository(session).list_all()
+            chroma_count = await get_vector_store().count(COLLECTION_CHUNKS)
+            return cap, enr, chunk_rows, topic_rows, chroma_count
+
+        cap, enr, chunk_rows, topic_rows, chroma_count = asyncio.run(go())
+        assert cap is not None
+        # Enrichment row landed (summary from GOOD_RESPONSE).
+        assert enr is not None and enr.summary == "A short summary."
+        # 3 paragraphs + 1 summary = 4 chunks.
+        assert len(chunk_rows) == 4
+        # Chroma mirrors SQL count.
+        assert chroma_count == 4
+        # Topics from GOOD_RESPONSE (topic-a, topic-b) made it through.
+        topic_slugs = {t.slug for t in topic_rows}
+        assert {"topic-a", "topic-b"}.issubset(topic_slugs)
 
 
 # ---- find_unenriched_capture_ids ------------------------------------

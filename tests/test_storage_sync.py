@@ -228,6 +228,59 @@ class TestSyncCapture:
         result = asyncio.run(go())
         assert result is False  # logged + swallowed, not raised
 
+    def test_duplicate_check_is_tenant_scoped(self):
+        """Duplicate check must be tenant-scoped. CaptureRepository.exists()
+        is a cross-tenant probe (its own docstring forbids application
+        use); sync_capture must not call it. Verified indirectly: a
+        second user trying to insert the SAME capture_id should NOT be
+        silently swallowed as a 'duplicate' — the global TEXT PK will
+        surface a real IntegrityError, which the boundary catches and
+        logs (returning False)."""
+        async def go():
+            await _seed_user_and_init()
+            # Seed a second user.
+            async with session_scope() as session:
+                await UserRepository(session).create(
+                    email="other@example.com",
+                    display_name="Other",
+                    user_id=2,
+                )
+            first = await sync_capture(
+                capture_id="cap-shared",
+                url="https://x", title="t", platform="general",
+                content_type="article",
+                captured_at="2026-05-08T10:00:00+00:00",
+                user_id=DEFAULT_USER_ID,
+            )
+            # Same capture_id, different user. With the buggy
+            # cross-tenant exists() check this would silently return
+            # False without surfacing the conflict. With the
+            # tenant-scoped get() check, the insert proceeds and the
+            # global PK collision fires — caught + logged + False.
+            second = await sync_capture(
+                capture_id="cap-shared",
+                url="https://x", title="t", platform="general",
+                content_type="article",
+                captured_at="2026-05-08T10:00:00+00:00",
+                user_id=2,
+            )
+            # Verify the original row is still owned by user 1, and
+            # user 2 has no row with this id.
+            async with session_scope() as session:
+                row1 = await CaptureRepository(session).get(
+                    "cap-shared", user_id=DEFAULT_USER_ID,
+                )
+                row2 = await CaptureRepository(session).get(
+                    "cap-shared", user_id=2,
+                )
+            return first, second, row1, row2
+
+        first, second, row1, row2 = asyncio.run(go())
+        assert first is True
+        assert second is False  # PK collision logged + swallowed
+        assert row1 is not None and row1.user_id == DEFAULT_USER_ID
+        assert row2 is None  # user 2 never got a row
+
 
 # ---- sync_hydration --------------------------------------------------
 
@@ -486,6 +539,103 @@ class TestSyncEnrichmentFullPath:
         assert len(ct_rows) == 6
         # Each chunk gets every entity: 3 * 1 = 3 rows
         assert len(ce_rows) == 3
+
+    def test_re_enrichment_does_not_violate_chunk_uniqueness(
+        self, vector_store, stub_embedder,
+    ):
+        """A second sync_enrichment call for the same capture (Phase 5+
+        re-enrichment scenario) MUST NOT crash. The chunks table has
+        UNIQUE(capture_id, chunk_index); the v1 behavior is to keep
+        the original chunks and only refresh the enrichment row +
+        topic/entity attachments. Targeted summary-chunk replacement
+        is a Phase 5 follow-up."""
+        async def go():
+            await _seed_user_and_init()
+            await sync_capture(
+                capture_id="cap-re-enrich",
+                url=None, title="t", platform="general",
+                content_type="article",
+                captured_at="2026-05-08T10:00:00+00:00",
+            )
+            processed = _ProcessedStub(
+                clean_text="Para A.\n\nPara B.",
+                transcript="",
+                image_text="",
+                timestamp="2026-05-08T10:00:00+00:00",
+            )
+            # First enrichment.
+            ok1 = await sync_enrichment(
+                capture_id="cap-re-enrich",
+                summary="First summary.",
+                key_facts_json="[]",
+                topics=["Kanban"],
+                entities=[],
+                model="haiku",
+                enriched_at="2026-05-08T10:00:02+00:00",
+                processed=processed,
+                embedder=stub_embedder,
+                vector_store=vector_store,
+            )
+            async with session_scope() as session:
+                first_chunks = await ChunkRepository(session).list_by_capture(
+                    "cap-re-enrich", user_id=DEFAULT_USER_ID,
+                )
+            first_chunk_count = len(first_chunks)
+            first_chunk_texts = [c.text for c in first_chunks]
+            first_chroma_count = await vector_store.count(COLLECTION_CHUNKS)
+
+            # Second enrichment with a DIFFERENT summary. Without the
+            # fix, this would integrity-error on chunk_index 0 already
+            # taken and the whole call would partially fail.
+            ok2 = await sync_enrichment(
+                capture_id="cap-re-enrich",
+                summary="Different summary the second time around.",
+                key_facts_json='["new fact"]',
+                topics=["Kanban", "Agile"],  # added a topic
+                entities=[],
+                model="haiku",
+                enriched_at="2026-05-08T10:00:05+00:00",  # later
+                processed=processed,
+                embedder=stub_embedder,
+                vector_store=vector_store,
+            )
+            async with session_scope() as session:
+                second_chunks = await ChunkRepository(session).list_by_capture(
+                    "cap-re-enrich", user_id=DEFAULT_USER_ID,
+                )
+                topic_rows = await TopicRepository(session).list_all()
+                enr = await EnrichmentRepository(session).get_by_capture(
+                    "cap-re-enrich", user_id=DEFAULT_USER_ID,
+                )
+            second_chroma_count = await vector_store.count(COLLECTION_CHUNKS)
+
+            return (
+                ok1, ok2,
+                first_chunk_count, first_chunk_texts, first_chroma_count,
+                second_chunks, topic_rows, enr, second_chroma_count,
+            )
+
+        (
+            ok1, ok2,
+            first_chunk_count, first_chunk_texts, first_chroma_count,
+            second_chunks, topic_rows, enr, second_chroma_count,
+        ) = asyncio.run(go())
+
+        # Both calls succeed at the boundary level.
+        assert ok1 is True
+        assert ok2 is True
+        # Original chunks preserved — same count, same texts.
+        assert len(second_chunks) == first_chunk_count
+        assert [c.text for c in second_chunks] == first_chunk_texts
+        # Chroma chunks count unchanged.
+        assert second_chroma_count == first_chroma_count
+        # New topic from second call DID get added to vocabulary.
+        topic_slugs = {t.slug for t in topic_rows}
+        assert {"kanban", "agile"}.issubset(topic_slugs)
+        # Most recent enrichment is the second one (B.5 / repo
+        # docstring says ORDER BY enriched_at DESC LIMIT 1).
+        assert enr is not None
+        assert enr.summary == "Different summary the second time around."
 
     def test_topics_and_entities_in_chroma_too(
         self, vector_store, stub_embedder,
