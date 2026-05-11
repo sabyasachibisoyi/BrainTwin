@@ -42,7 +42,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.config import settings  # noqa: E402
-from backend.storage.db import session_scope  # noqa: E402
+from backend.storage.db import _safe_url, session_scope  # noqa: E402
 from backend.storage.sync import DEFAULT_USER_ID  # noqa: E402
 
 
@@ -62,6 +62,18 @@ def _truncate(s: Optional[str], n: int = 70) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _collection_name(col: Any) -> str:
+    """Pull the name off a chromadb collection handle.
+
+    Recent chromadb returns Collection objects with a `name` attribute;
+    older versions return dicts. Cover both."""
+    return (
+        getattr(col, "name", None)
+        or (col.get("name") if isinstance(col, dict) else None)
+        or str(col)
+    )
+
+
 # ---- SQL inspector --------------------------------------------------
 
 async def _inspect_sql(*, samples: int, capture_id: Optional[str]) -> None:
@@ -72,7 +84,10 @@ async def _inspect_sql(*, samples: int, capture_id: Optional[str]) -> None:
         entities, enrichments, hydrations, topics, users,
     )
 
-    _hr(f"SQL — {settings.database_url}")
+    # _safe_url masks credentials so a `postgresql://user:pw@host` URL
+    # doesn't leak the password into shared terminal output / screenshots
+    # once Phase 3.5 migrates off SQLite.
+    _hr(f"SQL — {_safe_url(settings.database_url)}")
 
     # ---- Row counts (whole DB, not user-scoped — top-level health) -
     print("\nRow counts (whole DB):")
@@ -249,7 +264,7 @@ def _inspect_chroma(*, samples: int, capture_id: Optional[str]) -> None:
     for col in collections:
         # In recent chromadb, list_collections returns Collection objects
         # with a name attribute; older versions return dicts. Handle both.
-        name = getattr(col, "name", None) or (col.get("name") if isinstance(col, dict) else None) or str(col)
+        name = _collection_name(col)
         try:
             handle = client.get_collection(name=name)
             cnt = handle.count()
@@ -280,7 +295,7 @@ def _inspect_chroma(*, samples: int, capture_id: Optional[str]) -> None:
     # Generic samples per collection.
     print(f"\nSample (up to {samples} per collection):")
     for col in collections:
-        name = getattr(col, "name", None) or (col.get("name") if isinstance(col, dict) else None) or str(col)
+        name = _collection_name(col)
         try:
             handle = client.get_collection(name=name)
             res = handle.peek(limit=samples)

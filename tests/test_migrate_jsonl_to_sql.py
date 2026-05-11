@@ -272,6 +272,10 @@ def test_stage1_dry_run_writes_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(mig, "sync_capture", boom)
 
     async def go():
+        # Schema must exist even in dry-run — _migrate_captures now
+        # pre-loads existing capture_ids unconditionally so the counts
+        # the operator sees match what a real run would do.
+        await _seed_user_and_init()
         return await mig._migrate_captures(
             captures_path=captures, failures_path=fail,
             user_id=mig.DEFAULT_USER_ID,
@@ -572,3 +576,320 @@ def test_stage3_handles_unhydratable_capture(tmp_path, monkeypatch):
     assert counts["inserted"] == 1
     assert counts["unhydratable"] == 1
     assert captured_kwargs[0]["processed"] is None
+
+
+def test_stage3_corrupt_enrichment_field_logged_not_raised(tmp_path, monkeypatch):
+    """If the `enrichment` field is the wrong type (string / list instead
+    of dict), the loop must log + skip the row, NOT raise AttributeError
+    on the next .get() and abort the whole migration."""
+    captures = tmp_path / "captures.jsonl"
+    enrichments = tmp_path / "enrichments.jsonl"
+    fail = tmp_path / "failures.jsonl"
+    _write_jsonl(captures, [
+        {
+            "capture_id": "cap-good", "url": "https://x", "title": "t",
+            "platform": "general", "content_type": "article",
+            "clean_text": "hi", "text_source": "extension",
+            "transcript": None, "image_descriptions": [], "image_text": "",
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "dwell_time_seconds": 0, "metadata": {},
+        },
+        {
+            "capture_id": "cap-bad", "url": "https://y", "title": "t",
+            "platform": "general", "content_type": "article",
+            "clean_text": "hi", "text_source": "extension",
+            "transcript": None, "image_descriptions": [], "image_text": "",
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "dwell_time_seconds": 0, "metadata": {},
+        },
+    ])
+    _write_jsonl(enrichments, [
+        # Corrupt — enrichment is a string, not a dict.
+        {"capture_id": "cap-bad", "enriched_at": "2026-04-02T00:00:00+00:00",
+         "model": "m", "enrichment": "this should be a dict"},
+        # Valid — must still process after the bad row above.
+        {"capture_id": "cap-good", "enriched_at": "2026-04-02T00:00:00+00:00",
+         "model": "m",
+         "enrichment": {"summary": "S", "topics": [], "entities": [],
+                        "key_facts": []}},
+    ])
+
+    captured: list[dict] = []
+
+    async def fake_sync_enrichment(**kwargs):
+        captured.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mig, "sync_enrichment", fake_sync_enrichment)
+
+    async def go():
+        await _seed_user_and_init()
+        async with session_scope() as session:
+            for cid in ("cap-good", "cap-bad"):
+                await CaptureRepository(session).create(Capture(
+                    id=cid, user_id=mig.DEFAULT_USER_ID,
+                    url="https://x", title="t", platform="general",
+                    content_type="article",
+                    captured_at="2026-04-01T00:00:00+00:00",
+                    dwell_seconds=0, raw_metadata_json=None,
+                ))
+        return await mig._migrate_enrichments(
+            captures_path=captures, enrichments_path=enrichments,
+            failures_path=fail,
+            user_id=mig.DEFAULT_USER_ID, dry_run=False, limit=None,
+        )
+
+    counts = asyncio.run(go())
+    assert counts["failed"] == 1, "corrupt row should be counted as failed"
+    assert counts["inserted"] == 1, "valid row after the corrupt one must still land"
+    assert [k["capture_id"] for k in captured] == ["cap-good"]
+    failures = [json.loads(l) for l in fail.read_text(encoding="utf-8").splitlines()]
+    assert any("expected dict" in f["error_reason"] for f in failures)
+
+
+# ---- --limit flag ----------------------------------------------------
+
+def test_limit_caps_inserts_per_stage(tmp_path, monkeypatch):
+    """--limit N stops the loop after N inserts. Documented but
+    previously untested."""
+    captures = tmp_path / "captures.jsonl"
+    fail = tmp_path / "failures.jsonl"
+    _write_jsonl(captures, [
+        {
+            "capture_id": f"cap-{i}", "url": f"https://wiki/{i}",
+            "title": f"t{i}", "platform": "general", "content_type": "article",
+            "clean_text": "hi", "text_source": "extension",
+            "transcript": None, "image_descriptions": [], "image_text": "",
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "dwell_time_seconds": 0, "metadata": {},
+        }
+        for i in range(5)
+    ])
+
+    inserted_cids: list[str] = []
+
+    async def fake_sync_capture(**kwargs):
+        inserted_cids.append(kwargs["capture_id"])
+        async with session_scope() as session:
+            await CaptureRepository(session).create(Capture(
+                id=kwargs["capture_id"], user_id=kwargs["user_id"],
+                url=kwargs.get("url"), title=kwargs.get("title"),
+                platform=kwargs.get("platform"),
+                content_type=kwargs.get("content_type"),
+                captured_at=kwargs["captured_at"],
+                dwell_seconds=kwargs.get("dwell_seconds", 0),
+                raw_metadata_json=kwargs.get("raw_metadata_json"),
+            ))
+        return True
+
+    monkeypatch.setattr(mig, "sync_capture", fake_sync_capture)
+
+    async def go():
+        await _seed_user_and_init()
+        return await mig._migrate_captures(
+            captures_path=captures, failures_path=fail,
+            user_id=mig.DEFAULT_USER_ID,
+            dry_run=False, include_test_rows=False, limit=2,
+        )
+
+    counts = asyncio.run(go())
+    assert counts["inserted"] == 2
+    assert len(inserted_cids) == 2
+
+
+# ---- storage_dual_write=False short-circuit -------------------------
+
+def test_run_aborts_when_storage_dual_write_is_off(tmp_path, monkeypatch):
+    """If the operator forgot to flip storage_dual_write=True before
+    running a real migration, every sync_* call would no-op. run()
+    must bail with rc=2 and a clear error message rather than chugging
+    through the JSONLs and producing zero SQL rows."""
+    monkeypatch.setattr(mig.settings, "storage_dual_write", False)
+
+    rc = asyncio.run(mig.run(
+        captures_path=tmp_path / "captures.jsonl",
+        hydrations_path=tmp_path / "hydrations.jsonl",
+        enrichments_path=tmp_path / "enrichments.jsonl",
+        failures_path=tmp_path / "failures.jsonl",
+        dry_run=False,
+        include_test_rows=False,
+        limit=None,
+        verify_only=False,
+    ))
+    assert rc == 2
+
+
+def test_run_proceeds_in_dry_run_even_with_dual_write_off(tmp_path, monkeypatch):
+    """Dry-run is safe regardless of the flag — sync_* never fires."""
+    monkeypatch.setattr(mig.settings, "storage_dual_write", False)
+    # Empty inputs — should breeze through all three stages and return 0.
+    rc = asyncio.run(mig.run(
+        captures_path=tmp_path / "captures.jsonl",
+        hydrations_path=tmp_path / "hydrations.jsonl",
+        enrichments_path=tmp_path / "enrichments.jsonl",
+        failures_path=tmp_path / "failures.jsonl",
+        dry_run=True,
+        include_test_rows=False,
+        limit=None,
+        verify_only=False,
+    ))
+    assert rc == 0
+
+
+# ---- Legacy capture_id round-trip across stages 1 + 3 ---------------
+
+def test_legacy_id_round_trips_across_stages(tmp_path, monkeypatch):
+    """A pre-Phase-2 capture row (no capture_id) gets minted in stage 1
+    and re-minted by stage 3's _build_capture_lookup. Both must arrive
+    at the same id so the enrichment row joins correctly. Regression
+    test for the duplicated id-derivation code path."""
+    captures = tmp_path / "captures.jsonl"
+    enrichments = tmp_path / "enrichments.jsonl"
+    fail = tmp_path / "failures.jsonl"
+    _write_jsonl(captures, [{
+        # NO capture_id field — legacy row.
+        "url": "https://en.wikipedia.org/wiki/Legacy",
+        "title": "Legacy", "platform": "general", "content_type": "article",
+        "clean_text": "hello", "text_source": "extension",
+        "transcript": None, "image_descriptions": [], "image_text": "",
+        "timestamp": "2026-04-01T00:00:00+00:00",
+        "dwell_time_seconds": 0, "metadata": {},
+    }])
+
+    # Compute the id the migration WILL mint, so we can write the
+    # matching enrichment row.
+    minted = mig._mint_legacy_capture_id({
+        "url": "https://en.wikipedia.org/wiki/Legacy",
+        "timestamp": "2026-04-01T00:00:00+00:00",
+    })
+    _write_jsonl(enrichments, [{
+        "capture_id": minted,
+        "enriched_at": "2026-04-02T00:00:00+00:00",
+        "model": "m",
+        "enrichment": {"summary": "S", "topics": ["t"], "entities": [],
+                       "key_facts": []},
+    }])
+
+    enrichment_calls: list[dict] = []
+
+    async def fake_sync_capture(**kwargs):
+        async with session_scope() as session:
+            await CaptureRepository(session).create(Capture(
+                id=kwargs["capture_id"], user_id=kwargs["user_id"],
+                url=kwargs.get("url"), title=kwargs.get("title"),
+                platform=kwargs.get("platform"),
+                content_type=kwargs.get("content_type"),
+                captured_at=kwargs["captured_at"],
+                dwell_seconds=kwargs.get("dwell_seconds", 0),
+                raw_metadata_json=kwargs.get("raw_metadata_json"),
+            ))
+        return True
+
+    async def fake_sync_enrichment(**kwargs):
+        enrichment_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(mig, "sync_capture", fake_sync_capture)
+    monkeypatch.setattr(mig, "sync_enrichment", fake_sync_enrichment)
+
+    async def go():
+        await _seed_user_and_init()
+        c1 = await mig._migrate_captures(
+            captures_path=captures, failures_path=fail,
+            user_id=mig.DEFAULT_USER_ID,
+            dry_run=False, include_test_rows=False, limit=None,
+        )
+        c3 = await mig._migrate_enrichments(
+            captures_path=captures, enrichments_path=enrichments,
+            failures_path=fail,
+            user_id=mig.DEFAULT_USER_ID, dry_run=False, limit=None,
+        )
+        return c1, c3
+
+    c1, c3 = asyncio.run(go())
+    assert c1["minted_ids"] == 1
+    assert c1["inserted"] == 1
+    # The key assertion: stage 3 found the parent (so the two stages
+    # agree on the minted id) and called sync_enrichment, NOT counted
+    # the row as missing_parent.
+    assert c3["missing_parent"] == 0
+    assert c3["inserted"] == 1
+    assert enrichment_calls[0]["capture_id"] == minted
+
+
+# ---- _verify subcommand ----------------------------------------------
+
+def test_verify_returns_zero_when_sql_matches_jsonl(tmp_path, monkeypatch):
+    """Happy path: SQL captures count >= kept JSONL captures count
+    (test-fixture skipping is the only allowed gap). _verify exits 0."""
+    captures = tmp_path / "captures.jsonl"
+    hyd = tmp_path / "hydrations.jsonl"
+    enr = tmp_path / "enrichments.jsonl"
+    _write_jsonl(captures, [{
+        "capture_id": f"cap-{i}", "url": f"https://wiki/{i}",
+        "title": f"t{i}", "platform": "general", "content_type": "article",
+        "clean_text": "hi", "text_source": "extension",
+        "transcript": None, "image_descriptions": [], "image_text": "",
+        "timestamp": "2026-04-01T00:00:00+00:00",
+        "dwell_time_seconds": 0, "metadata": {},
+    } for i in range(3)])
+
+    async def go():
+        await _seed_user_and_init()
+        async with session_scope() as session:
+            for i in range(3):
+                await CaptureRepository(session).create(Capture(
+                    id=f"cap-{i}", user_id=mig.DEFAULT_USER_ID,
+                    url=f"https://wiki/{i}", title=f"t{i}",
+                    platform="general", content_type="article",
+                    captured_at="2026-04-01T00:00:00+00:00",
+                    dwell_seconds=0, raw_metadata_json=None,
+                ))
+        return await mig._verify(
+            captures_path=captures,
+            hydrations_path=hyd,
+            enrichments_path=enr,
+            user_id=mig.DEFAULT_USER_ID,
+            include_test_rows=False,
+        )
+
+    rc = asyncio.run(go())
+    assert rc == 0
+
+
+def test_verify_returns_nonzero_when_sql_short(tmp_path, monkeypatch):
+    """Migration partially failed — JSONL has 3 kept captures but only
+    1 made it to SQL. _verify must exit non-zero so the operator notices."""
+    captures = tmp_path / "captures.jsonl"
+    hyd = tmp_path / "hydrations.jsonl"
+    enr = tmp_path / "enrichments.jsonl"
+    _write_jsonl(captures, [{
+        "capture_id": f"cap-{i}", "url": f"https://wiki/{i}",
+        "title": f"t{i}", "platform": "general", "content_type": "article",
+        "clean_text": "hi", "text_source": "extension",
+        "transcript": None, "image_descriptions": [], "image_text": "",
+        "timestamp": "2026-04-01T00:00:00+00:00",
+        "dwell_time_seconds": 0, "metadata": {},
+    } for i in range(3)])
+
+    async def go():
+        await _seed_user_and_init()
+        # Only seed ONE capture — the other two are "missing".
+        async with session_scope() as session:
+            await CaptureRepository(session).create(Capture(
+                id="cap-0", user_id=mig.DEFAULT_USER_ID,
+                url="https://wiki/0", title="t0",
+                platform="general", content_type="article",
+                captured_at="2026-04-01T00:00:00+00:00",
+                dwell_seconds=0, raw_metadata_json=None,
+            ))
+        return await mig._verify(
+            captures_path=captures,
+            hydrations_path=hyd,
+            enrichments_path=enr,
+            user_id=mig.DEFAULT_USER_ID,
+            include_test_rows=False,
+        )
+
+    rc = asyncio.run(go())
+    assert rc == 1

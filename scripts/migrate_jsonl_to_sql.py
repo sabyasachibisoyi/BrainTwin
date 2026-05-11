@@ -168,6 +168,9 @@ def _mint_legacy_capture_id(row: dict[str, Any]) -> str:
     return str(uuid.uuid4())
 
 
+_failures_dirs_created: set[Path] = set()
+
+
 def _log_failure(
     failures_path: Path,
     *,
@@ -179,14 +182,18 @@ def _log_failure(
     """Append a B.5.3 validation-failure row to data/migration_failures.jsonl.
 
     Mirrors the shape used elsewhere in the codebase (newline-delimited
-    JSON, UTF-8, no fancy encoding tricks)."""
+    JSON, UTF-8, no fancy encoding tricks). mkdir runs once per
+    failures_path the first time we see it — subsequent calls skip the
+    syscall (negligible cost, but adds up across thousands of failures)."""
     record = {
         "source_file": source_file,
         "line_number": line_number,
         "raw_row": raw_row,
         "error_reason": error_reason,
     }
-    failures_path.parent.mkdir(parents=True, exist_ok=True)
+    if failures_path not in _failures_dirs_created:
+        failures_path.parent.mkdir(parents=True, exist_ok=True)
+        _failures_dirs_created.add(failures_path)
     with failures_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -255,10 +262,10 @@ async def _migrate_captures(
         "seen": 0, "test_skipped": 0, "already_in_sql": 0,
         "minted_ids": 0, "inserted": 0, "failed": 0, "bad_json": 0,
     }
-    existing = await _existing_capture_ids(user_id) if not dry_run else set()
-    # Map capture_id → resolved id we'll use (so stages 2 + 3 below can
-    # look up the same id we wrote in stage 1).
-    resolved_ids: dict[int, str] = {}
+    # Pre-load even in dry-run so the counts the operator sees match
+    # what a real run would actually do (otherwise dry-run reports
+    # every row as "inserted" even when SQL is already populated).
+    existing = await _existing_capture_ids(user_id)
 
     for lineno, row, raw in _iter_jsonl(captures_path):
         counts["seen"] += 1
@@ -284,7 +291,6 @@ async def _migrate_captures(
         if not isinstance(cid, str) or not cid:
             cid = _mint_legacy_capture_id(row)
             counts["minted_ids"] += 1
-        resolved_ids[lineno] = cid
 
         if cid in existing:
             counts["already_in_sql"] += 1
@@ -294,6 +300,11 @@ async def _migrate_captures(
             counts["inserted"] += 1  # would-have-inserted
             continue
 
+        # Match the live /capture path: NULL when no metadata, not "{}".
+        # Drift here would leave queries like "captures with no metadata"
+        # returning different sets depending on whether the row was
+        # migrated or written live.
+        metadata = row.get("metadata")
         ok = await sync_capture(
             capture_id=cid,
             url=row.get("url"),
@@ -302,8 +313,8 @@ async def _migrate_captures(
             content_type=row.get("content_type"),
             captured_at=row.get("timestamp") or "",
             dwell_seconds=int(row.get("dwell_time_seconds") or 0),
-            raw_metadata_json=json.dumps(
-                row.get("metadata") or {}, ensure_ascii=False,
+            raw_metadata_json=(
+                json.dumps(metadata, ensure_ascii=False) if metadata else None
             ),
             user_id=user_id,
         )
@@ -352,12 +363,9 @@ async def _migrate_hydrations(
         "seen": 0, "skipped_no_capture_id": 0, "already_in_sql": 0,
         "inserted": 0, "failed": 0, "bad_json": 0,
     }
-    existing = (
-        await _existing_hydrated_capture_ids(user_id) if not dry_run else set()
-    )
-    captures_in_sql = (
-        await _existing_capture_ids(user_id) if not dry_run else set()
-    )
+    # Pre-load even in dry-run — see _migrate_captures for the same reasoning.
+    existing = await _existing_hydrated_capture_ids(user_id)
+    captures_in_sql = await _existing_capture_ids(user_id)
 
     for lineno, row, raw in _iter_jsonl(hydrations_path):
         counts["seen"] += 1
@@ -388,9 +396,10 @@ async def _migrate_hydrations(
             counts["already_in_sql"] += 1
             continue
 
-        if not dry_run and cid not in captures_in_sql:
+        if cid not in captures_in_sql:
             # Parent capture was filtered out (test fixture or bad row).
-            # FK would fail; skip with a logged note.
+            # FK would fail; skip with a logged note. Applies in dry-run
+            # too — the operator wants to see this gap before committing.
             counts["failed"] += 1
             _log_failure(
                 failures_path,
@@ -463,12 +472,9 @@ async def _migrate_enrichments(
     }
 
     capture_index = _build_capture_lookup(captures_path)
-    existing = (
-        await _existing_enriched_capture_ids(user_id) if not dry_run else set()
-    )
-    captures_in_sql = (
-        await _existing_capture_ids(user_id) if not dry_run else set()
-    )
+    # Pre-load even in dry-run — see _migrate_captures for the same reasoning.
+    existing = await _existing_enriched_capture_ids(user_id)
+    captures_in_sql = await _existing_capture_ids(user_id)
 
     for lineno, row, raw in _iter_jsonl(enrichments_path):
         counts["seen"] += 1
@@ -499,7 +505,8 @@ async def _migrate_enrichments(
             counts["already_in_sql"] += 1
             continue
 
-        if not dry_run and cid not in captures_in_sql:
+        if cid not in captures_in_sql:
+            # Same posture as stage 2 — surface the gap in dry-run too.
             counts["missing_parent"] += 1
             _log_failure(
                 failures_path,
@@ -507,6 +514,24 @@ async def _migrate_enrichments(
                 line_number=lineno,
                 raw_row=row,
                 error_reason=f"parent capture {cid} not in SQL (filtered or failed)",
+            )
+            continue
+
+        # Defensive: a corrupted row might have `enrichment` as a string
+        # or list. Without this guard the next .get() raises AttributeError
+        # mid-loop and the whole migration aborts.
+        enrichment_obj = row.get("enrichment")
+        if enrichment_obj is not None and not isinstance(enrichment_obj, dict):
+            counts["failed"] += 1
+            _log_failure(
+                failures_path,
+                source_file=str(enrichments_path),
+                line_number=lineno,
+                raw_row=row,
+                error_reason=(
+                    f"enrichment field is {type(enrichment_obj).__name__}, "
+                    f"expected dict"
+                ),
             )
             continue
 
@@ -527,7 +552,7 @@ async def _migrate_enrichments(
                 lineno, cid,
             )
 
-        enrichment = row.get("enrichment") or {}
+        enrichment = enrichment_obj or {}
         summary = enrichment.get("summary")
         topics = enrichment.get("topics") or []
         entities = enrichment.get("entities") or []
@@ -727,14 +752,18 @@ async def run(
         )
         return 2
 
-    # Ensure schema + default user before anything tries to read SQL.
-    if not dry_run or verify_only:
-        try:
-            await init_db()
-            await _ensure_default_user()
-        except Exception as e:  # noqa: BLE001
-            logger.error("init_db / ensure_default_user failed: %s", e)
-            return 2
+    # Always ensure schema + default user before anything reads SQL.
+    # init_db is idempotent (CREATE TABLE IF NOT EXISTS) and _ensure_default_user
+    # is a single SELECT + maybe-INSERT, so this is cheap even on dry-run
+    # / verify — and required by dry-run too because pre-loading the
+    # existence sets reads from the captures / enrichments / hydrations
+    # tables.
+    try:
+        await init_db()
+        await _ensure_default_user()
+    except Exception as e:  # noqa: BLE001
+        logger.error("init_db / ensure_default_user failed: %s", e)
+        return 2
 
     if verify_only:
         return await _verify(
