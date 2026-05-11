@@ -74,6 +74,12 @@ from backend.storage.schema import (
     topics,
     users,
 )
+from backend.storage.sync import (
+    DEFAULT_USER_ID,
+    sync_capture,
+    sync_enrichment,
+    sync_hydration,
+)
 
 
 __all__ = [
@@ -118,4 +124,9 @@ __all__ = [
     "EntityRepository",
     "normalize_slug",
     "ENTITY_TYPES",
+    # dual-write seam (sync.py)
+    "DEFAULT_USER_ID",
+    "sync_capture",
+    "sync_hydration",
+    "sync_enrichment",
 ]
