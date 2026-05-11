@@ -94,6 +94,30 @@ python scripts/backfill_enrichment.py                   # full run
 
 For the full numbered Phase 2 verification flow (unit tests, crash recovery, bot `/failures`, etc.) see [docs/phase2-smoke-test.md](docs/phase2-smoke-test.md).
 
+### Phase 3 — SQL + Vector storage (dual-write mode)
+
+Every `/capture` POST and every successful enrichment now mirrors into SQL (`data/braintwin.db`) and ChromaDB (`data/chroma/`) **alongside** the JSONL writers. Gated by `STORAGE_DUAL_WRITE=true` (default).
+
+**Quick commands:**
+
+```bash
+# Run the full test suite from one entry point
+python scripts/run_tests.py
+
+# Inspect what's in SQL + Chroma right now (read-only)
+python scripts/inspect_storage.py
+
+# Drill into one capture across both stores
+python scripts/inspect_storage.py --capture-id <uuid>
+
+# Migrate historical JSONLs into SQL + Chroma
+python scripts/migrate_jsonl_to_sql.py --dry-run
+python scripts/migrate_jsonl_to_sql.py
+python scripts/migrate_jsonl_to_sql.py --verify
+```
+
+Full numbered verification flow: see [docs/phase3-smoke-test.md](docs/phase3-smoke-test.md). Design decisions and the build-step log: [docs/phase3-design.md](docs/phase3-design.md).
+
 ### Project Structure
 
 ```
@@ -113,9 +137,17 @@ BrainTwin/
 │   │   ├── llm_client.py       # Async Anthropic SDK wrapper, typed errors
 │   │   ├── prompts.py          # Enrichment system/user prompts + retry reminder
 │   │   ├── enrichment.py       # Pure enrich() — schema validation + 1 retry
-│   │   ├── enrichment_worker.py# Async retry policy + sidecar JSONL persistence
-│   │   ├── store.py            # Phase 3 — ChromaDB + SQLite (not built)
-│   │   └── embeddings.py       # Phase 3 — Embedding generation (not built)
+│   │   └── enrichment_worker.py# Async retry policy + sidecar JSONL persistence + dual-write to SQL
+│   ├── storage/                # Phase 3 — SQL + Vector storage (built)
+│   │   ├── __init__.py
+│   │   ├── db.py               # Async SQLAlchemy engine + session_scope + init_db
+│   │   ├── schema.py           # 9 SQLAlchemy Core tables (users, captures, hydrations, enrichments, chunks, topics, entities, chunk_topics, chunk_entities)
+│   │   ├── models.py           # Frozen dataclass models (User, Capture, Chunk, …)
+│   │   ├── repositories/       # 7 repository classes (one per table family)
+│   │   ├── embedder.py         # Lazy sentence-transformers wrapper (all-MiniLM-L6-v2)
+│   │   ├── vector_store.py     # ChromaVectorStore — 3 collections (chunks, topics, entities)
+│   │   ├── chunking.py         # Paragraph / chapter-aware / token-window chunking
+│   │   └── sync.py             # Dual-write seam (sync_capture / sync_hydration / sync_enrichment)
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── retrieval.py        # RAG retrieval logic
@@ -138,24 +170,40 @@ BrainTwin/
 ├── data/
 │   ├── captures.jsonl          # Phase 1 — raw captures (one per line, with capture_id)
 │   ├── enrichments.jsonl       # Phase 2 — Haiku enrichment sidecar (joined by capture_id)
+│   ├── hydrations.jsonl        # Phase 2.5 — OG metadata + transcription sidecar
 │   ├── capture_failures.jsonl  # Failures tagged with phase: capture | enrichment | enrichment_skipped (Phase 2.5)
-│   ├── chroma/                 # Phase 3 — ChromaDB storage (auto-created)
+│   ├── migration_failures.jsonl# Phase 3 — per-row validation failures from migrate_jsonl_to_sql.py
+│   ├── chroma/                 # Phase 3 — ChromaDB persistent storage (auto-created)
+│   ├── braintwin.db            # Phase 3 — SQLite database (auto-created)
 │   ├── images/                 # Captured images/memes
-│   ├── models/                 # Phase 2.5 — whisper.cpp models (gitignored, ~250 MB)
-│   └── braintwin.db            # Phase 3 — SQLite database (auto-created)
+│   └── models/                 # Phase 2.5 — whisper.cpp models (gitignored, ~250 MB)
 ├── bin/
 │   └── whisper-cli             # Phase 2.5 — local whisper.cpp binary (gitignored)
 ├── scripts/
 │   ├── mock_capture.py         # Phase 1 smoke test — POST a synthetic capture
 │   ├── mock_phase2_capture.py  # Phase 2 smoke test — POST + poll for enrichment
 │   ├── mock_telegram_capture.py# Phase 1 — exercise the Telegram capture path
-│   ├── backfill_enrichment.py  # Idempotent backfill over existing captures
-│   ├── retry_failed_enrichments.py  # On-demand catch-up for unenriched rows
-│   └── replay_failed_urls.py   # Phase 2.5 — re-POST URLs from capture_failures.jsonl (planned)
+│   ├── backfill_enrichment.py  # Phase 2 — idempotent backfill over existing captures
+│   ├── retry_failed_enrichments.py  # Phase 2 — on-demand catch-up for unenriched rows
+│   ├── replay_failed_urls.py   # Phase 2.5 — re-POST URLs from capture_failures.jsonl
+│   ├── migrate_jsonl_to_sql.py # Phase 3 — backfill historical JSONLs into SQL + Chroma
+│   ├── inspect_storage.py      # Phase 3 — read-only inspector (SQL row counts + Chroma collections)
+│   ├── run_tests.py            # Phase 3 — single-command pytest runner
+│   └── setup_whisper.sh        # Phase 2.5 — install whisper.cpp + model
 ├── tests/
+│   ├── conftest.py             # Pins DATABASE_URL to in-memory SQLite for all tests
 │   ├── test_capture.py
 │   ├── test_enrichment.py
-│   └── test_agent.py
+│   ├── test_og_fetcher.py
+│   ├── test_replay_failed_urls.py
+│   ├── test_storage_schema.py
+│   ├── test_storage_repos.py
+│   ├── test_embedder.py
+│   ├── test_vector_store.py
+│   ├── test_chunking.py
+│   ├── test_storage_sync.py
+│   ├── test_main_wiring.py
+│   └── test_migrate_jsonl_to_sql.py
 ├── docs/
 │   ├── architecture.html       # Visual architecture diagram
 │   ├── architecture-detailed.md
@@ -163,7 +211,9 @@ BrainTwin/
 │   ├── phase1-smoke-test.md
 │   ├── phase2-design.md        # Phase 2 — enrichment design
 │   ├── phase2-smoke-test.md
-│   └── phase2.5-capture-hydration.md  # Phase 2.5 — IG/FB hydration + hygiene fixes
+│   ├── phase2.5-capture-hydration.md  # Phase 2.5 — IG/FB hydration + hygiene fixes
+│   ├── phase3-design.md        # Phase 3 — SQL + Vector storage decisions
+│   └── phase3-smoke-test.md    # Phase 3 — run + verify locally
 ├── .env.example                # Environment variables template
 ├── .gitignore
 ├── requirements.txt
@@ -174,12 +224,14 @@ BrainTwin/
 
 Open `docs/architecture.html` in a browser for the full visual diagram.
 
-**Five layers:**
-1. **Capture** — Chrome extension (laptop) + Telegram bot (phone)
-2. **Processing** — Text extraction, vision AI for memes, LLM enrichment
-3. **Storage** — ChromaDB (semantic search) + SQLite (structured queries)
-4. **Agent** — Claude Sonnet with RAG retrieval from your knowledge base
-5. **Competition** — You vs the agent, scored by a third party
+**Phases (build order):**
+1. **Phase 1 — Capture** — Chrome extension (dwell-time-gated) + Telegram bot. Writes raw JSONL with `capture_id`. ✅ built
+2. **Phase 2 — Enrichment** — Async Claude Haiku enrichment (summary, entities, key facts, topics). Sidecar JSONL. ✅ built
+3. **Phase 2.5 — Hydration** — OG metadata + video transcription to fill empty captures before enrichment. ✅ built
+4. **Phase 3 — Storage** — SQLAlchemy on SQLite (Postgres-ready) + ChromaDB. Chunking, embeddings (`all-MiniLM-L6-v2`), 9-table schema, multi-tenant from day one. Currently in **dual-write mode** alongside the JSONLs. ✅ built
+5. **Phase 3.5 — Cutover** — Remove JSONL writers; SQL + Chroma become sole path. ⏳ next
+6. **Phase 4 — Agent** — Synthesis quizzes (use case A), vague-recall search (B), indirect-clue inference (C). 🛠️ planned
+7. **Phase 5 — Competition** — Third party quizzes you vs the agent, scoring. 🛠️ planned
 
 ## Tech Stack
 

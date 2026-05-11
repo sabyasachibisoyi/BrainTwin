@@ -1,8 +1,10 @@
 # Phase 3 — Storage Layer (SQL + Vector)
 
-> **Status as of 2026-05-05 — LAYER A SIGNED OFF. LAYER B BLOCKERS RESOLVED (B.1, B.2, B.3, B.5, B.7 ALL LOCKED). READY TO CODE.**
+> **Status as of 2026-05-11 — PHASE 3 BUILT. Dual-write window open. Awaiting Phase 3.5 cutover after ~2 weeks of live traffic.**
 >
 > Phase 3 is the storage layer that finally absorbs the three sidecar JSONLs (`captures.jsonl`, `enrichments.jsonl`, `hydrations.jsonl`) into proper joined storage backed by SQL + vector search. It also makes BrainTwin **multi-user from day one**, because the use cases below extend beyond a single personal twin.
+>
+> See [docs/phase3-smoke-test.md](phase3-smoke-test.md) for how to run and verify Phase 3 locally end-to-end.
 >
 > All Phase-3-blocking decisions are signed off as of 2026-05-05. The remaining open Layer B items (B.4 pgvector index, B.6 embedding regeneration, B.8 hybrid retrieval, B.9 graph storage) are intentionally deferred per the rationale in each section — none block implementation.
 >
@@ -514,12 +516,44 @@ Same reasoning as Phase 1, Phase 2, and Phase 2.5: design-then-code is faster th
 
 ---
 
-## Next: re-open Layer B + start building
+## What got built (Step-by-step, 2026-05-06 → 2026-05-08)
 
-After Sabya's reading:
-1. Walk through Layer B questions B.1 through B.7. Lock answers.
-2. Write `docs/phase3-smoke-test.md` with the verification passes (similar to phase2-smoke-test.md).
-3. Build, smoke-test, ship.
-4. Flip this doc's status to "PHASE 3 LIVE" when end-to-end works.
+The five steps from the build plan, in the order they landed:
+
+| Step | Files | Outcome |
+|---|---|---|
+| **1a — SQL foundation** | `backend/storage/db.py`, `backend/storage/schema.py`, `backend/storage/models.py` | Async SQLAlchemy 2.0 engine, 9-table schema per A.4, frozen dataclass models, lifecycle hooks (`init_db`, `session_scope`, `aclose`). |
+| **1b — Repositories** | `backend/storage/repositories/*.py` | 7 repository classes (User, Capture, Hydration, Enrichment, Chunk, Topic, Entity). Tenant-scoped reads, `find_or_create` semantics for the controlled-vocabulary tables. |
+| **2 — VectorStore + Embedder** | `backend/storage/embedder.py`, `backend/storage/vector_store.py` | Lazy `sentence-transformers/all-MiniLM-L6-v2` wrapper; thin async `ChromaVectorStore` over the three collections per B.3 (`chunks` per-user-filtered, `topics` + `entities` shared global). |
+| **3 — Chunking** | `backend/storage/chunking.py` | Pure functions: paragraph for articles, chapter-aware for transcripts when chapters are known, fixed token-window (256 / 64 overlap) as fallback. Codex review fixed three real bugs (forward-progress on unbroken tokens, whitespace regex, oversized-paragraph sub-split). |
+| **4 — Dual-write seam** | `backend/storage/sync.py`, `backend/main.py`, `backend/knowledge/enrichment_worker.py`, `tests/test_main_wiring.py` | `sync_capture` / `sync_hydration` / `sync_enrichment` mirror every live capture into SQL + Chroma alongside the JSONL writers. Best-effort: a SQL/Chroma hiccup never breaks the JSONL path. Gated by `settings.storage_dual_write`. Startup hook seeds `user_id=1` (Sabya, per B.5.4). |
+| **5 — Backfill** | `scripts/migrate_jsonl_to_sql.py`, `tests/test_migrate_jsonl_to_sql.py` | Idempotent, streaming migration of historical JSONLs. `--dry-run`, `--verify`, `--limit`, `--include-test-rows` flags. Per-row validation failures go to `data/migration_failures.jsonl`. |
+
+Also shipped alongside Phase 3:
+
+- `scripts/run_tests.py` — single-command pytest runner over the whole `tests/` directory.
+- `scripts/inspect_storage.py` — read-only inspector that dumps SQL row counts + samples and Chroma collection counts + samples. Use as a GUI replacement.
+- `tests/test_storage_*.py` — full coverage of schema, repos, embedder, vector store, chunking, sync, and migration paths.
+
+Codex reviewed PRs at Steps 3, 4, and 5 (`sbisoyi/bugfix/phase-3-chunking-review-fixes` and PRs #9, #10) and caught real bugs in each. Findings are documented in commit messages on those branches.
+
+---
+
+## What's still open
+
+- **B.4 pgvector index** — deferred until pgvector swap (Phase 6+).
+- **B.6 embedding regeneration** — deferred until first embedding model change.
+- **B.8 hybrid retrieval (BM25 + vector)** — deferred to Phase 4 if/when vector-only recall proves insufficient.
+- **B.9 graph storage** — deferred indefinitely (Postgres recursive CTEs cover small-graph needs).
+
+These were intentionally left open per the Layer B rationale above; none blocked Phase 3 shipping.
+
+---
+
+## Next: Phase 3.5 cutover, then Phase 4
+
+1. Run the two-week dual-write window (capture as normal, periodically inspect with `scripts/inspect_storage.py`).
+2. Phase 3.5 commit removes the JSONL writers; SQL + Chroma become the sole path. Small commit, mostly deletions. Historical JSONLs stay on disk as audit trail.
+3. Phase 4 — agent layer (synthesis quizzes A, vague-recall B, indirect-clue C). Wires in the controlled-vocabulary embedding flow (B.7 v2) where the LLM sees top-K existing topics before coining new ones.
 
 After that, Phase 4 (the agent + Q&A interface) can begin in earnest — that's where the synthesis quizzes and the Deepika clue game actually become demonstrable.

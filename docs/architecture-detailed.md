@@ -420,39 +420,30 @@ Third Person (Quizmaster)
 
 ---
 
-## Build Order (Suggested Phases)
+## Build Order — actual phases (status as of 2026-05-11)
 
-### Phase 1: Foundation (Week 1-2)
-- [ ] Set up Python project structure
-- [ ] Build FastAPI backend with capture endpoint
-- [ ] Set up ChromaDB + SQLite
-- [ ] Build processing pipeline (text extraction + LLM enrichment)
-- [ ] Test with manual content input (paste URLs)
+This is what got built, in the order it landed. The original week-by-week plan above this section was rewritten as design constraints clarified; the canonical phase docs are under `docs/phase*-design.md`.
 
-### Phase 2: Chrome Extension (Week 2-3)
-- [ ] Build Manifest V3 extension
-- [ ] Implement dwell time tracking
-- [ ] Content extraction per platform (Readability.js + custom)
-- [ ] Image capture for memes
-- [ ] Connect to local backend API
+### Phase 1 — Capture (✅ built)
+Chrome extension (Manifest V3, dwell-time-gated) + Telegram bot + FastAPI `/capture` endpoint. Raw payloads land in `data/captures.jsonl` with a `capture_id` UUID. Locked decisions in [phase1-design.md](phase1-design.md); verification in [phase1-smoke-test.md](phase1-smoke-test.md).
 
-### Phase 3: Mobile + Vision (Week 3-4)
-- [ ] Set up Telegram bot
-- [ ] Image processing with Claude Vision
-- [ ] YouTube transcript integration
-- [ ] Test cross-platform capture (laptop + phone)
+### Phase 2 — Enrichment (✅ built)
+Async Claude Haiku 4.5 enrichment. Pure `enrich()` does schema validation and one retry; `enrichment_worker.enqueue_enrichment` adds the retry policy and writes the sidecar `data/enrichments.jsonl`. Locked decisions in [phase2-design.md](phase2-design.md); verification in [phase2-smoke-test.md](phase2-smoke-test.md).
 
-### Phase 4: Agent (Week 4-5)
-- [ ] Build RAG retrieval pipeline
-- [ ] Design agent system prompt
-- [ ] Test with knowledge-based questions
-- [ ] Iterate on retrieval quality (tune chunk sizes, top-K, etc.)
+### Phase 2.5 — Hydration (✅ built)
+Fix 2.A — OG metadata fetch fills `clean_text` for empty captures (typical for Telegram-forwarded URLs). Fix 3 — `yt-dlp` + `whisper.cpp` local transcription for IG reels / FB videos / TikToks. Sits between capture and enrichment. Sidecar at `data/hydrations.jsonl`. Locked decisions and rationale in [phase2.5-capture-hydration.md](phase2.5-capture-hydration.md).
 
-### Phase 5: Competition Mode (Week 5-6)
-- [ ] Build competition interface (start with CLI or Telegram)
-- [ ] Implement scoring system
-- [ ] Test with friends
-- [ ] Iterate on agent accuracy
+### Phase 3 — Storage Layer (✅ built, dual-write mode)
+SQL (SQLAlchemy 2.0 async on SQLite) + ChromaDB. 9-table schema, multi-tenant from day one (user_id=1 reserved for Sabya), `sentence-transformers/all-MiniLM-L6-v2` embeddings (384 dim, cosine). Three Chroma collections per B.3: `chunks` (per-user-filtered), `topics` + `entities` (shared global). Five-step build (1a SQL → 1b repositories → 2 VectorStore → 3 chunking → 4 dual-write → 5 backfill). Locked decisions in [phase3-design.md](phase3-design.md); verification in [phase3-smoke-test.md](phase3-smoke-test.md).
+
+### Phase 3.5 — Cutover (⏳ planned, ~2 weeks after dual-write opens)
+Remove JSONL writers; SQL + Chroma become sole path. Small commit, mostly deletions. Historical JSONLs stay on disk as audit trail. Triggered when the dual-write window has shown SQL + Chroma reliable enough.
+
+### Phase 4 — Agent (🛠️ planned)
+Three retrieval modes on top of SQL + Chroma: synthesis quizzes (use case A — "generate a quiz over things I read this week"), vague-recall search (use case B — "that article about hash collisions a few weeks ago"), indirect-clue inference (use case C — third party gives layered clues, BrainTwin and Sabya race to the answer). Wires in the controlled-vocabulary embedding flow (phase3-design.md B.7 v2) where the LLM sees top-K existing topics before coining new ones.
+
+### Phase 5 — Competition (🛠️ planned)
+A third party quizzes Sabya and the agent in parallel. Scoring per the "Competition Layer" rubric above. Built on top of Phase 4's quiz generator.
 
 ---
 
@@ -466,13 +457,20 @@ BrainTwin/
 │   │   ├── processor.py        # Content processing pipeline
 │   │   ├── extractors.py       # Platform-specific extractors
 │   │   └── vision.py           # Image/meme understanding
-│   ├── knowledge/              # Built in Phase 2
+│   ├── knowledge/              # Phase 2 + Phase 2.5 — built
 │   │   ├── llm_client.py       # Model-agnostic async wrapper (Anthropic SDK)
 │   │   ├── prompts.py          # System / user prompts + retry reminder
 │   │   ├── enrichment.py       # Pure enrich(processed) → 4-field dict
-│   │   ├── enrichment_worker.py# Async retry + sidecar JSONL persistence
-│   │   ├── store.py            # Phase 3 — ChromaDB + SQLite operations
-│   │   └── embeddings.py       # Phase 3 — embedding generation
+│   │   └── enrichment_worker.py# Async retry + sidecar JSONL + Phase 3 dual-write
+│   ├── storage/                # Phase 3 — built
+│   │   ├── db.py               # Async SQLAlchemy engine + session_scope
+│   │   ├── schema.py           # 9 SQLAlchemy Core tables
+│   │   ├── models.py           # Frozen dataclass row models
+│   │   ├── repositories/       # 7 repository classes (one per table family)
+│   │   ├── embedder.py         # Lazy sentence-transformers wrapper
+│   │   ├── vector_store.py     # ChromaVectorStore — 3 collections per B.3
+│   │   ├── chunking.py         # Paragraph / chapter-aware / token-window
+│   │   └── sync.py             # Dual-write seam (sync_capture / hydration / enrichment)
 │   ├── agent/
 │   │   ├── retrieval.py        # RAG retrieval logic
 │   │   ├── reasoning.py        # Agent LLM calls
