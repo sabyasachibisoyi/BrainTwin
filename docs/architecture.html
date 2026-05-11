@@ -139,7 +139,7 @@
   <!-- LAYER 2: PROCESSING -->
   <div class="layer processing">
     <span class="layer-label">Phase 2</span>
-    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status built">Phase 2 LIVE</span> <span class="build-status proposed">Phase 2.5 in design</span></h2>
+    <h2><span class="icon">⚙️</span> Processing Pipeline <span class="build-status built">Phase 2 LIVE</span> <span class="build-status built">Phase 2.5 LIVE</span></h2>
     <div class="pipeline">
       <div class="step">
         <div class="step-icon">📄</div>
@@ -179,7 +179,7 @@
           <div class="tech"><span>Claude Haiku</span><span>~$0.003/capture</span><span>4-field schema</span><span>async BackgroundTasks</span></div>
         </div>
         <div class="card">
-          <h3>🪡 Capture Hydration Tiers <span class="build-status proposed">Phase 2.5</span></h3>
+          <h3>🪡 Capture Hydration Tiers <span class="build-status built">Phase 2.5 LIVE</span></h3>
           <p>Closes the gap surfaced by Phase 2 smoke testing — IG reels and FB share links forwarded via Telegram landed as <code>empty_content</code> failures because the bot can only send the URL and the backend has no fetcher beyond YouTube. Phase 2.5 adds a tiered capture-time hydration: <strong>(1)</strong> use raw text if present, <strong>(2)</strong> use Telegram's link preview if present (free), <strong>(3)</strong> fetch <code>og:title</code>/<code>og:description</code>/<code>og:image</code>, <strong>(4)</strong> for video URLs run <code>yt-dlp</code> + local <code>whisper.cpp</code>, <strong>(5)</strong> tag <code>phase: "enrichment_skipped"</code> so genuine failures stop drowning in noise.</p>
           <div class="tech"><span>httpx + selectolax</span><span>yt-dlp</span><span>whisper.cpp small.en</span><span>$0/mo</span><span>~250 MB disk</span></div>
           <a class="doc-link" href="phase2.5-capture-hydration.md">→ Design: phase2.5-capture-hydration.md</a>
@@ -193,7 +193,7 @@
   <!-- LAYER 3: STORAGE -->
   <div class="layer storage">
     <span class="layer-label">Phase 3</span>
-    <h2><span class="icon">💾</span> Knowledge Store <span class="build-status notbuilt">Not built</span></h2>
+    <h2><span class="icon">💾</span> Knowledge Store <span class="build-status built">Phase 3 LIVE (dual-write)</span></h2>
     <div class="db-container">
       <div class="db">
         <div class="db-icon">🔮</div>
@@ -214,6 +214,8 @@
         <div class="db-use">Memes and visual content preserved for future retrieval</div>
       </div>
     </div>
+    <a class="doc-link" href="phase3-design.md">→ Design: phase3-design.md</a>
+    <a class="doc-link" href="phase3-smoke-test.md">→ Run + verify locally: phase3-smoke-test.md</a>
   </div>
 
   <div class="flow-arrow"><span>▼ ▼ ▼</span></div>
