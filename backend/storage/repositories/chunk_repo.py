@@ -12,9 +12,11 @@ the chunks table and its junctions.
 
 from __future__ import annotations
 
-from sqlalchemy import insert, select
+import re
 
-from backend.storage.models import Chunk, ChunkAttachment, ChunkInsert
+from sqlalchemy import insert, select, text
+
+from backend.storage.models import Chunk, ChunkAttachment, ChunkInsert, ChunkWithScore
 from backend.storage.repositories.base import BaseRepository
 from backend.storage.schema import (
     captures,
@@ -22,6 +24,39 @@ from backend.storage.schema import (
     chunk_topics,
     chunks,
 )
+
+
+# Word-token extractor for building a safe FTS5 MATCH expression.
+# `\w+` is Unicode-aware on Python 3 str patterns, so it keeps
+# accented Latin, Devanagari, CJK, etc. (the proper nouns BM25 is
+# here to catch — "Tamasha", "Bengaluru") while dropping every byte
+# FTS5 would otherwise interpret as query syntax (":", "(", "-", "*",
+# quotes, and the bareword operators AND/OR/NOT/NEAR).
+_FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _build_fts_match_query(raw: str) -> str:
+    """Turn arbitrary user text into a safe FTS5 MATCH expression.
+
+    `/recall` receives free-form natural language ("what about kanban?",
+    "notes: HSR Layout", "team-size tradeoffs"). Passing that straight
+    into `chunks_fts MATCH :query` makes FTS5 parse it as a *query
+    expression*, and any of `: ( ) - + * " ?` or a leading AND/OR/NOT
+    raises `sqlite3.OperationalError`. So we extract bare word tokens,
+    double-quote each one (making it a literal term — no quote-escaping
+    needed since tokens contain no quotes), and OR them together.
+
+    OR (not AND) so a proper-noun query like "Tamasha meme" still
+    surfaces the chunk that contains only "Tamasha"; BM25's IDF weighting
+    handles the relevance ordering and de-prioritises common terms.
+
+    Returns "" when the query has no usable tokens (e.g. all punctuation)
+    so the caller can short-circuit to an empty result.
+    """
+    tokens = _FTS_TOKEN_RE.findall(raw)
+    if not tokens:
+        return ""
+    return " OR ".join(f'"{tok}"' for tok in tokens)
 
 
 def _row_to_chunk(row) -> Chunk:
@@ -101,6 +136,88 @@ class ChunkRepository(BaseRepository):
             .where(chunks.c.id.in_(chunk_ids))
         )
         return [_row_to_chunk(row) for row in result]
+
+    # ---- Phase 4 M.1 — BM25 full-text retrieval ----------------------
+
+    async def search_by_bm25(
+        self,
+        query: str,
+        *,
+        user_id: int,
+        limit: int = 20,
+    ) -> list[ChunkWithScore]:
+        """Full-text BM25 search over `chunks.text` via the FTS5
+        virtual table `chunks_fts`. Phase 4 M.1 — paired with Chroma's
+        vector search in M.2 to form the hybrid retrieval pipeline.
+
+        Tenant-isolated via the JOIN to `captures` on `user_id` —
+        chunks belonging to other users cannot surface in this user's
+        results.
+
+        Score convention: SQLite's `bm25()` function returns negative
+        values by convention (lower = better). We flip the sign before
+        returning so `ChunkWithScore.score` follows the HIGHER-is-better
+        convention, which matches what callers expect when fusing with
+        a vector-similarity ranker (M.2 RRF) or sorting for display.
+
+        Empty / whitespace-only queries (and queries that reduce to no
+        usable tokens, e.g. all punctuation) return [] without touching
+        the DB — FTS5's MATCH would error on a blank query and the
+        caller gets a cleaner contract.
+
+        The raw query is normalised into a safe FTS5 expression via
+        `_build_fts_match_query` so free-form natural language can't
+        trip FTS5's query-syntax parser (see that helper for the why).
+
+        Raw SQL via `text()` because SQLAlchemy Core doesn't model the
+        FTS5 `MATCH` operator. Parameters are still bound — no string
+        interpolation of `query` into the SQL.
+        """
+        if not query or not query.strip():
+            return []
+        if limit <= 0:
+            return []
+        match_query = _build_fts_match_query(query)
+        if not match_query:
+            return []
+        sql = text(
+            """
+            SELECT
+                c.id            AS id,
+                c.capture_id    AS capture_id,
+                c.chunk_index   AS chunk_index,
+                c.text          AS text,
+                c.source_kind   AS source_kind,
+                c.embedding     AS embedding,
+                bm25(chunks_fts) AS bm25_score
+            FROM chunks_fts
+            JOIN chunks   AS c   ON c.id = chunks_fts.rowid
+            JOIN captures AS cap ON cap.id = c.capture_id
+            WHERE chunks_fts MATCH :query
+              AND cap.user_id = :user_id
+            ORDER BY bm25(chunks_fts)
+            LIMIT :limit
+            """
+        )
+        result = await self.session.execute(
+            sql,
+            {"query": match_query, "user_id": user_id, "limit": limit},
+        )
+        out: list[ChunkWithScore] = []
+        for row in result:
+            chunk = Chunk(
+                id=row.id,
+                capture_id=row.capture_id,
+                chunk_index=row.chunk_index,
+                text=row.text,
+                source_kind=row.source_kind,
+                embedding=row.embedding,
+            )
+            # SQLite returns bm25() as a non-positive float (lower =
+            # better). Flip the sign so higher = better, matching the
+            # ChunkWithScore convention.
+            out.append(ChunkWithScore(chunk=chunk, score=-float(row.bm25_score)))
+        return out
 
     # ---- Junction-table operations -----------------------------------
 
