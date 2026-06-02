@@ -7,8 +7,10 @@ Covers:
   - _startup's two storage try-blocks are independent: init failure
     doesn't suppress user-seed, and user-seed failure doesn't undo
     init.
-  - storage_dual_write=False short-circuits the entire startup
-    storage block (no init, no seed).
+
+Phase 3.5 removed the storage_dual_write gate, so the
+TestDualWriteOffStartup case went with it — SQL is now the only
+persistence path and there's no longer an "off" state to test.
 """
 
 from __future__ import annotations
@@ -51,13 +53,6 @@ def clean_engine(monkeypatch):
 
 
 @pytest.fixture
-def dual_write_on(monkeypatch):
-    """Force storage_dual_write=True (default is True but tests may
-    have other monkeypatches in play)."""
-    monkeypatch.setattr(main_mod.settings, "storage_dual_write", True)
-
-
-@pytest.fixture
 def no_anthropic(monkeypatch):
     """Empty API key so _startup returns after the storage block —
     we don't want to exercise the LLM init / recovery path here."""
@@ -67,7 +62,7 @@ def no_anthropic(monkeypatch):
 # ---- _ensure_default_user --------------------------------------------
 
 class TestEnsureDefaultUser:
-    def test_idempotent(self, dual_write_on):
+    def test_idempotent(self):
         """Second call must NOT insert a duplicate row, must NOT raise.
         Required because _startup runs on every boot and would otherwise
         crash on the second app start once a user exists. Stronger
@@ -96,7 +91,7 @@ class TestEnsureDefaultUser:
 
 class TestStartupIndependence:
     def test_user_seed_failure_does_not_undo_init(
-        self, dual_write_on, no_anthropic, monkeypatch,
+        self, no_anthropic, monkeypatch,
     ):
         """If _ensure_default_user fails (e.g. transient DB hiccup),
         the schema init MUST still have completed — we want the
@@ -124,7 +119,7 @@ class TestStartupIndependence:
         assert rows == []  # Schema present, no rows because seed failed.
 
     def test_init_failure_still_attempts_user_seed(
-        self, dual_write_on, no_anthropic, monkeypatch,
+        self, no_anthropic, monkeypatch,
     ):
         """If init_storage_db fails, _ensure_default_user must still
         be ATTEMPTED (and likely fail too on missing tables — but the
@@ -153,33 +148,6 @@ class TestStartupIndependence:
         )
 
 
-# ---- storage_dual_write=False short-circuit --------------------------
-
-class TestDualWriteOffStartup:
-    def test_dual_write_off_skips_storage_block(
-        self, no_anthropic, monkeypatch,
-    ):
-        """When storage_dual_write=False the operator is signalling
-        'don't touch SQL this run'. The startup hook should respect
-        that — no schema init, no user seed."""
-        init_called = {"v": False}
-        seed_called = {"v": False}
-
-        async def record_init() -> None:
-            init_called["v"] = True
-
-        async def record_seed() -> None:
-            seed_called["v"] = True
-
-        monkeypatch.setattr(main_mod.settings, "storage_dual_write", False)
-        monkeypatch.setattr(main_mod, "init_storage_db", record_init)
-        monkeypatch.setattr(main_mod, "_ensure_default_user", record_seed)
-
-        asyncio.run(main_mod._startup())
-
-        assert init_called["v"] is False, (
-            "init_storage_db ran despite storage_dual_write=False"
-        )
-        assert seed_called["v"] is False, (
-            "_ensure_default_user ran despite storage_dual_write=False"
-        )
+# Phase 3.5 — the `TestDualWriteOffStartup` class is gone: the
+# storage_dual_write flag was retired with the JSONL writers, so
+# there's no "off" state to short-circuit anymore.

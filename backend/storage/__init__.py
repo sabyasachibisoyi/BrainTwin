@@ -124,7 +124,7 @@ __all__ = [
     "EntityRepository",
     "normalize_slug",
     "ENTITY_TYPES",
-    # dual-write seam (sync.py)
+    # Persistence seam (sync.py) — sole write path post-Phase-3.5.
     "DEFAULT_USER_ID",
     "sync_capture",
     "sync_hydration",

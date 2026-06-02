@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 
 from backend.storage.models import (
     Capture,
@@ -91,6 +91,18 @@ class EnrichmentRepository(BaseRepository):
             .distinct()
         )
         return {row.capture_id for row in result}
+
+    async def count_enriched_captures_by_user(self, *, user_id: int) -> int:
+        """Number of distinct captures the user has at least one
+        enrichment row for. Used by /stats — replaces the JSONL scan
+        that counted unique capture_ids in enrichments.jsonl."""
+        result = await self.session.execute(
+            select(func.count(func.distinct(enrichments.c.capture_id)))
+            .select_from(enrichments)
+            .join(captures, enrichments.c.capture_id == captures.c.id)
+            .where(captures.c.user_id == user_id)
+        )
+        return int(result.scalar_one())
 
     async def list_by_user(
         self,

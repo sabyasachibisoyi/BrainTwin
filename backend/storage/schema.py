@@ -68,10 +68,16 @@ users = Table(
 
 
 # ---------------------------------------------------------------------
-# Captures — lifted from data/captures.jsonl (Phase 1)
+# Captures — formerly mirrored from data/captures.jsonl, now sole store
 # ---------------------------------------------------------------------
 # `id` stays a TEXT UUID (matches today's `capture_id`) so JSONL rows
 # migrate cleanly with no re-keying in B.5.
+#
+# Phase 3.5 cutover: the processed content fields (clean_text, transcript,
+# image_text, image_descriptions_json, text_source) used to live only in
+# captures.jsonl. They now live on the captures row itself so the
+# enrichment worker can rebuild ProcessedContent from SQL for crash
+# recovery and manual retry. See docs/phase3.5-cutover.md.
 captures = Table(
     "captures",
     metadata,
@@ -87,6 +93,15 @@ captures = Table(
     # when we want to debug why a capture looks the way it does without
     # poking through git history of the source code.
     Column("raw_metadata_json", TEXT),
+    # ---- Phase 3.5 content columns ------------------------------------
+    # Processed payload, previously persisted only in captures.jsonl.
+    # All nullable so historical rows (pre-cutover) and any capture
+    # where the extractor returned nothing stay valid.
+    Column("clean_text", TEXT),
+    Column("transcript", TEXT),
+    Column("image_text", TEXT),
+    Column("image_descriptions_json", TEXT),  # JSON array of ImageDescription dicts
+    Column("text_source", TEXT),              # "extension" | "youtube_transcript" | "fallback"
     Index("idx_captures_user_id", "user_id"),
     Index("idx_captures_captured_at", "captured_at"),
     Index("idx_captures_platform", "platform"),

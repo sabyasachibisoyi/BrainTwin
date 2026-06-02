@@ -1,9 +1,17 @@
 """End-to-end smoke test for the BrainTwin Phase 2 enrichment path.
 
-Sends a real-shaped capture payload, then polls data/enrichments.jsonl
-for the matching capture_id and pretty-prints the enrichment block.
-This proves: extension/bot → /capture → captures.jsonl + capture_id
-→ FastAPI BackgroundTasks → enrichment_worker → Haiku → enrichments.jsonl.
+Sends a real-shaped capture payload, polls `/stats` until the
+enrichment count rises (or a matching failure row appears in
+capture_failures.jsonl), and prints the result. Proves the path:
+extension/bot → /capture → SQL captures row → FastAPI BackgroundTasks
+→ enrichment_worker → Haiku → SQL enrichments + Chroma chunks.
+
+Phase 3.5 update: this used to poll `data/enrichments.jsonl` for the
+matching capture_id. After the cutover, enrichments live in SQL only.
+The script now polls the `/stats` enrichments counter; the failures
+log is still consulted for a fast-fail signal because that JSONL
+survived the cutover (it's an ops record, not part of the knowledge
+graph).
 
 Requires:
   - Backend running with ANTHROPIC_API_KEY set (else enrichment is skipped
@@ -85,30 +93,10 @@ def http_json(
         return 0, {"error": str(e.reason)}
 
 
-def find_enrichment(path: Path, capture_id: str) -> dict | None:
-    """Scan enrichments.jsonl for the row matching this capture_id.
-
-    Returns the parsed record dict, or None if not yet present. Reads
-    line-by-line each call so we always see fresh appends.
-    """
-    if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("capture_id") == capture_id:
-                return row
-    return None
-
-
 def find_failure(path: Path, capture_id: str) -> dict | None:
-    """Scan capture_failures.jsonl for an enrichment failure for this id."""
+    """Scan capture_failures.jsonl for an enrichment failure for this id.
+
+    The failures log survives the Phase 3.5 cutover as an ops record."""
     if not path.exists():
         return None
     with path.open("r", encoding="utf-8") as f:
@@ -125,12 +113,16 @@ def find_failure(path: Path, capture_id: str) -> dict | None:
     return None
 
 
+def _enriched_total(backend: str) -> int:
+    _, body = http_json("GET", f"{backend}/stats")
+    return int((body.get("enrichments") or {}).get("total", 0))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--backend", default="http://127.0.0.1:8000")
-    ap.add_argument("--enrichments-log", default="data/enrichments.jsonl")
     ap.add_argument("--failures-log", default="data/capture_failures.jsonl")
     ap.add_argument(
         "--timeout", type=int, default=30,
@@ -163,7 +155,7 @@ def main() -> int:
     before_enriched = (before.get("enrichments") or {}).get("total", 0)
 
     # 3. Capture (mint a deterministic-looking capture_id so we can spot
-    # it in the JSONL during debugging)
+    # it in the failures log during debugging)
     capture_id = str(uuid.uuid4())
     payload = {**SAMPLE_PAYLOAD, "capture_id": capture_id}
     print("\n[3/5] POST /capture")
@@ -178,29 +170,32 @@ def main() -> int:
     if not body.get("enrichment_scheduled"):
         print(
             "  ⚠ enrichment_scheduled=False — backend chose not to run "
-            "enrichment (likely no API key). Bailing."
+            "enrichment (likely no API key or capture rejected). Bailing."
         )
         return 1
 
-    # 4. Wait for enrichments.jsonl row
-    print(f"\n[4/5] Polling {args.enrichments_log} (timeout {args.timeout}s)")
-    enrich_path = Path(args.enrichments_log)
+    # 4. Wait for enrichments counter to advance (or a failure row)
+    print(f"\n[4/5] Polling /stats for enrichment delta (timeout {args.timeout}s)")
     fail_path = Path(args.failures_log)
     deadline = time.time() + args.timeout
-    enrichment_row: dict | None = None
     failure_row: dict | None = None
+    succeeded = False
     while time.time() < deadline:
-        enrichment_row = find_enrichment(enrich_path, capture_id)
-        if enrichment_row is not None:
+        try:
+            after_enriched_now = _enriched_total(args.backend)
+        except Exception:
+            after_enriched_now = before_enriched
+        if after_enriched_now > before_enriched:
+            succeeded = True
             break
         failure_row = find_failure(fail_path, capture_id)
         if failure_row is not None:
             break
         time.sleep(1)
 
-    if enrichment_row is None and failure_row is None:
+    if not succeeded and failure_row is None:
         elapsed = int(args.timeout)
-        print(f"  ✗ Timed out after {elapsed}s — no enrichment row, no failure row.")
+        print(f"  ✗ Timed out after {elapsed}s — enrichments counter never moved.")
         print("  Check backend logs for traceback. Possible causes:")
         print("    - ANTHROPIC_API_KEY not set")
         print("    - Network blocked from reaching api.anthropic.com")
@@ -213,7 +208,7 @@ def main() -> int:
         print(f"    {json.dumps(failure_row, indent=2, ensure_ascii=False)}")
         return 1
 
-    print(f"  ✓ Enrichment row found.")
+    print("  ✓ Enrichment counter advanced.")
 
     # 5. Stats after
     print("\n[5/5] GET /stats (after)")
@@ -230,24 +225,12 @@ def main() -> int:
         f"(delta {after_enriched - before_enriched:+})"
     )
 
-    enr = enrichment_row.get("enrichment") or {}
-    print("\n  --- Enrichment block ---")
-    print(f"  summary:    {enr.get('summary')}")
-    print(f"  entities:   {enr.get('entities')}")
-    print(f"  key_facts:  {enr.get('key_facts')}")
-    print(f"  topics:     {enr.get('topics')}")
-    print(f"  model:      {enrichment_row.get('model')}")
-    print(f"  enriched_at:{enrichment_row.get('enriched_at')}")
-
-    # Sanity check: the system prompt told Haiku to preserve "jugaad"
-    # and "₹" / "HSR Layout" — flag if they're missing.
-    flat = json.dumps(enr, ensure_ascii=False).lower()
-    misses = [w for w in ("jugaad", "hsr") if w not in flat]
-    if misses:
-        print(f"  ⚠ Phase 2 fidelity check — missing tokens: {misses}")
-        print("    (Decision D says cultural keywords + place names should survive.)")
-    else:
-        print("  ✓ Phase 2 fidelity check — 'jugaad' and 'HSR' both preserved.")
+    print(
+        "\n  --- Note ---\n"
+        "  Phase 3.5: the per-capture enrichment block lives in SQL only.\n"
+        "  Use `python scripts/inspect_storage.py --capture-id "
+        f"{capture_id}` for the full enrichment + chunks view."
+    )
 
     print("\n✓ Phase 2 enrichment path works.")
     return 0

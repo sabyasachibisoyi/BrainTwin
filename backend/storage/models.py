@@ -41,7 +41,14 @@ class Capture:
     """One row per capture from the Chrome extension or Telegram bot.
     `id` is the UUID4 the client minted; we use it as both PK and
     join key to enrichments / hydrations / chunks (per Phase 2's
-    `capture_id` design)."""
+    `capture_id` design).
+
+    Phase 3.5 adds the processed-content fields (clean_text, transcript,
+    image_text, image_descriptions_json, text_source). They were only
+    in captures.jsonl before; now they live on the row so the enrichment
+    worker can rebuild ProcessedContent from SQL after a crash. All
+    nullable for backwards compatibility with rows that pre-date the
+    cutover or where the extractor returned nothing."""
     id: str
     user_id: int
     url: Optional[str]
@@ -51,6 +58,12 @@ class Capture:
     captured_at: str
     dwell_seconds: int
     raw_metadata_json: Optional[str]
+    # ---- Phase 3.5 content fields ------------------------------------
+    clean_text: Optional[str] = None
+    transcript: Optional[str] = None
+    image_text: Optional[str] = None
+    image_descriptions_json: Optional[str] = None
+    text_source: Optional[str] = None
 
 
 # ---- Hydrations -------------------------------------------------------

@@ -1,18 +1,19 @@
-"""Dual-write sync: mirror JSONL-bound payloads into SQL + Chroma.
+"""Persistence seam — SQL + Chroma writes for captures, hydrations,
+enrichments.
 
-Per docs/phase3-design.md B.1, Phase 3 runs in dual-write mode for
-~2 weeks: every `/capture` POST and every successful enrichment writes
-to BOTH the existing JSONLs AND the new SQL/Chroma stores. After the
-window, Phase 3.5 commit removes the JSONL writers and SQL becomes the
-sole path.
+History: this module started as the **dual-write seam** during the
+Phase 3 → Phase 3.5 cutover window. Per docs/phase3-design.md B.1 every
+`/capture` POST wrote to BOTH the legacy JSONL files AND SQL/Chroma so
+no capture could be lost if the new storage layer broke. The
+`storage_dual_write` flag gated each function so the operator could
+disable SQL writes during debugging.
 
-This module is the seam. Each `sync_*` function takes the same payload
-shape the JSONL writer already has, normalizes it, and persists into
-SQL + Chroma. Importantly, every function is **best-effort**: any
-SQL/Chroma failure is caught at the boundary, logged, and swallowed.
-The JSONL writer's success / failure is unaffected — even if the new
-storage layer is broken, no capture is lost during the dual-write
-window.
+After Phase 3.5 (docs/phase3.5-cutover.md) the JSONL writers were
+removed and SQL is the sole authoritative store. The `storage_dual_write`
+gate went with them — these functions are no longer best-effort
+side-channels, they are the primary persistence path. Errors are
+still logged and swallowed so a SQL hiccup doesn't crash the request,
+but a False return now means the capture is not persisted anywhere.
 
 Tenant simplification (Step 4):
   All captures land at user_id=1 per B.5.4. Bot and extension don't
@@ -39,9 +40,6 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
-
-from backend.config import settings
 from backend.storage.chunking import (
     SOURCE_KIND_ARTICLE_PARAGRAPH,
     SOURCE_KIND_IMAGE_CAPTION,
@@ -96,22 +94,27 @@ async def sync_capture(
     captured_at: str,
     dwell_seconds: int = 0,
     raw_metadata_json: Optional[str] = None,
+    clean_text: Optional[str] = None,
+    transcript: Optional[str] = None,
+    image_text: Optional[str] = None,
+    image_descriptions_json: Optional[str] = None,
+    text_source: Optional[str] = None,
     user_id: int = DEFAULT_USER_ID,
 ) -> bool:
-    """Mirror a capture into SQL.
+    """Persist a capture row to SQL.
 
     Idempotent: if `capture_id` already exists in the captures table,
     this is a silent no-op. Best-effort: never raises — any SQL error
-    is caught, logged, and swallowed so the JSONL path is unaffected.
+    is caught and logged so the caller (the /capture handler) can
+    decide whether to surface it.
 
     Returns True on a successful insert, False on duplicate or error.
 
-    Honors `settings.storage_dual_write` — when False, the dual-write
-    is disabled wholesale (used by Phase 3.5 cutover and by tests that
-    don't want to touch SQL/Chroma).
+    Phase 3.5: this is the ONLY persistence step for a capture (the
+    JSONL writer has been retired). The processed-content fields are
+    now stored on the captures row itself so the enrichment worker
+    can rebuild ProcessedContent from SQL after a crash.
     """
-    if not settings.storage_dual_write:
-        return False
     try:
         async with session_scope() as session:
             cap_repo = CaptureRepository(session)
@@ -135,6 +138,11 @@ async def sync_capture(
                 captured_at=captured_at,
                 dwell_seconds=dwell_seconds,
                 raw_metadata_json=raw_metadata_json,
+                clean_text=clean_text,
+                transcript=transcript,
+                image_text=image_text,
+                image_descriptions_json=image_descriptions_json,
+                text_source=text_source,
             ))
         logger.debug("sync_capture: inserted %s", capture_id)
         return True
@@ -150,14 +158,12 @@ async def sync_hydration(
     source_payload_json: Optional[str],
     hydrated_at: str,
 ) -> bool:
-    """Mirror a hydration row (Phase 2.5 sidecar) into SQL.
+    """Persist a hydration row (formerly the Phase 2.5 sidecar JSONL).
 
-    Best-effort like `sync_capture`. Caller is responsible for verifying
-    the parent capture exists — we don't pre-check, the FK constraint
-    will catch it if the order is wrong (and we'll log the failure
-    instead of raising). Honors `settings.storage_dual_write`."""
-    if not settings.storage_dual_write:
-        return False
+    Best-effort like `sync_capture` — never raises, returns False on
+    error. Caller is responsible for verifying the parent capture
+    exists; the FK constraint will catch ordering bugs (and we log
+    the failure instead of raising)."""
     try:
         async with session_scope() as session:
             hyd_repo = HydrationRepository(session)
@@ -216,13 +222,7 @@ async def sync_enrichment(
     pipeline emits them this way.
 
     `topics` shape: list of strings (labels). Slug-normalized internally.
-
-    Honors `settings.storage_dual_write` — when False, the entire
-    pipeline is skipped (used by Phase 3.5 cutover and by tests that
-    don't want to touch SQL/Chroma).
     """
-    if not settings.storage_dual_write:
-        return False
     embedder = embedder if embedder is not None else get_embedder()
     vector_store = vector_store if vector_store is not None else get_vector_store()
 
