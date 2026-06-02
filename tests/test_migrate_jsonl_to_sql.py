@@ -338,6 +338,114 @@ def test_stage1_bad_json_logged_and_continues(tmp_path, monkeypatch):
     assert failures[0]["line_number"] == 2
 
 
+def test_stage1_rescues_telegram_link_when_downstream_artifact_exists(
+    tmp_path, monkeypatch,
+):
+    """Regression: Telegram-forwarded URLs arrive with title='Telegram link'
+    and clean_text='', which `is_test_row` would normally classify as an
+    empty-Telegram-link fixture. But Phase 2.5 hydration adds content
+    downstream — so if a hydration row exists for this capture_id, it's
+    real and must NOT be skipped. Without this rescue, every such
+    capture's downstream hydration + enrichment got orphaned.
+    """
+    captures = tmp_path / "captures.jsonl"
+    fail = tmp_path / "failures.jsonl"
+    _write_jsonl(captures, [
+        # Looks like an empty Telegram-link fixture by the strict heuristic.
+        {
+            "capture_id": "tg-1",
+            "url": "https://www.instagram.com/p/DXgSDglDvyq/",
+            "title": "Telegram link",
+            "platform": "instagram",
+            "content_type": "article",
+            "clean_text": "",
+            "text_source": "fallback",
+            "transcript": None, "image_descriptions": [], "image_text": "",
+            "timestamp": "2026-04-30T00:00:00+00:00",
+            "dwell_time_seconds": 0,
+            "metadata": {"source": "telegram"},
+        },
+        # Also looks like an empty Telegram link — but with NO downstream
+        # artifact, so it should still be skipped.
+        {
+            "capture_id": "tg-2-fixture",
+            "url": "https://www.instagram.com/p/DOES_NOT_EXIST/",
+            "title": "Telegram link",
+            "platform": "instagram",
+            "content_type": "article",
+            "clean_text": "",
+            "text_source": "fallback",
+            "transcript": None, "image_descriptions": [], "image_text": "",
+            "timestamp": "2026-04-30T00:00:01+00:00",
+            "dwell_time_seconds": 0,
+            "metadata": {"source": "telegram"},
+        },
+    ])
+
+    inserted_cids: list[str] = []
+
+    async def fake_sync_capture(**kwargs):
+        inserted_cids.append(kwargs["capture_id"])
+        async with session_scope() as session:
+            await CaptureRepository(session).create(Capture(
+                id=kwargs["capture_id"], user_id=kwargs["user_id"],
+                url=kwargs.get("url"), title=kwargs.get("title"),
+                platform=kwargs.get("platform"),
+                content_type=kwargs.get("content_type"),
+                captured_at=kwargs["captured_at"],
+                dwell_seconds=kwargs.get("dwell_seconds", 0),
+                raw_metadata_json=kwargs.get("raw_metadata_json"),
+            ))
+        return True
+
+    monkeypatch.setattr(mig, "sync_capture", fake_sync_capture)
+
+    async def go():
+        await _seed_user_and_init()
+        # tg-1 has a downstream artifact — pass it via real_capture_ids.
+        return await mig._migrate_captures(
+            captures_path=captures, failures_path=fail,
+            user_id=mig.DEFAULT_USER_ID,
+            dry_run=False, include_test_rows=False, limit=None,
+            real_capture_ids={"tg-1"},
+        )
+
+    counts = asyncio.run(go())
+    # tg-1 is rescued because it has a downstream artifact.
+    # tg-2-fixture is still test_skipped because nothing references it.
+    assert counts["inserted"] == 1
+    assert counts["test_skipped"] == 1
+    assert inserted_cids == ["tg-1"]
+
+
+def test_build_real_capture_ids_unions_hydrations_and_enrichments(tmp_path):
+    """The helper that produces the rescue set should union capture_ids
+    from BOTH hydrations.jsonl and enrichments.jsonl."""
+    hyd = tmp_path / "hydrations.jsonl"
+    enr = tmp_path / "enrichments.jsonl"
+    _write_jsonl(hyd, [
+        {"capture_id": "in-hyd-only", "tier": "og_metadata",
+         "timestamp": "2026-04-01T00:00:00+00:00"},
+        {"capture_id": "in-both", "tier": "video_transcript",
+         "timestamp": "2026-04-01T00:00:00+00:00"},
+    ])
+    _write_jsonl(enr, [
+        {"capture_id": "in-enr-only",
+         "enriched_at": "2026-04-02T00:00:00+00:00",
+         "model": "m",
+         "enrichment": {"summary": "S", "topics": [], "entities": []}},
+        {"capture_id": "in-both",
+         "enriched_at": "2026-04-02T00:00:00+00:00",
+         "model": "m",
+         "enrichment": {"summary": "S", "topics": [], "entities": []}},
+    ])
+
+    real = mig._build_real_capture_ids(
+        hydrations_path=hyd, enrichments_path=enr,
+    )
+    assert real == {"in-hyd-only", "in-enr-only", "in-both"}
+
+
 # ---- Stage 2 — hydrations -------------------------------------------
 
 def test_stage2_skips_when_parent_capture_missing(tmp_path, monkeypatch):

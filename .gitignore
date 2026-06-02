@@ -3,6 +3,7 @@
 venv/
 .venv/
 .testvenv/
+env/
 
 # Data (don't commit your knowledge base)
 data/chroma/
@@ -15,6 +16,8 @@ data/telegram_state.json
 data/enrichments.jsonl
 # Phase 2.5 Fix 2 — capture hydration sidecar (joined to captures.jsonl)
 data/hydrations.jsonl
+# Phase 3 — JSONL→SQL migration failure log (per-run, local)
+data/migration_failures.jsonl
 # Phase 2.5 Fix 3 — Whisper model files (~250 MB each, per-machine)
 data/models/
 # Phase 2.5 Fix 3 — vendored binaries if a future setup ever drops them

@@ -254,14 +254,28 @@ async def _migrate_captures(
     dry_run: bool,
     include_test_rows: bool,
     limit: Optional[int],
+    real_capture_ids: Optional[set[str]] = None,
 ) -> dict[str, int]:
     """Walk captures.jsonl and call sync_capture on each non-test row.
 
-    Returns counts dict — caller logs the summary."""
+    Returns counts dict — caller logs the summary.
+
+    `real_capture_ids` is the set of capture_ids that have at least one
+    downstream artifact (hydration or enrichment row). For those captures
+    we bypass the test-fixture filter entirely — if the live pipeline
+    produced downstream artifacts for the row, it's real, regardless of
+    what the heuristic classifier says. This handles the common pattern
+    where a Telegram-forwarded URL lands with title="Telegram link" and
+    clean_text="" (which `is_test_row` would otherwise flag as an empty
+    Telegram link fixture), but Phase 2.5 hydration later populates the
+    content via OG metadata or video transcription. Without this
+    override, the migration would orphan every downstream artifact whose
+    parent matches that signature."""
     counts = {
         "seen": 0, "test_skipped": 0, "already_in_sql": 0,
         "minted_ids": 0, "inserted": 0, "failed": 0, "bad_json": 0,
     }
+    real_capture_ids = real_capture_ids or set()
     # Pre-load even in dry-run so the counts the operator sees match
     # what a real run would actually do (otherwise dry-run reports
     # every row as "inserted" even when SQL is already populated).
@@ -280,17 +294,21 @@ async def _migrate_captures(
             )
             continue
 
-        if not include_test_rows:
+        cid = row.get("capture_id")
+        if not isinstance(cid, str) or not cid:
+            cid = _mint_legacy_capture_id(row)
+            counts["minted_ids"] += 1
+
+        # Only apply the test-fixture filter if the live pipeline didn't
+        # already produce downstream artifacts for this capture. This
+        # rescues Telegram-forwarded URLs that look like "empty link"
+        # fixtures but were hydrated downstream.
+        if not include_test_rows and cid not in real_capture_ids:
             skip, reason = is_test_row(row)
             if skip:
                 counts["test_skipped"] += 1
                 logger.debug("captures.jsonl:%d skip (%s)", lineno, reason)
                 continue
-
-        cid = row.get("capture_id")
-        if not isinstance(cid, str) or not cid:
-            cid = _mint_legacy_capture_id(row)
-            counts["minted_ids"] += 1
 
         if cid in existing:
             counts["already_in_sql"] += 1
@@ -441,6 +459,32 @@ async def _migrate_hydrations(
 
 
 # ---- Stage 3: enrichments (+ chunks + topics + entities) -----------
+
+def _build_real_capture_ids(
+    *,
+    hydrations_path: Path,
+    enrichments_path: Path,
+) -> set[str]:
+    """Return capture_ids that have at least one downstream artifact —
+    a hydration row or an enrichment row referencing the capture_id.
+
+    Used by Stage 1 to override the test-fixture skip rule. If the live
+    pipeline produced a hydration or enrichment for a capture, the
+    pipeline considered it real and we should mirror it to SQL even if
+    the heuristic `is_test_row` classifier would otherwise reject it
+    (e.g. Telegram-forwarded URLs with `title="Telegram link"` and
+    `clean_text=""`, which become non-empty only after Phase 2.5
+    hydration writes into `hydrations.jsonl`)."""
+    real: set[str] = set()
+    for path in (hydrations_path, enrichments_path):
+        for _lineno, row, _raw in _iter_jsonl(path):
+            if not isinstance(row, dict) or row.get("__bad_json__"):
+                continue
+            cid = row.get("capture_id")
+            if isinstance(cid, str) and cid:
+                real.add(cid)
+    return real
+
 
 def _build_capture_lookup(captures_path: Path) -> dict[str, dict[str, Any]]:
     """Index captures.jsonl by capture_id (or minted legacy id) so the
@@ -777,6 +821,23 @@ async def run(
     if dry_run:
         logger.info("--dry-run: no SQL/Chroma writes will happen.")
 
+    # Build the set of capture_ids that have downstream artifacts. Stage 1
+    # uses this to rescue captures that match a test-fixture heuristic
+    # (e.g. Telegram-forwarded "empty link" pattern) but were actually
+    # hydrated/enriched by the live pipeline downstream. Without this,
+    # the test-fixture skip would orphan every hydration + enrichment
+    # whose parent matches the empty-Telegram-link signature.
+    real_capture_ids = _build_real_capture_ids(
+        hydrations_path=hydrations_path,
+        enrichments_path=enrichments_path,
+    )
+    if real_capture_ids:
+        logger.info(
+            "Loaded %d capture_ids with downstream artifacts "
+            "(these bypass test-fixture skip)",
+            len(real_capture_ids),
+        )
+
     # Stage 1 — captures
     logger.info("Stage 1/3 — captures.jsonl → captures table")
     cap_counts = await _migrate_captures(
@@ -786,6 +847,7 @@ async def run(
         dry_run=dry_run,
         include_test_rows=include_test_rows,
         limit=limit,
+        real_capture_ids=real_capture_ids,
     )
     logger.info("Stage 1 counts: %s", cap_counts)
 
