@@ -181,47 +181,48 @@ class RetrievalService:
         query_clean = query.strip()
 
         # The embedder is sync (sentence-transformers is sync). Call it
-        # before opening the session so we don't hold the SQL connection
-        # while the model runs.
+        # before opening any session so the model run doesn't hold a
+        # SQL connection.
         embedding = self._embedder.embed(query_clean)
 
+        # ---- Step 2: rankers in parallel, fault-isolated ----------
+        # Each ranker runs in its own coroutine with its own error
+        # boundary (and, for BM25, its own SQL session). One ranker
+        # failing — Chroma unreachable, an unexpected DB error —
+        # degrades to the other ranker's results instead of sinking the
+        # whole recall. Critically, BM25 gets a *dedicated* session: a
+        # failed query aborts its transaction, and reusing that session
+        # for the hydration step below would raise PendingRollbackError.
+        vector_hits, bm25_hits = await asyncio.gather(
+            self._run_vector(embedding, user_id, per_ranker_top_k),
+            self._run_bm25(query_clean, user_id, per_ranker_top_k),
+        )
+
+        # ---- Step 3: RRF fusion -----------------------------------
+        (
+            fused_scores,
+            vector_rank_by_id,
+            bm25_rank_by_id,
+            vector_distance_by_id,
+            bm25_score_by_id,
+            bm25_chunk_by_id,
+        ) = _fuse(vector_hits, bm25_hits, rrf_k=rrf_k)
+
+        if not fused_scores:
+            return RetrievalResult(query=query)
+
+        # Rank chunk ids by fused score (highest first). Stable
+        # secondary sort by chunk id keeps ordering deterministic
+        # when two chunks tie.
+        ranked_chunk_ids = sorted(
+            fused_scores.keys(),
+            key=lambda cid: (-fused_scores[cid], cid),
+        )
+
+        # ---- Steps 4-5: hydrate + diversify (fresh session) -------
         async with session_scope() as session:
             chunk_repo = ChunkRepository(session)
             cap_repo = CaptureRepository(session)
-
-            # ---- Step 2: rankers in parallel ----------------------
-            vector_hits, bm25_hits = await asyncio.gather(
-                self._vector_store.query(
-                    COLLECTION_CHUNKS,
-                    embedding=embedding,
-                    where={"user_id": user_id},
-                    top_k=per_ranker_top_k,
-                ),
-                chunk_repo.search_by_bm25(
-                    query_clean, user_id=user_id, limit=per_ranker_top_k,
-                ),
-            )
-
-            # ---- Step 3: RRF fusion -------------------------------
-            (
-                fused_scores,
-                vector_rank_by_id,
-                bm25_rank_by_id,
-                vector_distance_by_id,
-                bm25_score_by_id,
-                bm25_chunk_by_id,
-            ) = _fuse(vector_hits, bm25_hits, rrf_k=rrf_k)
-
-            if not fused_scores:
-                return RetrievalResult(query=query)
-
-            # Rank chunk ids by fused score (highest first). Stable
-            # secondary sort by chunk id keeps ordering deterministic
-            # when two chunks tie.
-            ranked_chunk_ids = sorted(
-                fused_scores.keys(),
-                key=lambda cid: (-fused_scores[cid], cid),
-            )
 
             # ---- Hydrate chunks not already in BM25 hits ----------
             # BM25 gives us full Chunk rows; vectors give us just IDs.
@@ -286,6 +287,40 @@ class RetrievalService:
                 ))
 
         return RetrievalResult(query=query, candidates=candidates)
+
+    async def _run_vector(
+        self, embedding, user_id: int, top_k: int,
+    ) -> list:
+        """Vector ranker with its own error boundary. A Chroma failure
+        degrades to BM25-only rather than failing the whole recall."""
+        try:
+            return await self._vector_store.query(
+                COLLECTION_CHUNKS,
+                embedding=embedding,
+                where={"user_id": user_id},
+                top_k=top_k,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "recall: vector ranker failed, continuing BM25-only: %s", e,
+            )
+            return []
+
+    async def _run_bm25(
+        self, query_clean: str, user_id: int, top_k: int,
+    ) -> list:
+        """BM25 ranker in its OWN session so a failed FTS query can't
+        poison the hydration session. A failure degrades to vector-only."""
+        try:
+            async with session_scope() as session:
+                return await ChunkRepository(session).search_by_bm25(
+                    query_clean, user_id=user_id, limit=top_k,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "recall: BM25 ranker failed, continuing vector-only: %s", e,
+            )
+            return []
 
 
 # ---- Pure fusion math (unit-testable in isolation) ------------------

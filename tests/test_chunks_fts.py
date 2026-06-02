@@ -524,3 +524,91 @@ class TestProperNounSurfacing:
         assert len(ascii_hits) == 1
         assert len(accented_hits) == 1
         assert ascii_hits[0].chunk.id == accented_hits[0].chunk.id
+
+
+# ---- M.1 — FTS5 query sanitization (bugfix) --------------------------
+
+class TestFtsQuerySanitization:
+    """Free-form recall queries must never reach FTS5's query parser
+    raw — punctuation like `: ( ) - + ? "` or a leading AND/OR/NOT
+    raises sqlite3.OperationalError otherwise. `search_by_bm25`
+    normalizes via `_build_fts_match_query` first.
+    """
+
+    def test_build_fts_match_query_unit(self):
+        from backend.storage.repositories.chunk_repo import (
+            _build_fts_match_query,
+        )
+        # Word tokens preserved (incl. non-ASCII), OR-joined and quoted.
+        assert _build_fts_match_query("kanban team") == '"kanban" OR "team"'
+        # Punctuation / FTS5 operators stripped to bare tokens.
+        assert _build_fts_match_query("notes: kanban?") == '"notes" OR "kanban"'
+        assert _build_fts_match_query("team-size (WIP)") == (
+            '"team" OR "size" OR "WIP"'
+        )
+        assert _build_fts_match_query("AND kanban") == '"AND" OR "kanban"'
+        # Non-ASCII proper nouns survive (BM25's whole reason to exist).
+        assert _build_fts_match_query("Bengaluru café") == (
+            '"Bengaluru" OR "café"'
+        )
+        # All-punctuation reduces to nothing → empty (caller short-circuits).
+        assert _build_fts_match_query("?!:()-+") == ""
+
+    @pytest.mark.parametrize("query", [
+        "what about kanban?",
+        "notes: kanban",
+        "team-size tradeoffs about kanban",
+        "C++ kanban",
+        "kanban (team",
+        "AND kanban",
+        'the "kanban" article',
+    ])
+    def test_punctuation_queries_do_not_raise_and_match(self, query):
+        """Each of these raised OperationalError before the fix. Now
+        they run cleanly and still find the kanban chunk."""
+        async def go():
+            await _seed_two_users()
+            async with session_scope() as session:
+                cap_repo = CaptureRepository(session)
+                chunk_repo = ChunkRepository(session)
+                await cap_repo.create(_make_capture(capture_id="cap-1", user_id=1))
+                await chunk_repo.create_many([
+                    ChunkInsert(
+                        capture_id="cap-1", chunk_index=0,
+                        text="the kanban article about team size and WIP limits",
+                        source_kind="article_paragraph",
+                    ),
+                ])
+            async with session_scope() as session:
+                repo = ChunkRepository(session)
+                hits = await repo.search_by_bm25(query, user_id=1, limit=10)
+            await aclose()
+            return hits
+
+        hits = asyncio.run(go())
+        assert len(hits) == 1
+        assert hits[0].chunk.capture_id == "cap-1"
+
+    def test_all_punctuation_query_returns_empty(self):
+        """A query with no word tokens short-circuits to [] without
+        touching FTS5."""
+        async def go():
+            await _seed_two_users()
+            async with session_scope() as session:
+                cap_repo = CaptureRepository(session)
+                chunk_repo = ChunkRepository(session)
+                await cap_repo.create(_make_capture(capture_id="cap-1", user_id=1))
+                await chunk_repo.create_many([
+                    ChunkInsert(
+                        capture_id="cap-1", chunk_index=0,
+                        text="some kanban text",
+                        source_kind="article_paragraph",
+                    ),
+                ])
+            async with session_scope() as session:
+                repo = ChunkRepository(session)
+                hits = await repo.search_by_bm25("?!:()", user_id=1, limit=10)
+            await aclose()
+            return hits
+
+        assert asyncio.run(go()) == []

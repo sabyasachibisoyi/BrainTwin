@@ -361,20 +361,29 @@ class TestRecallPipeline:
 
     def test_diversification_one_chunk_per_capture(self):
         """A capture with multiple matching chunks contributes one
-        CandidateCapture — the chunk with the highest fused score."""
+        CandidateCapture — the chunk with the highest fused score.
+
+        chunk_index 1 is the unambiguous winner: it's the only chunk
+        that matches the BM25 query "kanban" (bm25 rank 1) AND it's
+        vector rank 1. The other two chunks appear in the vector ranker
+        only, at lower ranks. We deliberately avoid a setup where two
+        chunks tie on fused score (e.g. one winning each ranker), since
+        the per-capture pick on a tie is just the deterministic
+        chunk-id order, not a meaningful ranking signal.
+        """
         async def go():
             await _seed_user_and_captures([("cap-long", 1, "Long article")])
             chunk_ids = await _seed_chunks([
-                ("cap-long", 0, "para one talks about kanban"),
-                ("cap-long", 1, "para two talks about kanban too"),
+                ("cap-long", 0, "para one is the introduction"),
+                ("cap-long", 1, "para two talks about kanban"),
                 ("cap-long", 2, "para three is unrelated"),
             ])
             # Vector returns all three chunks from the same capture
-            # in rank order.
+            # in rank order (chunk_index 1 first).
             vs = _StubVectorStore([
-                _vh(chunk_ids[1], 0.05),  # rank 1
-                _vh(chunk_ids[0], 0.10),  # rank 2
-                _vh(chunk_ids[2], 0.20),  # rank 3
+                _vh(chunk_ids[1], 0.05),  # vector rank 1
+                _vh(chunk_ids[0], 0.10),  # vector rank 2
+                _vh(chunk_ids[2], 0.20),  # vector rank 3
             ])
             svc = RetrievalService(embedder=_StubEmbedder(), vector_store=vs)
             return await svc.recall(query="kanban", user_id=1)
@@ -382,7 +391,8 @@ class TestRecallPipeline:
         r = asyncio.run(go())
         # One capture in candidates.
         assert len(r.candidates) == 1
-        # And the chunk attached is the highest-ranked one.
+        # And the chunk attached is the highest-fused one (chunk_index 1,
+        # which wins both rankers — see docstring).
         assert r.candidates[0].best_chunk.chunk.chunk_index == 1
 
     def test_top_captures_cap_applied(self):
@@ -451,3 +461,86 @@ class TestRecallPipeline:
         assert calls[0]["collection"] == "chunks"
         assert calls[0]["top_k"] == 5
         assert calls[0]["where"] == {"user_id": 1}
+
+
+# ---- Ranker fault isolation (bugfix) ---------------------------------
+
+class _RaisingVectorStore:
+    """Vector store that always errors — simulates Chroma being down."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def query(self, collection, *, embedding, where=None, top_k=20):
+        self.calls.append({"collection": collection})
+        raise RuntimeError("chroma unreachable")
+
+
+class TestRankerFaultIsolation:
+    """One ranker failing must degrade to the other, not sink the whole
+    recall. BM25 runs in its own session so a BM25 failure can't poison
+    the hydration session.
+    """
+
+    def test_vector_failure_degrades_to_bm25_only(self):
+        async def go():
+            await _seed_user_and_captures([("cap-1", 1, "Article")])
+            await _seed_chunks([
+                ("cap-1", 0, "the kanban article about team size"),
+            ])
+            svc = RetrievalService(
+                embedder=_StubEmbedder(), vector_store=_RaisingVectorStore(),
+            )
+            return await svc.recall(query="kanban", user_id=1)
+
+        r = asyncio.run(go())
+        assert len(r.candidates) == 1
+        assert r.candidates[0].capture.id == "cap-1"
+        # BM25-only provenance.
+        assert r.candidates[0].best_chunk.vector_rank is None
+        assert r.candidates[0].best_chunk.bm25_rank == 1
+
+    def test_bm25_failure_degrades_to_vector_only(self, monkeypatch):
+        """Proves the dedicated-session fix: BM25 raising inside its own
+        session does NOT poison the hydration session that get_by_ids /
+        cap_repo.get rely on. (Pre-fix, the shared session would raise
+        PendingRollbackError here.)"""
+        from backend.storage.repositories.chunk_repo import ChunkRepository as _CR
+
+        async def boom(self, *a, **k):
+            raise RuntimeError("bm25 exploded")
+
+        monkeypatch.setattr(_CR, "search_by_bm25", boom)
+
+        async def go():
+            await _seed_user_and_captures([("cap-1", 1, "Article")])
+            chunk_ids = await _seed_chunks([("cap-1", 0, "body text")])
+            vs = _StubVectorStore([_vh(chunk_ids[0], 0.05)])
+            svc = RetrievalService(embedder=_StubEmbedder(), vector_store=vs)
+            return await svc.recall(query="body", user_id=1)
+
+        r = asyncio.run(go())
+        assert len(r.candidates) == 1
+        assert r.candidates[0].capture.id == "cap-1"
+        # Vector-only provenance; hydration via get_by_ids still worked.
+        assert r.candidates[0].best_chunk.bm25_rank is None
+        assert r.candidates[0].best_chunk.vector_rank == 1
+
+    def test_both_rankers_fail_returns_empty(self, monkeypatch):
+        from backend.storage.repositories.chunk_repo import ChunkRepository as _CR
+
+        async def boom(self, *a, **k):
+            raise RuntimeError("bm25 exploded")
+
+        monkeypatch.setattr(_CR, "search_by_bm25", boom)
+
+        async def go():
+            await _seed_user_and_captures([("cap-1", 1, "Article")])
+            await _seed_chunks([("cap-1", 0, "body text")])
+            svc = RetrievalService(
+                embedder=_StubEmbedder(), vector_store=_RaisingVectorStore(),
+            )
+            return await svc.recall(query="body", user_id=1)
+
+        r = asyncio.run(go())
+        assert r.candidates == []
