@@ -146,11 +146,13 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 async def init_db() -> None:
     """Create all tables from `metadata`. Idempotent — safe to call on
-    every startup. CREATE TABLE IF NOT EXISTS semantics under the hood.
+    every startup. CREATE TABLE IF NOT EXISTS semantics under the hood,
+    followed by a narrow ADD COLUMN sweep for v1.5 evolutions.
 
     This is the only schema-management entry point in v1. When the
-    schema evolves and we need migrations beyond "add a new table,"
-    we'll bring in alembic — see Phase 3.5/4 doc for that decision.
+    schema evolves and we need migrations beyond "add a new table" or
+    "add a new column," we'll bring in alembic — see Phase 3.5/4 doc
+    for that decision.
     """
     # Local import to avoid circular imports at module load time:
     # backend.storage.__init__ imports both schema and db, and we want
@@ -159,7 +161,65 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        # Phase 3.5 — narrow ADD COLUMN migration for pre-existing DBs
+        # that pre-date the new content columns on `captures`. SQLAlchemy's
+        # `metadata.create_all` is CREATE-IF-NOT-EXISTS only; it will NOT
+        # add new columns to a table that already exists. This sweep
+        # closes the gap without bringing in alembic for one column set.
+        await conn.run_sync(_apply_pending_column_adds)
     logger.info("Database schema initialized (tables: %d)", len(metadata.tables))
+
+
+# ---- Narrow per-startup column migration ----------------------------
+#
+# Phase 3.5 adds five columns to `captures`. Listing them here (rather
+# than reading metadata.tables) keeps the migration explicit and avoids
+# accidentally re-adding columns that have been removed in some later
+# schema revision. When the next migration lands, add its columns here
+# in the same shape; once the list gets long enough to be painful, that
+# is the trigger for adopting alembic.
+_PENDING_COLUMN_ADDS: tuple[tuple[str, str, str], ...] = (
+    # (table_name, column_name, column_ddl)
+    ("captures", "clean_text", "TEXT"),
+    ("captures", "transcript", "TEXT"),
+    ("captures", "image_text", "TEXT"),
+    ("captures", "image_descriptions_json", "TEXT"),
+    ("captures", "text_source", "TEXT"),
+)
+
+
+def _apply_pending_column_adds(sync_conn) -> None:
+    """Run inside `engine.begin()` via `run_sync`. Receives a sync
+    Connection (SQLAlchemy auto-bridges async↔sync via run_sync) so we
+    can use the inspector cleanly without juggling event loops.
+
+    For each (table, column, ddl) in `_PENDING_COLUMN_ADDS`, runs
+    `ALTER TABLE … ADD COLUMN` if and only if the column is missing.
+    SQLite and Postgres both support this; the column is added as
+    NULLable so existing rows stay valid."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(sync_conn)
+    for table, column, ddl in _PENDING_COLUMN_ADDS:
+        try:
+            existing_cols = {c["name"] for c in inspector.get_columns(table)}
+        except Exception as e:  # noqa: BLE001
+            # Table doesn't exist yet (fresh DB) — create_all above will
+            # have built it WITH the new columns, so nothing to ALTER.
+            logger.debug(
+                "_apply_pending_column_adds: inspector skipped table=%s: %s",
+                table, e,
+            )
+            continue
+        if column in existing_cols:
+            continue
+        sync_conn.execute(text(
+            f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+        ))
+        logger.info(
+            "Phase 3.5 migration: added column %s.%s (%s)",
+            table, column, ddl,
+        )
 
 
 async def aclose() -> None:

@@ -1,9 +1,9 @@
 """Async enrichment worker.
 
-Wraps the pure `enrich()` call with retry policy, sidecar JSONL
-persistence, and structured failure logging. This is the layer that
-FastAPI's `BackgroundTasks` schedules from `/capture` (Decision H —
-async, never block the capture path).
+Wraps the pure `enrich()` call with retry policy, SQL persistence, and
+structured failure logging. This is the layer that FastAPI's
+`BackgroundTasks` schedules from `/capture` (Decision H — async, never
+block the capture path).
 
 Design notes (per docs/phase2-design.md Decision H):
   - 3 retries on transient errors with 0.5s / 1s / 2s exponential backoff.
@@ -16,9 +16,15 @@ Design notes (per docs/phase2-design.md Decision H):
     log nothing useful. We catch broadly at the boundary and route to
     the failure log so `/failures` surfaces the problem.
 
-Sidecar files written:
-  - data/enrichments.jsonl       on success (one row per capture_id)
-  - data/capture_failures.jsonl  with one of two phase tags
+Persistence (Phase 3.5):
+  - Successful enrichment → SQL via `sync_enrichment` (enrichment row +
+    chunks + topics + entities + Chroma vectors). The old
+    `enrichments.jsonl` writer was retired with the cutover.
+  - Successful hydration  → SQL via `sync_hydration`. The old
+    `hydrations.jsonl` writer was retired with the cutover.
+  - Failures and skips    → `data/capture_failures.jsonl` with one of
+    two phase tags. This log is intentionally NOT a SQL table — it's
+    an operational record (see docs/phase3.5-cutover.md, decision 2).
       - phase: "enrichment"          → real failure (network, auth,
         malformed JSON after retry, schema, transient_exhausted, etc.).
         Surfaced in `/failures` and bot `/failures` by default.
@@ -28,13 +34,12 @@ Sidecar files written:
         from `/failures` and bot `/failures` by default; surfaced via
         `?phase=enrichment_skipped` on demand.
 
-Crash recovery: `find_unenriched_capture_ids()` scans the JSONLs and
-returns capture_ids in captures.jsonl that have no matching row in
-enrichments.jsonl AND haven't been tagged enrichment_skipped (otherwise
-the startup hook would re-call Haiku on the same empty content every
-boot). FastAPI startup hook calls this to re-queue work that was
-in-flight when the process died. The same function backs
-`scripts/retry_failed_enrichments.py`.
+Crash recovery: `iter_unenriched_captures()` runs a SQL query
+(`captures LEFT JOIN enrichments`) for the default user and yields
+each unenriched capture as a domain object. The skipped set still
+comes from the failures log (no SQL counterpart) so the startup hook
+doesn't re-call Haiku on the same empty content every boot. The same
+helper backs `scripts/retry_failed_enrichments.py`.
 """
 
 from __future__ import annotations
@@ -42,10 +47,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import fields as dc_fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, AsyncIterator
 
 from backend.capture.hydration import HydrationResult, hydrate_processed as hydrate_capture
 from backend.capture.processor import ProcessedContent
@@ -55,13 +59,18 @@ from backend.knowledge.enrichment import (
     EmptyContentError,
     SchemaError,
     enrich,
-    wrap_enrichment_record,
 )
 from backend.knowledge.llm_client import (
     LLMClient,
     MalformedResponseError,
     PermanentLLMError,
     TransientLLMError,
+)
+from backend.storage import (
+    Capture,
+    CaptureRepository,
+    DEFAULT_USER_ID,
+    session_scope,
 )
 from backend.storage.sync import sync_enrichment, sync_hydration
 
@@ -76,10 +85,19 @@ TRANSIENT_BACKOFFS_SECONDS: tuple[float, ...] = (0.5, 1.0, 2.0)
 
 
 # ---- Persistence -----------------------------------------------------
+#
+# Post-Phase-3.5: the only JSONL we still write to is `capture_failures.jsonl`,
+# which is intentionally NOT a SQL table — it's an operational log
+# (see docs/phase3.5-cutover.md, decision 2). Successful enrichments
+# and hydrations go to SQL via `sync_enrichment` / `sync_hydration`
+# inside the worker entry point below.
 
 def _append_jsonl(path: Path, row: dict[str, Any]) -> None:
     """Append a row as one JSON line. Best-effort; logs and swallows
-    OSError so a disk hiccup doesn't propagate into BackgroundTasks."""
+    OSError so a disk hiccup doesn't propagate into BackgroundTasks.
+
+    Only used for the operational failures log; the knowledge JSONLs
+    (captures, enrichments, hydrations) were retired in Phase 3.5."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
@@ -154,21 +172,6 @@ def _log_enrichment_skipped(
     _append_jsonl(Path(settings.capture_failures_path), row)
 
 
-def _persist_enrichment(*, capture_id: str, enrichment: dict[str, Any]) -> None:
-    """Write a successful enrichment to data/enrichments.jsonl."""
-    record = wrap_enrichment_record(capture_id=capture_id, enrichment=enrichment)
-    _append_jsonl(Path(settings.enrichments_path), record)
-
-
-def _persist_hydration(record: dict[str, Any]) -> None:
-    """Phase 2.5 Fix 2 — write a hydration sidecar row.
-
-    Original captures.jsonl row stays untouched (audit trail of what
-    arrived from the client). The sidecar pattern matches enrichments.jsonl
-    so consumers can join by `capture_id`."""
-    _append_jsonl(Path(settings.hydrations_path), record)
-
-
 # ---- Worker entry point ---------------------------------------------
 
 async def enqueue_enrichment(
@@ -209,9 +212,9 @@ async def enqueue_enrichment(
         hydration = HydrationResult(processed=processed)
 
     if hydration.hydrated and hydration.record is not None:
-        _persist_hydration(hydration.record)
-        # Phase 3 Step 4b — dual-write the hydration row into SQL.
-        # Best-effort: sync_hydration catches all errors internally.
+        # Phase 3.5 — hydration is SQL-only. Best-effort: sync_hydration
+        # catches all errors internally and a failure here doesn't block
+        # the enrichment that follows.
         await sync_hydration(
             capture_id=capture_id,
             tier=hydration.record.get("tier", "unknown"),
@@ -312,11 +315,10 @@ async def enqueue_enrichment(
             return
 
         # Success path — break out of retry loop.
-        _persist_enrichment(capture_id=capture_id, enrichment=enrichment)
-        # Phase 3 Step 4b — dual-write the enrichment + derived chunks
-        # / topics / entities into SQL + Chroma. Best-effort: any
-        # SQL/Chroma failure is caught inside sync_enrichment, logged,
-        # and swallowed so the JSONL path stays unaffected.
+        # Phase 3.5 — enrichment is SQL-only. sync_enrichment writes
+        # the enrichment row plus derived chunks / topics / entities
+        # into SQL + Chroma. Errors are caught and logged inside;
+        # nothing else persists the result.
         #
         # TODO(Phase 5+): when fallback models are wired (e.g.
         # haiku → sonnet on transient errors), record the model that
@@ -352,72 +354,72 @@ async def enqueue_enrichment(
         )
 
 
-# ---- Hydration (shared by main.py startup + scripts) ----------------
+# ---- Rebuilding ProcessedContent from a SQL Capture row ------------
 
-# Defaults used when an old pre-Phase-2 row is missing fields the
-# `ProcessedContent` dataclass now expects. These match the dataclass
-# default values where they have one.
-_HYDRATION_DEFAULTS: dict[str, Any] = {
-    "transcript": None,
-    "image_descriptions": [],
-    "image_text": "",
-    "metadata": {},
-    "dwell_time_seconds": 0,
-}
+def hydrate_processed_from_capture(capture: Capture) -> ProcessedContent | None:
+    """Reconstruct a `ProcessedContent` from a `Capture` SQL row.
 
+    Phase 3.5 replacement for the old `hydrate_processed(row: dict)`
+    that consumed a captures.jsonl row. The new content columns
+    (`clean_text`, `transcript`, `image_text`, `image_descriptions_json`,
+    `text_source`) carry everything the enrichment worker needs.
 
-def hydrate_processed(row: dict[str, Any]) -> ProcessedContent | None:
-    """Reconstruct a `ProcessedContent` from a captures.jsonl row.
-
-    Returns None if required fields are still missing after applying
-    defaults — caller should skip those rows. Used by:
-      - main.py startup recovery scan
-      - scripts/backfill_enrichment.py
-      - scripts/retry_failed_enrichments.py
-
-    Single source of truth so the three call sites can't drift.
+    Returns None if the row has neither text nor transcript nor image
+    text — there's nothing for the LLM to enrich and the caller should
+    skip it. (Mirrors the old "missing required fields → skip" path.)
     """
-    expected = {f.name for f in dc_fields(ProcessedContent)}
-    payload = {k: v for k, v in row.items() if k in expected}
-    for k, v in _HYDRATION_DEFAULTS.items():
-        payload.setdefault(k, v)
-    if expected - payload.keys():
+    clean_text = capture.clean_text or ""
+    transcript = capture.transcript
+    image_text = capture.image_text or ""
+    if not clean_text and not transcript and not image_text:
         return None
+
     try:
-        return ProcessedContent(**payload)
+        image_descriptions = (
+            json.loads(capture.image_descriptions_json)
+            if capture.image_descriptions_json else []
+        )
+    except json.JSONDecodeError:
+        image_descriptions = []
+
+    try:
+        metadata = json.loads(capture.raw_metadata_json) if capture.raw_metadata_json else {}
+    except json.JSONDecodeError:
+        metadata = {}
+
+    try:
+        return ProcessedContent(
+            url=capture.url or "",
+            title=capture.title or "",
+            platform=capture.platform or "general",
+            content_type=capture.content_type or "article",
+            clean_text=clean_text,
+            text_source=capture.text_source or "extension",
+            transcript=transcript,
+            image_descriptions=image_descriptions,
+            image_text=image_text,
+            timestamp=capture.captured_at,
+            dwell_time_seconds=capture.dwell_seconds,
+            metadata=metadata if isinstance(metadata, dict) else {},
+        )
     except TypeError:
         return None
 
 
 # ---- Crash recovery / manual catch-up -------------------------------
 
-def _read_jsonl_field(path: Path, field: str) -> Iterable[str]:
-    """Stream values of one field from a JSONL file, skipping bad rows."""
-    if not path.exists():
-        return
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            v = row.get(field)
-            if isinstance(v, str) and v:
-                yield v
-
-
 def _read_jsonl_field_where(
     path: Path, field: str, *, where_field: str, where_value: str
-) -> Iterable[str]:
+):
     """Stream values of `field` from rows where `where_field == where_value`.
 
     Phase 2.5 Fix 1 — used to pull capture_ids tagged as
     `enrichment_skipped` from the failures log so the startup recovery
     scan can skip them (otherwise the hook would re-call Haiku on the
-    same empty content every boot)."""
+    same empty content every boot).
+
+    Kept post-3.5 because `capture_failures.jsonl` is intentionally NOT
+    a SQL table (see docs/phase3.5-cutover.md, decision 2)."""
     if not path.exists():
         return
     with path.open("r", encoding="utf-8") as f:
@@ -436,43 +438,41 @@ def _read_jsonl_field_where(
                 yield v
 
 
-def find_unenriched_capture_ids(
-    *,
-    captures_path: Path | None = None,
-    enrichments_path: Path | None = None,
-    failures_path: Path | None = None,
-) -> list[str]:
-    """Return capture_ids in captures.jsonl with no row in enrichments.jsonl
-    AND no row in capture_failures.jsonl tagged `phase: "enrichment_skipped"`.
-
-    Used both by the FastAPI startup hook (to re-queue work that was
-    in-flight when the previous process died) and by
-    `scripts/retry_failed_enrichments.py` (manual on-demand catch-up).
-
-    Phase 2.5 Fix 1: also exclude IDs that were already evaluated and
-    intentionally skipped (empty / oversized content). Without this, every
-    process restart would re-call Haiku on the same hopeless rows.
-
-    Order is preserved (oldest unenriched first) so retries process
-    in the same order the captures arrived.
-    """
-    cp = captures_path or Path("./data/captures.jsonl")
-    ep = enrichments_path or Path(settings.enrichments_path)
+def _load_skipped_capture_ids(failures_path: Path | None = None) -> set[str]:
+    """Set of capture_ids tagged `phase: enrichment_skipped` in the
+    failures log. Used to exclude "nothing to enrich" rows from the
+    recovery sweep."""
     fp = failures_path or Path(settings.capture_failures_path)
-
-    enriched_ids = set(_read_jsonl_field(ep, "capture_id"))
-    skipped_ids = set(
+    return set(
         _read_jsonl_field_where(
-            fp, "capture_id", where_field="phase", where_value="enrichment_skipped"
+            fp, "capture_id",
+            where_field="phase", where_value="enrichment_skipped",
         )
     )
-    excluded = enriched_ids | skipped_ids
 
-    unenriched: list[str] = []
-    seen: set[str] = set()
-    for cid in _read_jsonl_field(cp, "capture_id"):
-        if cid in excluded or cid in seen:
-            continue
-        seen.add(cid)
-        unenriched.append(cid)
-    return unenriched
+
+async def iter_unenriched_captures(
+    *,
+    user_id: int = DEFAULT_USER_ID,
+    failures_path: Path | None = None,
+) -> AsyncIterator[Capture]:
+    """Yield each `Capture` that has no enrichment row, in capture
+    order (oldest first), excluding any tagged `enrichment_skipped`
+    in the failures log.
+
+    Phase 3.5 replacement for the JSONL-scanning
+    `find_unenriched_capture_ids` + the captures.jsonl re-hydration
+    loop. Used by:
+      - the FastAPI startup hook (to re-queue work that was in-flight
+        when the previous process died)
+      - `scripts/retry_failed_enrichments.py` (manual catch-up)
+    """
+    skipped_ids = _load_skipped_capture_ids(failures_path)
+    async with session_scope() as session:
+        cap_repo = CaptureRepository(session)
+        rows = await cap_repo.unenriched(
+            user_id=user_id,
+            exclude_capture_ids=skipped_ids,
+        )
+    for cap in rows:
+        yield cap

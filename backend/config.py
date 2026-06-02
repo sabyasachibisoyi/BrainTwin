@@ -115,11 +115,11 @@ class Settings(BaseSettings):
     # checking what SQLAlchemy generates from a Core expression. Off by
     # default — can be flipped without a redeploy.
     database_echo: bool = False
-    # Phase 3 dual-write window (B.1). When true, /capture and the
-    # enrichment worker write to BOTH the existing JSONLs AND the new
-    # SQL/Chroma store. Phase 3.5 will set this false and remove the
-    # JSONL writers entirely.
-    storage_dual_write: bool = True
+    # Phase 3 dual-write window (B.1) was retired in Phase 3.5 —
+    # `storage_dual_write` is no longer read anywhere. Pydantic still
+    # accepts the env var (it's marked extra-allow by default) so a
+    # stale `STORAGE_DUAL_WRITE=false` in someone's .env is silently
+    # ignored rather than crashing startup.
     # Phase 3 controlled-vocabulary threshold (B.7). When the enrichment
     # LLM proposes a topic/entity, we look up the K most similar existing
     # ones via embedding cosine similarity. Anything above this threshold

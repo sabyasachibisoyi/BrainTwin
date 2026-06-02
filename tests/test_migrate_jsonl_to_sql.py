@@ -805,43 +805,13 @@ def test_limit_caps_inserts_per_stage(tmp_path, monkeypatch):
     assert len(inserted_cids) == 2
 
 
-# ---- storage_dual_write=False short-circuit -------------------------
-
-def test_run_aborts_when_storage_dual_write_is_off(tmp_path, monkeypatch):
-    """If the operator forgot to flip storage_dual_write=True before
-    running a real migration, every sync_* call would no-op. run()
-    must bail with rc=2 and a clear error message rather than chugging
-    through the JSONLs and producing zero SQL rows."""
-    monkeypatch.setattr(mig.settings, "storage_dual_write", False)
-
-    rc = asyncio.run(mig.run(
-        captures_path=tmp_path / "captures.jsonl",
-        hydrations_path=tmp_path / "hydrations.jsonl",
-        enrichments_path=tmp_path / "enrichments.jsonl",
-        failures_path=tmp_path / "failures.jsonl",
-        dry_run=False,
-        include_test_rows=False,
-        limit=None,
-        verify_only=False,
-    ))
-    assert rc == 2
-
-
-def test_run_proceeds_in_dry_run_even_with_dual_write_off(tmp_path, monkeypatch):
-    """Dry-run is safe regardless of the flag — sync_* never fires."""
-    monkeypatch.setattr(mig.settings, "storage_dual_write", False)
-    # Empty inputs — should breeze through all three stages and return 0.
-    rc = asyncio.run(mig.run(
-        captures_path=tmp_path / "captures.jsonl",
-        hydrations_path=tmp_path / "hydrations.jsonl",
-        enrichments_path=tmp_path / "enrichments.jsonl",
-        failures_path=tmp_path / "failures.jsonl",
-        dry_run=True,
-        include_test_rows=False,
-        limit=None,
-        verify_only=False,
-    ))
-    assert rc == 0
+# ---- storage_dual_write flag removed in Phase 3.5 -------------------
+#
+# The previous tests `test_run_aborts_when_storage_dual_write_is_off`
+# and `test_run_proceeds_in_dry_run_even_with_dual_write_off` were
+# removed when the dual-write gate was retired. SQL is now the sole
+# persistence path so there is no "off" state for migrate_jsonl_to_sql
+# to bail on.
 
 
 # ---- Legacy capture_id round-trip across stages 1 + 3 ---------------

@@ -14,7 +14,7 @@ from sqlalchemy import func, insert, select
 
 from backend.storage.models import Capture
 from backend.storage.repositories.base import BaseRepository
-from backend.storage.schema import captures
+from backend.storage.schema import captures, enrichments
 
 
 def _row_to_capture(row) -> Capture:
@@ -28,6 +28,11 @@ def _row_to_capture(row) -> Capture:
         captured_at=row.captured_at,
         dwell_seconds=row.dwell_seconds,
         raw_metadata_json=row.raw_metadata_json,
+        clean_text=row.clean_text,
+        transcript=row.transcript,
+        image_text=row.image_text,
+        image_descriptions_json=row.image_descriptions_json,
+        text_source=row.text_source,
     )
 
 
@@ -46,6 +51,11 @@ class CaptureRepository(BaseRepository):
             captured_at=capture.captured_at,
             dwell_seconds=capture.dwell_seconds,
             raw_metadata_json=capture.raw_metadata_json,
+            clean_text=capture.clean_text,
+            transcript=capture.transcript,
+            image_text=capture.image_text,
+            image_descriptions_json=capture.image_descriptions_json,
+            text_source=capture.text_source,
         ))
 
     async def get(
@@ -99,3 +109,55 @@ class CaptureRepository(BaseRepository):
             .where(captures.c.user_id == user_id)
         )
         return int(result.scalar_one())
+
+    # ---- Phase 3.5 — /stats and recovery helpers --------------------
+
+    async def latest_captured_at(self, *, user_id: int) -> Optional[str]:
+        """Most recent `captured_at` for this user (ISO 8601 string),
+        or None if the user has no captures yet. Used by /stats."""
+        result = await self.session.execute(
+            select(func.max(captures.c.captured_at))
+            .where(captures.c.user_id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def platform_counts(self, *, user_id: int) -> dict[str, int]:
+        """Capture counts grouped by platform. Used by /stats."""
+        result = await self.session.execute(
+            select(captures.c.platform, func.count())
+            .where(captures.c.user_id == user_id)
+            .group_by(captures.c.platform)
+        )
+        return {(row[0] or "unknown"): int(row[1]) for row in result}
+
+    async def unenriched(
+        self,
+        *,
+        user_id: int,
+        exclude_capture_ids: Optional[set[str]] = None,
+    ) -> list[Capture]:
+        """Captures for `user_id` that have no enrichment row, oldest
+        first (so retries process in capture order). The optional
+        `exclude_capture_ids` set lets the caller filter out ids that
+        were intentionally skipped (empty / oversized content tagged
+        in capture_failures.jsonl) — we don't have a SQL skip table,
+        so the failures log is still consulted for that classification.
+
+        Replaces `find_unenriched_capture_ids` + the JSONL re-hydration
+        loop from Phase 2. Phase 3.5 startup recovery uses this.
+        """
+        exclude_capture_ids = exclude_capture_ids or set()
+        stmt = (
+            select(captures)
+            .outerjoin(enrichments, enrichments.c.capture_id == captures.c.id)
+            .where(captures.c.user_id == user_id)
+            .where(enrichments.c.id.is_(None))
+            .order_by(captures.c.captured_at.asc())
+        )
+        result = await self.session.execute(stmt)
+        out: list[Capture] = []
+        for row in result:
+            if row.id in exclude_capture_ids:
+                continue
+            out.append(_row_to_capture(row))
+        return out

@@ -15,13 +15,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.storage.models import Entity
 from backend.storage.repositories.base import BaseRepository
 from backend.storage.repositories.topic_repo import normalize_slug
-from backend.storage.schema import entities
+from backend.storage.schema import (
+    captures,
+    chunk_entities,
+    chunks,
+    entities,
+)
 
 
 # Allowed entity_type values. Kept here rather than as a CHECK
@@ -115,6 +120,32 @@ class EntityRepository(BaseRepository):
             select(entities).order_by(entities.c.coined_at.asc()).limit(limit)
         )
         return [_row_to_entity(row) for row in result]
+
+    async def count_capture_mentions_by_user(self, *, user_id: int) -> int:
+        """Distinct (capture_id, entity_id) pairs for this user.
+
+        Phase 3.5 — replaces the old `/stats` JSONL scan that summed
+        `len(enrichment["entities"])` across enrichments.jsonl. Same
+        intent: how many entity mentions did this user's corpus
+        produce? Implementation walks chunk_entities → chunks →
+        captures and de-duplicates per (capture, entity) so the same
+        entity attached to N chunks of one capture still counts once.
+        The DISTINCT-pair-via-subquery form works on both SQLite and
+        Postgres without dialect-specific tricks.
+        """
+        sub = (
+            select(chunks.c.capture_id, chunk_entities.c.entity_id)
+            .select_from(chunk_entities)
+            .join(chunks, chunk_entities.c.chunk_id == chunks.c.id)
+            .join(captures, chunks.c.capture_id == captures.c.id)
+            .where(captures.c.user_id == user_id)
+            .distinct()
+            .subquery()
+        )
+        result = await self.session.execute(
+            select(func.count()).select_from(sub)
+        )
+        return int(result.scalar_one())
 
 
 __all__ = ["EntityRepository", "ENTITY_TYPES"]

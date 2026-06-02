@@ -18,12 +18,15 @@ from backend.capture.processor import CaptureInput, process
 from backend.config import settings
 from backend.knowledge.enrichment_worker import (
     enqueue_enrichment,
-    find_unenriched_capture_ids,
-    hydrate_processed,
+    hydrate_processed_from_capture,
+    iter_unenriched_captures,
 )
 from backend.knowledge.llm_client import LLMClient, PermanentLLMError
 from backend.storage import (
     DEFAULT_USER_ID,
+    CaptureRepository,
+    EntityRepository,
+    EnrichmentRepository,
     UserRepository,
     aclose as aclose_storage,
     init_db as init_storage_db,
@@ -55,11 +58,12 @@ app.add_middleware(
 )
 
 
-# Phase 1 persistence: append each processed capture to a JSONL file.
-# Phase 3 will replace this with ChromaDB + SQLite.
-CAPTURES_LOG = Path("./data/captures.jsonl")
+# Phase 3.5 — captures + enrichments + hydrations now live in SQL +
+# Chroma only. The three knowledge JSONLs (captures, enrichments,
+# hydrations) were retired with the cutover; see docs/phase3.5-cutover.md.
+# Only the failures log survives — it's an operational record, not part
+# of the knowledge graph, and intentionally stays a flat JSONL.
 FAILURES_LOG = Path(settings.capture_failures_path)
-ENRICHMENTS_LOG = Path(settings.enrichments_path)
 
 
 # ---- Phase 2: shared LLM client (constructed at startup) ------------
@@ -149,42 +153,33 @@ async def _recover_unenriched() -> None:
 
     Decision H — crash recovery. Runs once per process boot; emits one
     asyncio task per unenriched capture. Bounded by the number of
-    unenriched rows in captures.jsonl, which is small in normal operation.
+    unenriched rows for the default user, which is small in normal
+    operation.
+
+    Phase 3.5: replaced the captures.jsonl scan with a SQL query
+    (`captures LEFT JOIN enrichments`). The set of intentionally-skipped
+    capture_ids (empty / oversized content) still lives in the
+    operational failures log — same JSONL file as before, but now the
+    only JSONL anything reads.
     """
     client = _get_llm_client()
     if client is None:
         return
-    if not CAPTURES_LOG.exists():
-        return
 
-    unenriched_ids = set(find_unenriched_capture_ids(
-        captures_path=CAPTURES_LOG,
-        enrichments_path=ENRICHMENTS_LOG,
-    ))
-    if not unenriched_ids:
-        return
-
-    logger.info("Recovering %d unenriched captures from previous runs", len(unenriched_ids))
     queued = 0
-    with CAPTURES_LOG.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            cid = row.get("capture_id")
-            if not cid or cid not in unenriched_ids:
-                continue
-            processed = hydrate_processed(row)
-            if processed is None:
-                logger.debug("Skipping recovery for %s — could not hydrate row", cid)
-                continue
-            asyncio.create_task(enqueue_enrichment(cid, processed, client))
-            queued += 1
-            unenriched_ids.discard(cid)
+    async for capture in iter_unenriched_captures(
+        user_id=DEFAULT_USER_ID,
+        failures_path=FAILURES_LOG,
+    ):
+        processed = hydrate_processed_from_capture(capture)
+        if processed is None:
+            logger.debug(
+                "Skipping recovery for %s — capture row has no content",
+                capture.id,
+            )
+            continue
+        asyncio.create_task(enqueue_enrichment(capture.id, processed, client))
+        queued += 1
     if queued:
         logger.info("Re-queued %d unenriched captures", queued)
 
@@ -210,35 +205,27 @@ async def _ensure_default_user() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    # Phase 3 Step 4b — initialize SQL schema + seed default user.
-    # Runs even when ANTHROPIC_API_KEY is empty because /capture's
-    # dual-write path mirrors into SQL regardless of enrichment status.
-    # Best-effort: a SQL hiccup must not block app startup; the JSONL
-    # path still works for the dual-write window.
-    #
-    # The flag short-circuit means "we are not writing to SQL this
-    # run" — so don't even create the schema or seed users (avoids
-    # touching the DB file at all when the operator is debugging a
-    # broken SQL setup with dual_write off).
-    if settings.storage_dual_write:
-        # Independent try-blocks: a user-seed failure must not look
-        # like an init failure, and vice versa. If init fails the
-        # seed will too — that's fine, both get logged.
-        try:
-            await init_storage_db()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Phase 3 SQL schema init failed "
-                "(dual-write to SQL effectively disabled this run): %s", e,
-            )
-        try:
-            await _ensure_default_user()
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Phase 3 default-user seed failed "
-                "(sync_capture writes will FK-violate on user_id=%s): %s",
-                DEFAULT_USER_ID, e,
-            )
+    # Phase 3.5 — SQL is the sole authoritative store. Init the schema
+    # (idempotent CREATE TABLE IF NOT EXISTS + a narrow ADD COLUMN sweep
+    # for the v1.5 content columns; see backend/storage/db.py) and seed
+    # the default user. If init fails we still try the user seed — the
+    # two try-blocks stay independent so a user-seed bug doesn't look
+    # like a schema-init bug and vice versa.
+    try:
+        await init_storage_db()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "SQL schema init failed (captures will not persist this run): %s",
+            e,
+        )
+    try:
+        await _ensure_default_user()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Default-user seed failed "
+            "(sync_capture writes will FK-violate on user_id=%s): %s",
+            DEFAULT_USER_ID, e,
+        )
 
     global _llm_client
     if not settings.anthropic_api_key:
@@ -265,7 +252,7 @@ async def _shutdown() -> None:
         except Exception:  # noqa: BLE001
             logger.exception("Error closing LLM client")
         _llm_client = None
-    # Phase 3 Step 4b — drain the SQL connection pool cleanly.
+    # Drain the SQL connection pool cleanly.
     try:
         await aclose_storage()
     except Exception:  # noqa: BLE001
@@ -288,14 +275,19 @@ def _detect_source(payload: CapturePayload) -> str:
 async def capture_content(payload: CapturePayload, background_tasks: BackgroundTasks):
     """Receive captured content from Chrome extension or Telegram bot.
 
-    Pipeline (Phase 1 + Phase 2):
+    Pipeline (Phase 1 + 2, post-3.5 cutover):
       1. Extract + vision (synchronous, in the request).
-      2. Append the raw row to data/captures.jsonl with a capture_id.
+      2. Persist the processed row to SQL via `sync_capture` — captures
+         table now stores clean_text/transcript/image_text alongside
+         the metadata, so an in-flight enrichment can be replayed
+         from SQL after a crash.
       3. Schedule enrichment in the background — never blocks the
          response. Decision H — async enrichment via BackgroundTasks.
 
-    Phase 3 will swap step 2 for ChromaDB + SQLite writes; the
-    capture_id stays the join key.
+    Phase 3.5 removed the captures.jsonl writer; the SQL row IS the
+    authoritative capture. A SQL failure means the capture is logged
+    to the failures log and `/capture` returns persisted=False so the
+    extension/bot can decide what to do.
     """
     source = _detect_source(payload)
     capture_id = payload.capture_id or str(uuid.uuid4())
@@ -320,47 +312,48 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         _log_failure(source=source, reason=f"processing: {e}", payload=payload.model_dump(mode="json"))
         raise HTTPException(status_code=500, detail=f"processing failed: {e}")
 
-    # Append to JSONL log. Phase 2: include capture_id so enrichments.jsonl
-    # can be joined back to the raw row. Phase 3 dual-write also mirrors
-    # into SQL via sync_capture below; once the dual-write window closes
-    # (Phase 3.5) the JSONL writer goes away and SQL becomes the sole path.
-    persisted = False
-    try:
-        CAPTURES_LOG.parent.mkdir(parents=True, exist_ok=True)
-        row = {"capture_id": capture_id, **processed.to_dict()}
-        with CAPTURES_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        persisted = True
-    except OSError as e:
-        logger.warning("Failed to persist capture: %s", e)
-        _log_failure(source=source, reason=f"persist: {e}", payload=payload.model_dump(mode="json"))
-
-    # Phase 3 Step 4b — dual-write the capture row into SQL. Best-effort
-    # by design (sync_capture catches all errors internally) — a SQL
-    # outage MUST NOT break the JSONL path during the dual-write window.
-    # Idempotent on duplicate capture_id (silent no-op).
-    #
-    # Gated on `persisted`: JSONL is the authoritative store during
-    # the dual-write window, so a JSONL failure means the capture
-    # is logged-as-failed and we don't mirror an orphaned row into
-    # SQL. Once the window closes (Phase 3.5) this gate goes away.
-    sql_synced = False
-    if persisted:
-        sql_synced = await sync_capture(
-            capture_id=capture_id,
-            url=processed.url,
-            title=processed.title,
-            platform=processed.platform,
-            content_type=processed.content_type,
-            captured_at=processed.timestamp,
-            dwell_seconds=processed.dwell_time_seconds,
-            raw_metadata_json=(
-                json.dumps(processed.metadata, ensure_ascii=False)
-                if processed.metadata else None
-            ),
+    # Phase 3.5 — sole persistence step. sync_capture writes the row
+    # (metadata + content columns) to SQL; idempotent on duplicate
+    # capture_id. Returns False on duplicate OR error — we treat both
+    # the same way for the enrichment decision, but a False with no
+    # prior row is the only failure mode that matters and gets surfaced
+    # via the failures log so the operator notices.
+    persisted = await sync_capture(
+        capture_id=capture_id,
+        url=processed.url,
+        title=processed.title,
+        platform=processed.platform,
+        content_type=processed.content_type,
+        captured_at=processed.timestamp,
+        dwell_seconds=processed.dwell_time_seconds,
+        raw_metadata_json=(
+            json.dumps(processed.metadata, ensure_ascii=False)
+            if processed.metadata else None
+        ),
+        clean_text=processed.clean_text or None,
+        transcript=processed.transcript,
+        image_text=processed.image_text or None,
+        image_descriptions_json=(
+            json.dumps(processed.image_descriptions, ensure_ascii=False)
+            if processed.image_descriptions else None
+        ),
+        text_source=processed.text_source,
+    )
+    if not persisted:
+        # Surface SQL persistence failures in the operational log so the
+        # operator (and the bot's `/failures` command) can see them.
+        # Idempotent-duplicate also returns False — that's expected when
+        # a client retries a known capture_id; we log it but it's not a
+        # real failure. Differentiated by checking SQL after the fact
+        # would be a round-trip; cheaper to log and let `/failures`
+        # de-noise via the reason field.
+        _log_failure(
+            source=source,
+            reason="sql_persist_failed_or_duplicate",
+            payload=payload.model_dump(mode="json"),
         )
 
-    # Phase 2 — schedule enrichment. Skipped if:
+    # Schedule enrichment. Skipped if:
     #   - persistence failed (no row to enrich against)
     #   - no LLM client (no API key in env)
     enrichment_scheduled = False
@@ -370,7 +363,7 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         enrichment_scheduled = True
 
     return {
-        "status": "captured",
+        "status": "captured" if persisted else "rejected",
         "capture_id": capture_id,
         "url": processed.url,
         "title": processed.title,
@@ -381,10 +374,10 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         "images_processed": len(processed.image_descriptions),
         "vision_skipped": skip_vision,
         "enrichment_scheduled": enrichment_scheduled,
-        # Phase 3 Step 4b — dual-write status. False during the window
-        # is non-fatal (capture is in JSONL); persistent False signals
-        # SQL/Chroma trouble worth investigating.
-        "sql_synced": sql_synced,
+        # Phase 3.5 — SQL is the only persistence path. `persisted=False`
+        # means the capture did NOT land anywhere durable; the caller
+        # should treat it as a failure and retry.
+        "persisted": persisted,
     }
 
 
@@ -408,72 +401,73 @@ async def ask_agent(payload: QuestionPayload):
 
 @app.get("/stats")
 async def get_stats():
-    """Get knowledge base statistics."""
-    total = 0
-    platforms: dict[str, int] = {}
-    last_capture: str | None = None
-    capture_ids: set[str] = set()
-    if CAPTURES_LOG.exists():
-        with CAPTURES_LOG.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                total += 1
-                plat = rec.get("platform", "unknown")
-                platforms[plat] = platforms.get(plat, 0) + 1
-                last_capture = rec.get("timestamp") or last_capture
-                cid = rec.get("capture_id")
-                if isinstance(cid, str) and cid:
-                    capture_ids.add(cid)
+    """Knowledge base statistics, read from SQL.
 
-    # Phase 2 — enrichment counts.
-    enriched_ids: set[str] = set()
-    total_entities = 0
-    if ENRICHMENTS_LOG.exists():
-        with ENRICHMENTS_LOG.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                cid = rec.get("capture_id")
-                if isinstance(cid, str) and cid:
-                    enriched_ids.add(cid)
-                ents = (rec.get("enrichment") or {}).get("entities") or []
-                if isinstance(ents, list):
-                    total_entities += len(ents)
+    Phase 3.5: this used to scan `captures.jsonl` + `enrichments.jsonl`
+    + `capture_failures.jsonl`. After the cutover, captures and
+    enrichments live in SQL; only the skipped-set still comes from the
+    failures log (it's an ops record, not part of the knowledge graph).
+    """
+    user_id = DEFAULT_USER_ID
 
-    # Phase 2.5 Fix 1 — capture_ids deliberately skipped (empty / oversized
-    # content). Subtract these from `pending` so the metric reflects real
-    # backlog, not nothing-to-do work. Surface separately as `skipped`.
-    skipped_ids: set[str] = set()
-    if FAILURES_LOG.exists():
-        with FAILURES_LOG.open("r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("phase") != "enrichment_skipped":
-                    continue
-                cid = rec.get("capture_id")
-                if isinstance(cid, str) and cid:
-                    skipped_ids.add(cid)
-    pending_enrichment = max(0, len(capture_ids - enriched_ids - skipped_ids))
+    async with session_scope() as session:
+        cap_repo = CaptureRepository(session)
+        enr_repo = EnrichmentRepository(session)
+        ent_repo = EntityRepository(session)
+
+        total_captures = await cap_repo.count_by_user(user_id=user_id)
+        platforms = await cap_repo.platform_counts(user_id=user_id)
+        last_capture = await cap_repo.latest_captured_at(user_id=user_id)
+        total_enriched = await enr_repo.count_enriched_captures_by_user(user_id=user_id)
+        total_entities = await ent_repo.count_capture_mentions_by_user(user_id=user_id)
+
+    # Skipped-set still comes from the ops failures log per the
+    # Phase 3.5 decision to keep capture_failures.jsonl as a flat log
+    # (no SQL counterpart). We use it to discount the pending metric
+    # so it reflects real backlog, not "nothing to enrich" rows.
+    skipped_count = _count_enrichment_skipped(FAILURES_LOG)
+
+    pending_enrichment = max(0, total_captures - total_enriched - skipped_count)
 
     return {
-        "total_captures": total,
+        "total_captures": total_captures,
         "total_entities": total_entities,
         "platforms": platforms,
         "last_capture": last_capture,
         "enrichments": {
-            "total": len(enriched_ids),
+            "total": total_enriched,
             "pending": pending_enrichment,
-            "skipped": len(skipped_ids),
+            "skipped": skipped_count,
         },
     }
+
+
+def _count_enrichment_skipped(failures_log: Path) -> int:
+    """Count rows tagged `phase: enrichment_skipped` in the failures log.
+
+    Lives here (not on the storage layer) because the failures log is
+    intentionally NOT a SQL table — it's an operational record (see
+    docs/phase3.5-cutover.md, decision 2). Small enough to scan on
+    every `/stats` call; if it ever grows uncomfortably large, the
+    failures log gets a rotation policy before it gets a SQL table.
+    """
+    if not failures_log.exists():
+        return 0
+    count = 0
+    seen: set[str] = set()
+    with failures_log.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("phase") != "enrichment_skipped":
+                continue
+            cid = row.get("capture_id")
+            if isinstance(cid, str) and cid and cid not in seen:
+                seen.add(cid)
+                count += 1
+    return count
 
 
 @app.get("/failures")

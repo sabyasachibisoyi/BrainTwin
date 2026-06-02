@@ -1,7 +1,13 @@
 """End-to-end smoke test for the BrainTwin /capture endpoint.
 
-Mimics exactly what extension/content.js POSTs to the backend, then reads
-back /stats and tails data/captures.jsonl to confirm the round-trip.
+Mimics exactly what extension/content.js POSTs to the backend, then
+checks `/stats` to confirm the capture landed.
+
+Phase 3.5: this used to tail `data/captures.jsonl` for the last row
+the backend wrote. After the cutover the captures.jsonl writer is
+gone — `python scripts/inspect_storage.py --capture-id <uuid>` is now
+the way to drill into a specific capture. We keep the `/stats` delta
+check here as a quick liveness signal.
 
 Usage:
     # 1. Start the backend in one terminal:
@@ -24,7 +30,6 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
 
 
 # A realistic payload — same shape extension/content.js builds in
@@ -80,11 +85,6 @@ def http_json(method: str, url: str, body: dict | None = None, timeout: float = 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", default="http://127.0.0.1:8000", help="Backend base URL")
-    ap.add_argument(
-        "--captures-log",
-        default="data/captures.jsonl",
-        help="Path to JSONL capture log (relative to project root)",
-    )
     args = ap.parse_args()
 
     print(f"→ Backend: {args.backend}")
@@ -116,7 +116,7 @@ def main() -> int:
     if status != 200:
         return 1
 
-    # 4. Stats after + JSONL tail
+    # 4. Stats after
     print("\n[4/4] GET /stats (after)")
     _, after = http_json("GET", f"{args.backend}/stats")
     print(f"  ← {after}")
@@ -124,16 +124,12 @@ def main() -> int:
     delta = after.get("total_captures", 0) - before_total
     print(f"\n  total_captures: {before_total} → {after.get('total_captures')}  (delta {delta:+})")
 
-    log = Path(args.captures_log)
-    if log.exists():
-        last_line = log.read_text(encoding="utf-8").strip().splitlines()[-1]
-        try:
-            rec = json.loads(last_line)
-            print(f"  last row in {log}: url={rec.get('url')!r} text_source={rec.get('text_source')!r}")
-        except json.JSONDecodeError:
-            print(f"  (couldn't parse last line of {log})")
-    else:
-        print(f"  (no {log} file yet — backend may be writing elsewhere)")
+    cid = (body or {}).get("capture_id") if isinstance(body, dict) else None
+    if cid:
+        print(
+            f"  Drill into this capture with:\n"
+            f"    python scripts/inspect_storage.py --capture-id {cid}"
+        )
 
     if delta < 1:
         print("\n✗ Capture did not register. Check backend logs.")

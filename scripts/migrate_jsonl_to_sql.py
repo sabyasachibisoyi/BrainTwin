@@ -92,8 +92,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from dataclasses import fields as dc_fields  # noqa: E402
+
+from backend.capture.processor import ProcessedContent  # noqa: E402
 from backend.config import settings  # noqa: E402
-from backend.knowledge.enrichment_worker import hydrate_processed  # noqa: E402
 from backend.storage import (  # noqa: E402
     CaptureRepository,
     ChunkRepository,
@@ -110,10 +112,6 @@ from backend.storage.sync import (  # noqa: E402
 )
 from sqlalchemy import select  # noqa: E402
 
-# Reuse Phase 2's test-row classifier so historical fixtures don't
-# pollute SQL. Same rules as scripts/backfill_enrichment.py.
-from scripts.backfill_enrichment import is_test_row  # noqa: E402
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -129,6 +127,77 @@ _LEGACY_CAPTURE_NS = uuid.UUID("a4d29c6e-7d1e-4f8e-b9b1-1a2b3c4d5e6f")
 
 
 # ---- Helpers --------------------------------------------------------
+
+# Test-row classifier — kept local to this script since post-Phase-3.5
+# `scripts/backfill_enrichment.py` walks SQL rows (`is_test_capture`)
+# and no longer exposes a JSONL-dict variant. Rules match the original
+# backfill classifier so historical fixtures get skipped consistently.
+_TEST_URL_HOSTS = ("example.com", "example.org", "test.local")
+
+
+def is_test_row(row: dict[str, Any]) -> tuple[bool, str]:
+    """Return (skip, reason). Conservative — only skips obvious fixtures.
+
+    Identifies:
+      - URL is empty / on example.com / starts with tg:// (Telegram debug)
+      - clean_text is empty AND there's no transcript AND no image text
+      - title is "Telegram link" with no body (Phase 1 mock script's signature)
+      - metadata.source == "mock_capture" (scripts/mock_capture.py)
+    """
+    url = (row.get("url") or "").strip().lower()
+    title = (row.get("title") or "").strip()
+    clean_text = (row.get("clean_text") or "").strip()
+    transcript = (row.get("transcript") or "").strip() if row.get("transcript") else ""
+    image_text = (row.get("image_text") or "").strip()
+    metadata = row.get("metadata") or {}
+
+    if isinstance(metadata, dict) and metadata.get("source") == "mock_capture":
+        return True, "mock_capture metadata"
+    if not url:
+        return True, "empty url"
+    if title == "Telegram link" and not clean_text and not image_text:
+        return True, "empty telegram link"
+    for host in _TEST_URL_HOSTS:
+        if host in url:
+            return True, f"test domain ({host})"
+    if not (clean_text or transcript or image_text):
+        return True, "no extractable text"
+    return False, ""
+
+
+# Defaults used when an old pre-Phase-2 row is missing fields the
+# `ProcessedContent` dataclass now expects. These match the dataclass
+# default values where they have one. Inlined here post-Phase-3.5 —
+# the live worker no longer reads JSONL captures, but this migration
+# script still has to translate historical rows into ProcessedContent.
+_HYDRATION_DEFAULTS: dict[str, Any] = {
+    "transcript": None,
+    "image_descriptions": [],
+    "image_text": "",
+    "metadata": {},
+    "dwell_time_seconds": 0,
+}
+
+
+def hydrate_processed(row: dict[str, Any]) -> Optional[ProcessedContent]:
+    """Reconstruct a `ProcessedContent` from a captures.jsonl row.
+
+    Frozen historical helper — used only by this migration script to
+    translate pre-cutover JSONL rows into the in-memory shape
+    `sync_enrichment` expects. The live path uses
+    `hydrate_processed_from_capture` (a `Capture` SQL row) instead.
+    """
+    expected = {f.name for f in dc_fields(ProcessedContent)}
+    payload = {k: v for k, v in row.items() if k in expected}
+    for k, v in _HYDRATION_DEFAULTS.items():
+        payload.setdefault(k, v)
+    if expected - payload.keys():
+        return None
+    try:
+        return ProcessedContent(**payload)
+    except TypeError:
+        return None
+
 
 def _iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any], str]]:
     """Stream a JSONL file, yielding (line_number, parsed_row, raw_line).
@@ -789,12 +858,10 @@ async def run(
     limit: Optional[int],
     verify_only: bool,
 ) -> int:
-    if not settings.storage_dual_write and not (dry_run or verify_only):
-        logger.error(
-            "settings.storage_dual_write is False — sync_* calls would "
-            "no-op. Either flip the flag or pass --dry-run / --verify."
-        )
-        return 2
+    # Phase 3.5 — the storage_dual_write gate was retired with the
+    # JSONL writers; SQL is now the only persistence path so there's
+    # nothing to flip. This script remains as a frozen historical
+    # backfill tool for pre-Phase-3 JSONL archives.
 
     # Always ensure schema + default user before anything reads SQL.
     # init_db is idempotent (CREATE TABLE IF NOT EXISTS) and _ensure_default_user

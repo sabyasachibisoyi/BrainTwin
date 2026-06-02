@@ -1,4 +1,5 @@
-"""Retry enrichment for capture_ids that have no row in enrichments.jsonl.
+"""Retry enrichment for captures that have no row in the enrichments
+table.
 
 Counterpart to the FastAPI startup recovery hook (Decision H). Use this
 when:
@@ -6,11 +7,12 @@ when:
   - You want to retry enrichment without bouncing the backend.
   - You've fixed the underlying cause of an enrichment failure (e.g.,
     refilled API quota, fixed a bad prompt) and want to clear the backlog.
-  - You want to re-run after editing data/captures.jsonl by hand.
 
-This does NOT apply the test-row classifier — if it's in captures.jsonl
-without an enrichment, it gets retried. Use scripts/backfill_enrichment.py
-if you want test-row filtering.
+Phase 3.5: this used to scan `data/captures.jsonl` and
+`data/enrichments.jsonl`. After the cutover, captures and enrichments
+live in SQL; the script walks the captures table via
+`iter_unenriched_captures()` instead. Skipped (empty / oversized)
+captures are still pulled from the failures log.
 
 Usage:
     # Retry every unenriched capture
@@ -28,25 +30,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any
 
 # Make `backend.*` imports work when running this file as a script.
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from backend.capture.processor import ProcessedContent  # noqa: E402,F401
+from backend.capture.processor import ProcessedContent  # noqa: E402
 from backend.config import settings  # noqa: E402
 from backend.knowledge.enrichment_worker import (  # noqa: E402
     enqueue_enrichment,
-    find_unenriched_capture_ids,
-    hydrate_processed,
+    hydrate_processed_from_capture,
+    iter_unenriched_captures,
 )
 from backend.knowledge.llm_client import LLMClient  # noqa: E402
+from backend.storage import DEFAULT_USER_ID  # noqa: E402
 
 
 logging.basicConfig(
@@ -58,42 +59,30 @@ logger = logging.getLogger("retry")
 
 async def run(
     *,
-    captures_path: Path,
-    enrichments_path: Path,
+    user_id: int,
+    failures_path: Path,
     dry_run: bool,
     limit: int | None,
 ) -> int:
-    target_ids = set(find_unenriched_capture_ids(
-        captures_path=captures_path,
-        enrichments_path=enrichments_path,
-    ))
-    logger.info("Found %d unenriched capture_ids", len(target_ids))
-    if not target_ids:
-        return 0
-
-    # Re-scan captures.jsonl to hydrate ProcessedContent for each target.
     targets: list[tuple[str, ProcessedContent]] = []
-    with captures_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            cid = row.get("capture_id")
-            if not isinstance(cid, str) or cid not in target_ids:
-                continue
-            processed = hydrate_processed(row)
-            if processed is None:
-                logger.warning("Could not hydrate row for %s — skipping", cid[:8])
-                continue
-            targets.append((cid, processed))
-            if limit and len(targets) >= limit:
-                break
+    async for capture in iter_unenriched_captures(
+        user_id=user_id,
+        failures_path=failures_path,
+    ):
+        processed = hydrate_processed_from_capture(capture)
+        if processed is None:
+            logger.warning(
+                "Could not hydrate %s — empty content; tag in failures log "
+                "or skip", capture.id[:8],
+            )
+            continue
+        targets.append((capture.id, processed))
+        if limit and len(targets) >= limit:
+            break
 
     logger.info("Will retry %d capture(s)", len(targets))
+    if not targets:
+        return 0
     if dry_run:
         for cid, p in targets:
             logger.info("  %s — %.80s", cid[:8], p.title or "(no title)")
@@ -118,19 +107,25 @@ async def run(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Retry failed enrichments.")
-    p.add_argument("--captures", default="./data/captures.jsonl", type=Path)
     p.add_argument(
-        "--enrichments",
-        default=settings.enrichments_path,
+        "--user-id",
+        type=int,
+        default=DEFAULT_USER_ID,
+        help="User to scan (default: %(default)s — Sabya).",
+    )
+    p.add_argument(
+        "--failures",
+        default=settings.capture_failures_path,
         type=Path,
+        help="Path to capture_failures.jsonl (for skipped-rows filter).",
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=None)
     args = p.parse_args()
 
     rc = asyncio.run(run(
-        captures_path=Path(args.captures),
-        enrichments_path=Path(args.enrichments),
+        user_id=int(args.user_id),
+        failures_path=Path(args.failures),
         dry_run=bool(args.dry_run),
         limit=args.limit,
     ))

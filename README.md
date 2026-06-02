@@ -38,7 +38,9 @@ uvicorn backend.main:app --reload --port 8000
 
 ### Inspecting captures & enrichment
 
-Handy commands for verifying that a capture made it through the full Phase 1 + Phase 2 pipeline (raw text → Haiku enrichment → sidecar JSONL). Run these from the repo root with the backend running.
+Handy commands for verifying that a capture made it through the full Phase 1 + Phase 2 pipeline (raw text → Haiku enrichment → SQL + Chroma). Run these from the repo root with the backend running.
+
+Post-Phase-3.5 the three knowledge JSONLs (`captures.jsonl`, `enrichments.jsonl`, `hydrations.jsonl`) are gone. SQL (`data/braintwin.db`) and Chroma (`data/chroma/`) are the sole stores. The only JSONL anything still reads is `data/capture_failures.jsonl`, kept as an operational log (see [docs/phase3.5-cutover.md](docs/phase3.5-cutover.md), decision 2).
 
 **1. High-level counts:**
 
@@ -48,43 +50,35 @@ curl -s http://127.0.0.1:8000/stats | python -m json.tool
 
 You want `total_captures` and `enrichments.total` to both go up by 1 after each capture, and `enrichments.pending` to settle to `0` once the background worker finishes (usually within a few seconds).
 
-**2. Pull the latest capture row + grab its `capture_id`:**
+**2. Drill into a specific capture across SQL + Chroma:**
 
 ```bash
-tail -1 data/captures.jsonl | python -m json.tool | head -20
-CID=$(tail -1 data/captures.jsonl | python -c "import json,sys; print(json.loads(sys.stdin.read())['capture_id'])")
-echo "capture_id = $CID"
+python scripts/inspect_storage.py --capture-id <uuid>
 ```
 
-**3. Pull the matching enrichment row:**
+This is the workhorse command for debugging post-3.5. It shows the SQL row, hydration, enrichment, every chunk + source_kind, and the matching Chroma vectors. Replaces the old "tail captures.jsonl + grep enrichments.jsonl" combo.
 
-```bash
-grep "$CID" data/enrichments.jsonl | python -m json.tool
-```
-
-The enrichment block must have four fields: `summary` (1-2 sentences), `entities` (list of `{name, type}`), `key_facts` (atomic claims), `topics` (3-5 lowercase hyphenated tags). Wrapper keys: `model`, `enriched_at`, `related_captures` (reserved empty for Phase 3).
-
-**4. Confirm no enrichment failure was logged for that capture:**
+**3. Confirm no enrichment failure was logged for that capture:**
 
 ```bash
 grep "$CID" data/capture_failures.jsonl 2>/dev/null || echo "(no failures for $CID — good)"
 ```
 
-**5. Inspect failures by phase (capture vs enrichment):**
+**4. Inspect failures by phase (capture vs enrichment):**
 
 ```bash
 curl -s 'http://127.0.0.1:8000/failures?phase=enrichment&limit=5' | python -m json.tool
 curl -s 'http://127.0.0.1:8000/failures?phase=capture&limit=5'    | python -m json.tool
 ```
 
-**6. If `enrichments.pending` won't go to 0**, the worker either failed or is still running. Check the uvicorn log for an `enrich[<first-8-of-CID>]` line, then manually retry:
+**5. If `enrichments.pending` won't go to 0**, the worker either failed or is still running. Check the uvicorn log for an `enrich[<first-8-of-CID>]` line, then manually retry. Retry walks SQL (no JSONL needed):
 
 ```bash
 python scripts/retry_failed_enrichments.py --dry-run    # show what's missing
 python scripts/retry_failed_enrichments.py              # actually retry
 ```
 
-**7. Backfill enrichment over older captures (idempotent — skips test rows and already-enriched IDs):**
+**6. Backfill enrichment over older captures (idempotent — skips test rows and already-enriched captures via SQL):**
 
 ```bash
 python scripts/backfill_enrichment.py --dry-run         # preview
@@ -94,9 +88,9 @@ python scripts/backfill_enrichment.py                   # full run
 
 For the full numbered Phase 2 verification flow (unit tests, crash recovery, bot `/failures`, etc.) see [docs/phase2-smoke-test.md](docs/phase2-smoke-test.md).
 
-### Phase 3 — SQL + Vector storage (dual-write mode)
+### Phase 3 — SQL + Vector storage (post-cutover)
 
-Every `/capture` POST and every successful enrichment now mirrors into SQL (`data/braintwin.db`) and ChromaDB (`data/chroma/`) **alongside** the JSONL writers. Gated by `STORAGE_DUAL_WRITE=true` (default).
+Every `/capture` POST and every successful enrichment writes to SQL (`data/braintwin.db`) and ChromaDB (`data/chroma/`). Phase 3.5 retired the JSONL writers; SQL is now the sole authoritative store.
 
 **Quick commands:**
 
@@ -110,13 +104,14 @@ python scripts/inspect_storage.py
 # Drill into one capture across both stores
 python scripts/inspect_storage.py --capture-id <uuid>
 
-# Migrate historical JSONLs into SQL + Chroma
+# Migrate historical JSONLs into SQL + Chroma (one-shot, frozen tool
+# kept for backfilling archived pre-cutover data)
 python scripts/migrate_jsonl_to_sql.py --dry-run
 python scripts/migrate_jsonl_to_sql.py
 python scripts/migrate_jsonl_to_sql.py --verify
 ```
 
-Full numbered verification flow: see [docs/phase3-smoke-test.md](docs/phase3-smoke-test.md). Design decisions and the build-step log: [docs/phase3-design.md](docs/phase3-design.md).
+Full numbered verification flow: see [docs/phase3-smoke-test.md](docs/phase3-smoke-test.md). Design decisions: [docs/phase3-design.md](docs/phase3-design.md). Phase 3.5 cutover decisions and what changed: [docs/phase3.5-cutover.md](docs/phase3.5-cutover.md).
 
 ### Project Structure
 
@@ -168,13 +163,13 @@ BrainTwin/
 │   ├── popup.js                # Popup logic
 │   └── icons/                  # Extension icons
 ├── data/
-│   ├── captures.jsonl          # Phase 1 — raw captures (one per line, with capture_id)
-│   ├── enrichments.jsonl       # Phase 2 — Haiku enrichment sidecar (joined by capture_id)
-│   ├── hydrations.jsonl        # Phase 2.5 — OG metadata + transcription sidecar
-│   ├── capture_failures.jsonl  # Failures tagged with phase: capture | enrichment | enrichment_skipped (Phase 2.5)
-│   ├── migration_failures.jsonl# Phase 3 — per-row validation failures from migrate_jsonl_to_sql.py
+│   ├── braintwin.db            # Phase 3 — SQLite database (auto-created, sole capture store post-3.5)
 │   ├── chroma/                 # Phase 3 — ChromaDB persistent storage (auto-created)
-│   ├── braintwin.db            # Phase 3 — SQLite database (auto-created)
+│   ├── capture_failures.jsonl  # Operational failures log — retained through Phase 3.5 cutover. Phases: capture | enrichment | enrichment_skipped
+│   ├── migration_failures.jsonl# Phase 3 — per-row validation failures from migrate_jsonl_to_sql.py
+│   ├── captures.jsonl          # ☠ Retired in Phase 3.5 — historical archive only (if present)
+│   ├── enrichments.jsonl       # ☠ Retired in Phase 3.5 — historical archive only (if present)
+│   ├── hydrations.jsonl        # ☠ Retired in Phase 3.5 — historical archive only (if present)
 │   ├── images/                 # Captured images/memes
 │   └── models/                 # Phase 2.5 — whisper.cpp models (gitignored, ~250 MB)
 ├── bin/
@@ -225,12 +220,12 @@ BrainTwin/
 Open `docs/architecture.html` in a browser for the full visual diagram.
 
 **Phases (build order):**
-1. **Phase 1 — Capture** — Chrome extension (dwell-time-gated) + Telegram bot. Writes raw JSONL with `capture_id`. ✅ built
-2. **Phase 2 — Enrichment** — Async Claude Haiku enrichment (summary, entities, key facts, topics). Sidecar JSONL. ✅ built
+1. **Phase 1 — Capture** — Chrome extension (dwell-time-gated) + Telegram bot. ✅ built
+2. **Phase 2 — Enrichment** — Async Claude Haiku enrichment (summary, entities, key facts, topics). ✅ built
 3. **Phase 2.5 — Hydration** — OG metadata + video transcription to fill empty captures before enrichment. ✅ built
-4. **Phase 3 — Storage** — SQLAlchemy on SQLite (Postgres-ready) + ChromaDB. Chunking, embeddings (`all-MiniLM-L6-v2`), 9-table schema, multi-tenant from day one. Currently in **dual-write mode** alongside the JSONLs. ✅ built
-5. **Phase 3.5 — Cutover** — Remove JSONL writers; SQL + Chroma become sole path. ⏳ next
-6. **Phase 4 — Agent** — Synthesis quizzes (use case A), vague-recall search (B), indirect-clue inference (C). 🛠️ planned
+4. **Phase 3 — Storage** — SQLAlchemy on SQLite (Postgres-ready) + ChromaDB. Chunking, embeddings (`all-MiniLM-L6-v2`), 9-table schema, multi-tenant from day one. Dual-write window alongside the JSONLs. ✅ built
+5. **Phase 3.5 — Cutover** — JSONL writers (captures, enrichments, hydrations) removed; SQL + Chroma are the sole path. `capture_failures.jsonl` survives as an ops log. ✅ built
+6. **Phase 4 — Agent** — Synthesis quizzes (use case A), vague-recall search (B), indirect-clue inference (C). ⏳ next
 7. **Phase 5 — Competition** — Third party quizzes you vs the agent, scoring. 🛠️ planned
 
 ## Tech Stack
