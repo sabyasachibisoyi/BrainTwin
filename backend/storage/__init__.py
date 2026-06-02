@@ -42,6 +42,7 @@ from backend.storage.models import (
     Chunk,
     ChunkAttachment,
     ChunkInsert,
+    ChunkWithScore,
     Entity,
     Enrichment,
     Hydration,
@@ -111,6 +112,7 @@ __all__ = [
     "Entity",
     "CaptureWithEnrichment",
     "ChunkAttachment",
+    "ChunkWithScore",
     # repositories
     "BaseRepository",
     "RepositoryError",

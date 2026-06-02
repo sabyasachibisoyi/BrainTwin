@@ -253,6 +253,91 @@ chunk_entities = Table(
 )
 
 
+# ---------------------------------------------------------------------
+# chunks_fts — SQLite FTS5 virtual table mirroring chunks.text (Phase 4 M.1)
+# ---------------------------------------------------------------------
+# Per docs/phase4-vague-recall-design.md V.1 — vague-recall retrieval is
+# a hybrid of Chroma (vector) and SQLite FTS5 (BM25) over the same
+# `chunks` table. FTS5 is what catches the proper-noun and exact-token
+# queries that the embedder misses (Tamasha, HSR Layout, jugaad).
+#
+# Why this lives in raw DDL rather than a `Table()` declaration:
+# SQLAlchemy Core has no clean modelling for FTS5 virtual tables —
+# `USING fts5(...)` with the `content=` / `content_rowid=` options
+# isn't a real Core concept. Trying to fit it in produces brittle
+# dialect-specific hacks. Raw DDL strings declared here, executed via
+# the idempotent migration sweep in `backend/storage/db.py`, are the
+# cleaner option. They sit outside the SQLAlchemy MetaData on purpose.
+#
+# Design choices baked into the DDL:
+#   - `content='chunks'` + `content_rowid='id'` makes this a
+#     CONTENTLESS-EXTERNAL FTS5 index. The actual text bytes live only
+#     in `chunks.text`; FTS5 stores only the inverted index. No
+#     storage duplication.
+#   - `tokenize='unicode61 remove_diacritics 2'` normalizes accented
+#     proper nouns consistently (café/cafe both index the same way)
+#     while leaving distinct tokens distinct (Bengaluru ≠ Bangalore —
+#     that's vector search's job per V.1's hybrid argument).
+#   - The triggers below keep `chunks_fts` in sync with `chunks` on
+#     INSERT / UPDATE OF text / DELETE. For an external-content FTS5
+#     table you write to it via the special `delete` and `insert`
+#     command columns rather than DML. The sync triggers are textbook
+#     SQLite FTS5 (see https://www.sqlite.org/fts5.html §4.4.3).
+#
+# Postgres note: if/when we migrate the SQL layer to Postgres, this
+# block gets replaced with a `tsvector` column on `chunks` and a
+# trigger that maintains it. The Phase 4 retrieval code that touches
+# this index goes through `ChunkRepository.search_by_bm25`, which is
+# the only seam that has to change.
+
+CHUNKS_FTS_TABLE_DDL = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
+    "text, "
+    "content='chunks', "
+    "content_rowid='id', "
+    "tokenize='unicode61 remove_diacritics 2'"
+    ")"
+)
+
+CHUNKS_FTS_INSERT_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_after_insert "
+    "AFTER INSERT ON chunks BEGIN "
+    "INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text); "
+    "END"
+)
+
+# Fires only when `text` actually changes — embedding-only updates
+# don't waste an index rewrite. The `delete` + `insert` dance is the
+# documented pattern for updating a row in an external-content FTS5
+# table (see SQLite FTS5 docs §4.4.3).
+CHUNKS_FTS_UPDATE_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_after_update "
+    "AFTER UPDATE OF text ON chunks BEGIN "
+    "INSERT INTO chunks_fts(chunks_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); "
+    "INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text); "
+    "END"
+)
+
+CHUNKS_FTS_DELETE_TRIGGER_DDL = (
+    "CREATE TRIGGER IF NOT EXISTS chunks_fts_after_delete "
+    "AFTER DELETE ON chunks BEGIN "
+    "INSERT INTO chunks_fts(chunks_fts, rowid, text) "
+    "VALUES('delete', old.id, old.text); "
+    "END"
+)
+
+# Ordered list driven by the idempotent migration sweep in db.py.
+# Pairs of (object_name, ddl) — object_name is what we look up in
+# sqlite_master to decide whether to issue the CREATE.
+CHUNKS_FTS_DDL: tuple[tuple[str, str], ...] = (
+    ("chunks_fts", CHUNKS_FTS_TABLE_DDL),
+    ("chunks_fts_after_insert", CHUNKS_FTS_INSERT_TRIGGER_DDL),
+    ("chunks_fts_after_update", CHUNKS_FTS_UPDATE_TRIGGER_DDL),
+    ("chunks_fts_after_delete", CHUNKS_FTS_DELETE_TRIGGER_DDL),
+)
+
+
 __all__ = [
     "metadata",
     "users",
@@ -264,4 +349,11 @@ __all__ = [
     "entities",
     "chunk_topics",
     "chunk_entities",
+    # Phase 4 M.1 — FTS5 raw DDL, executed by the idempotent migration
+    # sweep in backend/storage/db.py.
+    "CHUNKS_FTS_DDL",
+    "CHUNKS_FTS_TABLE_DDL",
+    "CHUNKS_FTS_INSERT_TRIGGER_DDL",
+    "CHUNKS_FTS_UPDATE_TRIGGER_DDL",
+    "CHUNKS_FTS_DELETE_TRIGGER_DDL",
 ]

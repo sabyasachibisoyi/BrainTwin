@@ -167,6 +167,11 @@ async def init_db() -> None:
         # add new columns to a table that already exists. This sweep
         # closes the gap without bringing in alembic for one column set.
         await conn.run_sync(_apply_pending_column_adds)
+        # Phase 4 M.1 — FTS5 virtual table + triggers for BM25 retrieval.
+        # SQLAlchemy Core doesn't model virtual tables, so the DDL is raw
+        # strings declared in schema.py. Same idempotent CREATE-IF-NOT-EXISTS
+        # shape as the column-adds sweep above.
+        await conn.run_sync(_apply_pending_fts_setup)
     logger.info("Database schema initialized (tables: %d)", len(metadata.tables))
 
 
@@ -219,6 +224,54 @@ def _apply_pending_column_adds(sync_conn) -> None:
         logger.info(
             "Phase 3.5 migration: added column %s.%s (%s)",
             table, column, ddl,
+        )
+
+
+# ---- Phase 4 M.1 — FTS5 virtual table + sync triggers ---------------
+#
+# `chunks_fts` is a SQLite FTS5 virtual table that mirrors `chunks.text`
+# for BM25 retrieval (docs/phase4-vague-recall-design.md V.1). The DDL
+# lives in `backend.storage.schema` because SQLAlchemy Core doesn't
+# model virtual tables — see the long comment in schema.py for the
+# rationale.
+#
+# This sweep is idempotent — it consults `sqlite_master` for each
+# object (virtual table + 3 triggers) and only issues the CREATE if
+# the object is absent. Safe to run on every `init_db()` call.
+#
+# Postgres path: when we migrate, this becomes a no-op (the equivalent
+# Postgres setup — `tsvector` column + a maintenance trigger — lands
+# in the Postgres-specific migration). The dialect check guards that.
+
+def _apply_pending_fts_setup(sync_conn) -> None:
+    """Run inside `engine.begin()` via `run_sync`. Idempotently creates
+    the `chunks_fts` virtual table and its three sync triggers.
+
+    Currently SQLite-only. On Postgres this is a no-op; the BM25-side
+    of hybrid retrieval will be ported to `tsvector` in the Postgres
+    migration (Phase 3 decision A.7)."""
+    from sqlalchemy import text
+
+    from backend.storage.schema import CHUNKS_FTS_DDL
+
+    # FTS5 is a SQLite extension. On other dialects we skip — the
+    # Postgres path will add `tsvector` instead.
+    dialect_name = sync_conn.dialect.name
+    if dialect_name != "sqlite":
+        logger.debug(
+            "_apply_pending_fts_setup: skipping on dialect=%s", dialect_name,
+        )
+        return
+
+    for object_name, ddl in CHUNKS_FTS_DDL:
+        existing = sync_conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE name = :name"
+        ), {"name": object_name}).first()
+        if existing is not None:
+            continue
+        sync_conn.execute(text(ddl))
+        logger.info(
+            "Phase 4 M.1 migration: created FTS5 object %s", object_name,
         )
 
 

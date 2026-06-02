@@ -12,9 +12,9 @@ the chunks table and its junctions.
 
 from __future__ import annotations
 
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, text
 
-from backend.storage.models import Chunk, ChunkAttachment, ChunkInsert
+from backend.storage.models import Chunk, ChunkAttachment, ChunkInsert, ChunkWithScore
 from backend.storage.repositories.base import BaseRepository
 from backend.storage.schema import (
     captures,
@@ -101,6 +101,80 @@ class ChunkRepository(BaseRepository):
             .where(chunks.c.id.in_(chunk_ids))
         )
         return [_row_to_chunk(row) for row in result]
+
+    # ---- Phase 4 M.1 — BM25 full-text retrieval ----------------------
+
+    async def search_by_bm25(
+        self,
+        query: str,
+        *,
+        user_id: int,
+        limit: int = 20,
+    ) -> list[ChunkWithScore]:
+        """Full-text BM25 search over `chunks.text` via the FTS5
+        virtual table `chunks_fts`. Phase 4 M.1 — paired with Chroma's
+        vector search in M.2 to form the hybrid retrieval pipeline.
+
+        Tenant-isolated via the JOIN to `captures` on `user_id` —
+        chunks belonging to other users cannot surface in this user's
+        results.
+
+        Score convention: SQLite's `bm25()` function returns negative
+        values by convention (lower = better). We flip the sign before
+        returning so `ChunkWithScore.score` follows the HIGHER-is-better
+        convention, which matches what callers expect when fusing with
+        a vector-similarity ranker (M.2 RRF) or sorting for display.
+
+        Empty / whitespace-only queries return [] without touching the
+        DB — FTS5's MATCH would error on a blank query and the caller
+        gets a cleaner contract.
+
+        Raw SQL via `text()` because SQLAlchemy Core doesn't model the
+        FTS5 `MATCH` operator. Parameters are still bound — no string
+        interpolation of `query` into the SQL.
+        """
+        if not query or not query.strip():
+            return []
+        if limit <= 0:
+            return []
+        sql = text(
+            """
+            SELECT
+                c.id            AS id,
+                c.capture_id    AS capture_id,
+                c.chunk_index   AS chunk_index,
+                c.text          AS text,
+                c.source_kind   AS source_kind,
+                c.embedding     AS embedding,
+                bm25(chunks_fts) AS bm25_score
+            FROM chunks_fts
+            JOIN chunks   AS c   ON c.id = chunks_fts.rowid
+            JOIN captures AS cap ON cap.id = c.capture_id
+            WHERE chunks_fts MATCH :query
+              AND cap.user_id = :user_id
+            ORDER BY bm25(chunks_fts)
+            LIMIT :limit
+            """
+        )
+        result = await self.session.execute(
+            sql,
+            {"query": query, "user_id": user_id, "limit": limit},
+        )
+        out: list[ChunkWithScore] = []
+        for row in result:
+            chunk = Chunk(
+                id=row.id,
+                capture_id=row.capture_id,
+                chunk_index=row.chunk_index,
+                text=row.text,
+                source_kind=row.source_kind,
+                embedding=row.embedding,
+            )
+            # SQLite returns bm25() as a non-positive float (lower =
+            # better). Flip the sign so higher = better, matching the
+            # ChunkWithScore convention.
+            out.append(ChunkWithScore(chunk=chunk, score=-float(row.bm25_score)))
+        return out
 
     # ---- Junction-table operations -----------------------------------
 

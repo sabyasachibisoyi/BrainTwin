@@ -158,6 +158,22 @@ class CaptureWithEnrichment:
 
 
 @dataclass(frozen=True)
+class ChunkWithScore:
+    """A chunk paired with a retrieval score (Phase 4 M.1).
+
+    Returned by `ChunkRepository.search_by_bm25` and (eventually) the
+    vector-search seam, so the Phase 4 retrieval pipeline can fuse
+    rankings by score regardless of which ranker produced them.
+
+    Score convention: HIGHER is better. SQLite's `bm25()` function
+    returns negative values by convention (lower = better match);
+    `search_by_bm25` flips the sign before constructing this dataclass
+    so callers don't have to special-case the comparison direction."""
+    chunk: Chunk
+    score: float
+
+
+@dataclass(frozen=True)
 class ChunkAttachment:
     """Used by ChunkRepository.attach_entities() to record one mention
     of an entity inside a chunk, with confidence and offset.
@@ -181,4 +197,5 @@ __all__ = [
     "Entity",
     "CaptureWithEnrichment",
     "ChunkAttachment",
+    "ChunkWithScore",
 ]
