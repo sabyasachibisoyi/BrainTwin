@@ -9,7 +9,13 @@ pydantic-settings
 
 # LLM & AI
 anthropic
-sentence-transformers
+# Intel macOS only ships torch wheels up to 2.2.2 (compiled against numpy 1.x).
+# Pin numpy<2 to keep torch importable, and cap transformers/sentence-transformers
+# at the last releases that still support torch 2.2.
+numpy<2
+torch==2.2.2
+transformers<5
+sentence-transformers<4
 
 # Vector Database
 chromadb
