@@ -175,6 +175,22 @@ class ConversationStore:
     def save(self, entry: _ConversationEntry) -> None:
         entry.updated_at = time.monotonic()
         self._entries[entry.conversation_id] = entry
+        self._evict_expired()
+
+    def _evict_expired(self) -> None:
+        """Drop entries idle past the TTL. Runs on every save so
+        abandoned conversations (user closed the tab and never sent a
+        follow-up) don't accumulate forever — get()'s lazy eviction
+        only fires for the key being read, which never reaches the
+        abandoned ones. The just-saved entry is safe: its updated_at is
+        `now`, so it sits above the cutoff. O(n) per save, n tiny for a
+        single user."""
+        cutoff = time.monotonic() - self._ttl
+        stale = [
+            cid for cid, e in self._entries.items() if e.updated_at < cutoff
+        ]
+        for cid in stale:
+            del self._entries[cid]
 
     def new_id(self) -> str:
         return str(uuid.uuid4())
@@ -313,11 +329,19 @@ class Recaller:
             # LLM degraded — fall back to retrieval order.
             rerank = self._fallback_rerank(candidates)
 
+        # Compose the ordered result blocks BEFORE the confidence gate
+        # so the gate (and the headline confidence) operate on the
+        # candidate the user will actually see at the top — results[0].
+        # V.7 is explicit that it's the TOP-1 confidence that decides
+        # no-match; taking max() across all candidates would let a
+        # low-confidence top result slip through just because some
+        # lower-ranked candidate happened to score higher, and would
+        # report a headline confidence that doesn't belong to the
+        # result shown first.
+        results = self._compose_results(candidates, rerank, summaries)
+
         # ---- Step 7: confidence threshold (V.7) ------------------
-        top_confidence = max(
-            (r["confidence"] for r in rerank["ranked_results"]),
-            default=0.0,
-        )
+        top_confidence = results[0].confidence if results else 0.0
         no_match = rerank.get("no_match", False) or top_confidence < self._threshold
 
         if no_match:
@@ -330,7 +354,6 @@ class Recaller:
             )
 
         # ---- Step 8: build response + save conversation ----------
-        results = self._compose_results(candidates, rerank, summaries)
         answer = rerank.get("brief_answer") or self._fallback_brief_answer(results)
 
         response = RecallResponse(
