@@ -664,6 +664,19 @@ Explicitly out of scope, with the rationale for each:
 - **Result diversification beyond per-capture.** No diversity rules
   on topic or recency for v1. If retrieval feels monotonous in
   practice, revisit.
+- **Eval harness + Langfuse tracing.** The whole evaluation discipline —
+  golden query dataset, Recall@1 / Recall@6 / MRR metrics, LLM-as-judge
+  graders, Langfuse self-hosted for production traces — is deferred
+  until after Phase 4 ships and we've used the product against real
+  queries for a couple of weeks. Building eval infrastructure against
+  a system you haven't used is premature optimization; the golden
+  queries you write cold-staring at the corpus aren't the queries
+  you'll actually ask. Once Phase 4 is in daily use, the failure
+  modes will tell us what to measure. Plan: stand up the local eval
+  harness + Langfuse self-hosted as **Phase 4.0.5** before any prompt
+  iteration that costs real Sonnet tokens; migrate to LangSmith when
+  the system moves to cloud. See the end of `docs/phase4.0.5-eval-design.md`
+  (to be written) for the locked decisions.
 
 ---
 
@@ -705,6 +718,11 @@ read these.
 
 - `phase4-vague-recall-smoke-test.md` — the numbered verification
   flow (mirror of `phase2-smoke-test.md`, `phase3-smoke-test.md`)
+- `phase4.0.5-eval-design.md` — the deferred evaluation discipline.
+  Golden query dataset shape, Recall@1 / Recall@6 / MRR metrics,
+  LLM-as-judge graders, Langfuse self-hosted setup. Written *after*
+  Phase 4.0 is in daily use so the metrics calibrate against real
+  failure modes, not imagined ones.
 - `phase4.1-quizzes-design.md` — design notes for use case A once we
   have a month of real recall usage
 - `phase4.2-clue-game-design.md` — design notes for use case C,

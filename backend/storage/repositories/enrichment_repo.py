@@ -92,6 +92,48 @@ class EnrichmentRepository(BaseRepository):
         )
         return {row.capture_id for row in result}
 
+    async def get_summaries_by_capture_ids(
+        self,
+        capture_ids: list[str],
+        *,
+        user_id: int,
+    ) -> dict[str, Optional[str]]:
+        """Bulk fetch the most-recent enrichment summary per capture_id,
+        tenant-checked. Returns a mapping from capture_id to the summary
+        string (or None when the enrichment exists but has no summary).
+        Capture_ids without any enrichment row simply don't appear in
+        the result.
+
+        Phase 4 M.3 — Recaller calls this once per /recall to attach
+        summaries to the candidate captures before the Sonnet rerank
+        prompt and the response shape. One bulk SQL call is cheaper
+        than N round-trips on the hot path.
+
+        Multiple enrichments per capture (Phase 5+ re-enrichment) →
+        we keep the most recent one by `enriched_at` desc. Python-side
+        dedup is simpler than SQL's window functions here and the
+        candidate count is small (~6).
+        """
+        if not capture_ids:
+            return {}
+        result = await self.session.execute(
+            select(
+                enrichments.c.capture_id,
+                enrichments.c.summary,
+                enrichments.c.enriched_at,
+            )
+            .join(captures, enrichments.c.capture_id == captures.c.id)
+            .where(captures.c.user_id == user_id)
+            .where(enrichments.c.capture_id.in_(capture_ids))
+            .order_by(enrichments.c.enriched_at.desc())
+        )
+        out: dict[str, Optional[str]] = {}
+        for row in result:
+            # First row per capture_id wins (most-recent-first ordering).
+            if row.capture_id not in out:
+                out[row.capture_id] = row.summary
+        return out
+
     async def count_enriched_captures_by_user(self, *, user_id: int) -> int:
         """Number of distinct captures the user has at least one
         enrichment row for. Used by /stats — replaces the JSONL scan
