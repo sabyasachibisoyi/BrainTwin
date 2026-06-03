@@ -484,6 +484,72 @@ class TestNoMatch:
         assert "closest match" in response.answer.lower()
 
 
+# ---- Confidence gate: top-1, not max (bugfix) ------------------------
+
+class TestConfidenceGate:
+    """V.7 decides no-match on the TOP-1 candidate's confidence, and the
+    headline confidence must belong to the result shown first — not the
+    max across all candidates."""
+
+    def test_top1_below_threshold_is_no_match_even_if_lower_rank_higher(
+        self, no_summaries,
+    ):
+        """The LLM ranks cap-a first at 0.4 (weak) but cap-b second at
+        0.8. The gate must read the top result (0.4 < 0.6) → no_match,
+        NOT max(0.4, 0.8)=0.8 which would wrongly pass."""
+        cands = [
+            _make_candidate(capture_id="cap-a"),
+            _make_candidate(capture_id="cap-b"),
+        ]
+        retrieval = _StubRetrievalService({"x": cands})
+        llm = _StubLLMClient([
+            {
+                "ranked_results": [
+                    {"capture_id": "cap-a", "confidence": 0.4,
+                     "why_this_matches": "weak"},
+                    {"capture_id": "cap-b", "confidence": 0.8,
+                     "why_this_matches": "stronger but ranked lower"},
+                ],
+                "brief_answer": "I think it's cap-a.",
+                "no_match": False,  # LLM says match; gate must override
+            },
+            # Closest-miss framing call (proves we took the no-match path).
+            {"answer": "Not sure this is it, but here's the closest."},
+        ])
+        r = _make_recaller(retrieval=retrieval, llm=llm)
+
+        response = asyncio.run(r.recall(query="x", user_id=1))
+        assert response.no_match is True
+        assert len(llm.calls) == 2  # rerank + closest-miss framing
+
+    def test_headline_confidence_is_top_result_not_max(self, no_summaries):
+        """Both clear the threshold; cap-a is ranked first at 0.7,
+        cap-b second at 0.95. The response confidence and the first
+        result must both be 0.7 (the shown top), not 0.95."""
+        cands = [
+            _make_candidate(capture_id="cap-a"),
+            _make_candidate(capture_id="cap-b"),
+        ]
+        retrieval = _StubRetrievalService({"x": cands})
+        llm = _StubLLMClient([{
+            "ranked_results": [
+                {"capture_id": "cap-a", "confidence": 0.7,
+                 "why_this_matches": "a"},
+                {"capture_id": "cap-b", "confidence": 0.95,
+                 "why_this_matches": "b"},
+            ],
+            "brief_answer": "I think it's cap-a.",
+            "no_match": False,
+        }])
+        r = _make_recaller(retrieval=retrieval, llm=llm)
+
+        response = asyncio.run(r.recall(query="x", user_id=1))
+        assert response.no_match is False
+        assert response.results[0].capture_id == "cap-a"
+        assert response.confidence == pytest.approx(0.7)
+        assert response.results[0].confidence == pytest.approx(0.7)
+
+
 # ---- LLM failure degradation -----------------------------------------
 
 class TestLLMFailure:
@@ -582,6 +648,29 @@ class TestConversationStore:
         assert store.get("abc") is None
         # And the stale entry was evicted from the dict.
         assert store.size() == 0
+
+    def test_save_evicts_abandoned_entries_past_ttl(self, monkeypatch):
+        """An abandoned conversation (never read again) must still be
+        evicted. save() sweeps expired entries so they don't accumulate
+        forever — get()'s lazy eviction never reaches an unread key."""
+        store = ConversationStore(ttl_seconds=10)
+        store.save(_ConversationEntry(
+            conversation_id="old", last_query="x", last_candidates=[],
+        ))
+        assert store.size() == 1
+
+        # Fast-forward past the TTL, then save a fresh entry. Nobody
+        # ever calls get("old") — only the save() sweep can drop it.
+        original = time.monotonic
+        fake_now = original() + 11
+        monkeypatch.setattr(time, "monotonic", lambda: fake_now)
+
+        store.save(_ConversationEntry(
+            conversation_id="new", last_query="y", last_candidates=[],
+        ))
+        assert store.size() == 1
+        assert store.get("new") is not None
+        assert "old" not in store._entries
 
     def test_get_returns_entry_inside_ttl(self):
         store = ConversationStore(ttl_seconds=10)
