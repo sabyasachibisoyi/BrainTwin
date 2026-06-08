@@ -617,13 +617,41 @@ prompt design.
 - Returns a `RecallResponse` dataclass with the exact shape of S.3
 - Prompts and JSON schemas live in `backend/agent/prompts.py`
 
-### M.4 — POST /recall endpoint
+### M.4 — POST /recall endpoint ✅ built
 
-- Add to `backend/main.py`
-- Thin handler over `Recaller`
-- Default user (Sabya, `user_id=1`) for now; multi-user auth lands
-  with use case A
-- Same FastAPI pattern as `/capture`
+- Added `RecallPayload` (Pydantic) — `query: str`, optional
+  `conversation_id: str | None`. Empty body / missing `query` → 422
+  via Pydantic; empty-but-present `query=""` reaches Recaller which
+  returns `no_match` cleanly.
+- New `_recaller` module-level singleton in `backend/main.py`,
+  constructed in `_startup` on top of the shared `LLMClient` + a
+  fresh `RetrievalService()` + the default in-memory
+  `ConversationStore`. Mirrors the existing `_llm_client` pattern.
+- `_shutdown` drops `_recaller` first (it holds the LLM client by
+  reference), then closes the LLM client and SQL pool as before.
+- `POST /recall` is a thin handler: pulls the Recaller singleton,
+  calls `recaller.recall(query, user_id=DEFAULT_USER_ID,
+  conversation_id=...)`, returns `response.to_dict()`. Single-user
+  for v1 — DEFAULT_USER_ID is hard-coded per B.5.4 until multi-user
+  auth lands with use case A.
+- Missing API key path: `_recaller` stays None, `/recall` returns
+  **503** with a message pointing the operator at `.env`. The
+  `/capture` path keeps working so ingestion isn't blocked by a
+  broken agent layer.
+- The legacy `/ask` placeholder was removed — callers that hit it
+  now get 404 so they update.
+- Tests: `tests/test_recall_endpoint.py` (FastAPI TestClient, stub
+  Recaller injected via `monkeypatch.setattr(main_mod, "_recaller",
+  stub)`):
+    * happy-path response shape covers all U.2 fields
+    * `conversation_id` round-trips through the body / Recaller / response
+    * missing-conversation_id case lets the Recaller mint and surface it
+    * no-match response passes through with correct flag + courtesy result
+    * 503 when Recaller singleton is None
+    * 422 on missing / empty body
+    * empty-string `query` reaches Recaller (Recaller, not FastAPI,
+      owns that no-match)
+    * legacy `/ask` route is 404
 
 ### M.5 — Chrome extension Remember tab
 

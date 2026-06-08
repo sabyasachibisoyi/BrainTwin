@@ -14,6 +14,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from backend.agent.recaller import Recaller
+from backend.agent.retrieval import RetrievalService
 from backend.capture.processor import CaptureInput, process
 from backend.config import settings
 from backend.knowledge.enrichment_worker import (
@@ -79,6 +81,20 @@ def _get_llm_client() -> LLMClient | None:
     return _llm_client
 
 
+# ---- Phase 4 M.4: shared Recaller (constructed at startup) ----------
+#
+# The Recaller wraps RetrievalService + LLMClient + an in-memory
+# ConversationStore. We construct one per process and reuse it across
+# requests so the conversation store is shared (so a follow-up turn
+# can find its prior). None when the LLM client is missing — `/recall`
+# returns 503 in that case rather than crash with an unbound singleton.
+_recaller: Recaller | None = None
+
+
+def _get_recaller() -> Recaller | None:
+    return _recaller
+
+
 def _log_failure(*, source: str, reason: str, payload: dict[str, Any]) -> None:
     """Append a structured capture-phase failure row to data/capture_failures.jsonl.
 
@@ -123,8 +139,17 @@ class CapturePayload(BaseModel):
     capture_id: str | None = None
 
 
-class QuestionPayload(BaseModel):
-    question: str
+class RecallPayload(BaseModel):
+    """Body for `POST /recall` — vague-recall search.
+
+    - `query` is what the user typed (free-form natural language)
+    - `conversation_id` is optional; when present, this turn is treated
+      as a refinement on the prior turn's candidate pool instead of a
+      fresh search (per docs/phase4-vague-recall-design.md U.3)
+    """
+
+    query: str
+    conversation_id: str | None = None
 
 
 # --- Routes ---
@@ -227,11 +252,12 @@ async def _startup() -> None:
             DEFAULT_USER_ID, e,
         )
 
-    global _llm_client
+    global _llm_client, _recaller
     if not settings.anthropic_api_key:
         logger.warning(
-            "ANTHROPIC_API_KEY is empty — Phase 2 enrichment is DISABLED. "
-            "Captures will still be persisted; set the key in .env to enable."
+            "ANTHROPIC_API_KEY is empty — Phase 2 enrichment AND Phase 4 "
+            "recall are DISABLED. Captures will still be persisted; set "
+            "the key in .env to enable."
         )
         return
     try:
@@ -239,13 +265,33 @@ async def _startup() -> None:
     except PermanentLLMError as e:
         logger.error("LLM client init failed: %s", e)
         return
+
+    # Phase 4 M.4 — build the Recaller singleton on top of the shared
+    # LLM client. RetrievalService is stateless; its embedder and vector
+    # store are lazy singletons inside the storage layer, so we don't
+    # need any wiring beyond the default constructor here. Recaller
+    # owns the in-memory ConversationStore (lost on process restart by
+    # design, U.3).
+    try:
+        _recaller = Recaller(
+            retrieval=RetrievalService(),
+            llm_client=_llm_client,
+        )
+        logger.info("Recaller initialized — /recall is live")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Recaller init failed (/recall will return 503): %s", e,
+        )
+
     # Crash recovery — re-queue work that was in flight when we died.
     await _recover_unenriched()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    global _llm_client
+    global _llm_client, _recaller
+    # Drop the Recaller first — it holds the LLM client by reference.
+    _recaller = None
     if _llm_client is not None:
         try:
             await _llm_client.aclose()
@@ -381,22 +427,55 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
     }
 
 
-@app.post("/ask")
-async def ask_agent(payload: QuestionPayload):
-    """Ask the BrainTwin agent a question."""
-    # TODO: Phase 4 — wire up agent
-    # 1. Semantic search in ChromaDB
-    # 2. Entity search in SQLite
-    # 3. Merge and deduplicate results
-    # 4. Build RAG prompt with knowledge context
-    # 5. Call Claude API
-    # 6. Return answer
+@app.post("/recall")
+async def recall(payload: RecallPayload):
+    """Phase 4 M.4 — vague-recall search (use case B).
 
-    return {
-        "question": payload.question,
-        "answer": "Agent not yet connected. Build Phase 4 to enable this.",
-        "sources": [],
-    }
+    Pipeline (delegated to Recaller — see backend/agent/recaller.py):
+      1. Hybrid retrieval (Chroma vector + SQLite BM25) via the shared
+         RetrievalService.
+      2. Reciprocal-rank fusion + per-capture diversification.
+      3. Sonnet re-rank pass that picks the most likely answer, attaches
+         confidence + reasoning per candidate, composes the brief
+         conversational answer.
+      4. Confidence threshold (V.7) — top-1 below 0.6 → no_match
+         response with the closest-miss courtesy framing.
+      5. Conversation state — when `conversation_id` is present, the
+         query is treated as a refinement on the prior candidate pool
+         instead of a fresh search (U.3). A first call without
+         `conversation_id` mints a uuid and returns it; subsequent
+         calls with that uuid get layered as refinements.
+
+    Returns the RecallResponse shape locked by docs/phase4-vague-recall-design.md
+    S.3 (answer, confidence, results, conversation_id, no_match).
+
+    Errors:
+      - 503 if the Recaller wasn't initialized (no ANTHROPIC_API_KEY).
+        The capture path stays available so the user can keep ingesting
+        content while the agent layer is down.
+      - 422 on missing `query` (FastAPI's default Pydantic validation).
+      - 5xx if something raises out of the Recaller — which it
+        shouldn't, since recall() catches and degrades. If it does
+        happen, that's a bug worth seeing.
+
+    Tenancy: single-user for v1 — every call lands at DEFAULT_USER_ID
+    (Sabya per B.5.4). Multi-user auth lands with use case A (Phase 4.1+).
+    """
+    recaller = _get_recaller()
+    if recaller is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Recall agent not initialized — set ANTHROPIC_API_KEY in "
+                ".env and restart the backend."
+            ),
+        )
+    response = await recaller.recall(
+        query=payload.query,
+        user_id=DEFAULT_USER_ID,
+        conversation_id=payload.conversation_id,
+    )
+    return response.to_dict()
 
 
 @app.get("/stats")
