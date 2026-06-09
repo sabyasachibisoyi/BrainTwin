@@ -1,6 +1,17 @@
 # Phase 4.0.6 — Cloud Deployment (AWS)
 
-> **Status as of 2026-06-04 — DESIGN IN REVIEW.**
+> **Status as of 2026-06-09 — DESIGN REVISED AFTER REVIEW.**
+>
+> Revision summary (2026-06-09 senior-eng review): budget reworked
+> around the real post-July-2025 AWS credit rules (Paid Plan at
+> signup, ~12-month runway, NOT 23); server-side auth pulled forward
+> into M.1 so the API is never publicly exposed unauthenticated;
+> Telegram bot added as an explicit deployed service (it was the #1
+> pain point but had no deploy milestone); instance bumped to
+> t4g.small (1 GiB was the riskiest call in v1 of this doc);
+> docker-compose locked as the deployment unit; litestream/S3
+> lifecycle conflict fixed; Cloudflare TLS mode pinned; SSH replaced
+> with SSM Session Manager; CDK locked as the IaC choice.
 >
 > Phase 4.0 (Vague Recall) shipped on the laptop. Before going to
 > Phase 4.0.5 (Eval) or Phase 4.1 (Synthesis Quizzes), this slice
@@ -31,9 +42,12 @@ Three concrete pains drove this phase:
 1. **Telegram forwards get lost when the laptop sleeps.** The bot
    polls Telegram from the laptop, so a closed lid = a silent
    capture outage.
-2. **Recall is only usable when the laptop is on** — i.e., when the
-   user is in front of the laptop, defeating most of the
-   memory-prosthetic value.
+2. **The backend is only up when the laptop is.** Honest framing:
+   the Chrome extension lives on the laptop anyway, so cloud hosting
+   alone doesn't make *recall* laptop-independent — that lands with
+   M.6 (Telegram `/recall`). The headline win today is capture
+   continuity; a stable backend is the prerequisite for phone-side
+   recall later.
 3. **Phase 4.0.5 (eval) is impossible to build well against a
    laptop-hosted backend.** The eval discipline needs a stable
    target so test runs are comparable; laptop sleeps / restarts
@@ -58,11 +72,19 @@ Locked because:
   on a resume to every hiring manager at a product company —
   AWS is the default cloud at startups, hyperscalers, and most
   global tech employers.
-- **Generous combined credits.** The new Free Plan (post-July 2025
-  restructure) gives **$200 in credits over 6 months**. The
-  GitHub Student Pack adds **~$100 more** in AWS credits when
-  approved. Total: ~$300 of runway, enough to host BrainTwin's
-  v1 architecture for ~12 months at $0 out-of-pocket.
+- **Real credits, with real fine print.** The post-July-2025
+  restructure gives new accounts **$100 at signup + up to $100 more
+  for completing onboarding activities**. Critical rule verified
+  2026-06-09: on the **Free Plan**, the account is **auto-closed
+  after 6 months or when credits run out — whichever comes first**
+  (90-day grace, then resources deleted, unused credits lost).
+  That's unacceptable for a system that must stay up. **Decision:
+  sign up on the Paid Plan** — the same $200 in credits apply,
+  the account persists, and credits expire ~12 months after
+  issuance. Realistic free runway: **~12 months**, not 23.
+  The GitHub Student Pack's AWS benefit historically routed through
+  AWS Educate, which stopped general credit grants in 2023 —
+  **do not count that money until it's visible in the account.**
 - **Always-free services on top.** Lambda 1M req/month, DynamoDB
   25GB, CloudWatch metrics — perpetual, no expiry, on top of the
   $200.
@@ -106,17 +128,20 @@ SQLite-on-EBS**. The Phase 3 design already keeps the schema
 Postgres-ready, so the SQLite-vs-RDS choice can flip later without
 schema changes.
 
-### 3.1 Compute: EC2 `t3.micro` (single instance, all-in-one)
+### 3.1 Compute: EC2 `t4g.small` (single instance, all-in-one)
 
 | Aspect | Decision |
 |--------|----------|
-| Instance type | `t3.micro` (2 vCPU burstable, 1 GiB RAM) |
+| Instance type | `t4g.small` (2 vCPU Graviton/ARM, 2 GiB RAM) |
 | Region | `ap-south-1` (Mumbai) |
 | AZ | Single AZ — no multi-AZ until use case A goes multi-user |
-| OS | Amazon Linux 2023 |
-| Why not ECS Fargate | Fargate is NOT in the free tier — costs ~$9/month minimum. EC2 t3.micro at ~$7.50/month after free credits is cheaper AND the "I ran a containerized FastAPI app on EC2 + Docker" bullet is still solid resume material. |
-| Why not t3.small | Doubles cost (~$15/month). 1 GiB is tight but we have swap (§3.6) to compensate. |
-| RAM strategy | 2 GiB swap file on EBS. Lets sentence-transformers + Chroma + whisper.cpp coexist; rare swap-thrash is acceptable for single-user load. |
+| OS | Amazon Linux 2023 (arm64) |
+| Why not ECS Fargate | Fargate is NOT in the free tier — costs ~$9/month minimum. A single EC2 box is cheaper AND the "I ran a containerized FastAPI app on EC2 + Docker" bullet is still solid resume material. |
+| Why not t3.micro (1 GiB) | This was v1 of this doc and it was the riskiest call in it. sentence-transformers pulls in PyTorch (~0.5–1 GB RSS with the model resident), Chroma keeps its HNSW index in RAM, and whisper.cpp spikes during transcription. On 1 GiB that means living in swap on EBS and an eventual OOM-kill of uvicorn mid-transcription. Swap is a strategy for occasional spikes, not for a resident model. Graviton pricing makes t4g.small land within ~$1–2/month of t3.micro in Mumbai — double the RAM for roughly the same money. |
+| ARM consequence | Docker image built for `linux/arm64` via `docker buildx`. Everything in the stack (torch CPU wheels, sentence-transformers, whisper.cpp, ffmpeg) has aarch64 support. Cross-building from the laptop is itself a nice portfolio detail. |
+| CPU credit mode | `standard`, NOT `unlimited` — whisper runs will burn burst credits, and unlimited mode silently bills overages. Better to throttle than to surprise-bill. |
+| RAM strategy | 2 GiB physical + 2 GiB swap file on EBS as headroom, not as the plan. |
+| App runtime constraint | **uvicorn runs with exactly 1 worker.** `ConversationStore` is in-process memory — at `--workers 2` multi-turn refinement breaks intermittently (the refinement turn lands on the other worker). Single-user load doesn't need more; this constraint is load-bearing and documented here so nobody "tunes" it away. |
 
 ### 3.2 Database: SQLite on EBS (not RDS — for now)
 
@@ -134,20 +159,31 @@ schema changes.
 |--------|----------|
 | Bucket name | `braintwin-prod-{account-id}` (or single-user equivalent) |
 | Versioning | Enabled — protects against accidental delete |
-| Lifecycle | Move backups to Glacier IA after 30 days, delete after 180 days |
-| What goes here | Litestream's SQLite WAL stream, image uploads, the Chroma index nightly snapshot |
+| Lifecycle | **Scoped by prefix.** Glacier-after-30-days / delete-after-180 applies ONLY to the nightly tarball prefixes (`chroma/`, `images/`). The `litestream/` prefix is **excluded** — litestream needs its generations instantly readable or `litestream restore` breaks (or pays Glacier retrieval); litestream's own retention settings manage that prefix. |
+| What goes here | Litestream's SQLite WAL stream (own prefix, own retention), image uploads, the Chroma index nightly snapshot |
 | Why not EFS | EFS is overkill for single-instance access. S3 is cheaper for backup-shaped workloads. |
+
+### 3.3.1 Container registry: ECR (private)
+
+| Aspect | Decision |
+|--------|----------|
+| Registry | One private ECR repo, `braintwin` |
+| Image size | Expect 2–4 GB with torch + ffmpeg + whisper.cpp. Use the **CPU-only torch wheel** (`--index-url https://download.pytorch.org/whl/cpu`) to roughly halve it. |
+| Cost | $0.10/GB-month storage — pennies, but it's in the budget table now (it was missing in v1 of this doc). |
+| Hygiene | Lifecycle policy: keep last 5 images, expire untagged. `docker system prune` on the host periodically — image layers accumulate on the 30 GiB EBS volume. |
 
 ### 3.4 Networking & HTTPS
 
 | Aspect | Decision |
 |--------|----------|
 | Subnet | Single public subnet — NO private subnet, NO NAT Gateway. NAT Gateway is $32/month and would dominate the bill. |
-| Security group | Allow inbound 22 (SSH from operator IP only), 80, 443. Allow all outbound. |
+| Shell access | **SSM Session Manager — NO port 22, no SSH keypair at all.** The instance role already exists for Parameter Store; Session Manager rides the same agent. Zero open SSH ports is a stronger security posture (and resume bullet) than "SSH from operator IP". |
+| Security group | Inbound: 80 + 443 only. **Until M.7 cutover: restricted to the operator's IP.** After M.7: restricted to **Cloudflare's published IP ranges** (so nobody bypasses Cloudflare and hits the origin directly). Outbound: all. |
 | Public IP | **Elastic IP** attached to the instance (free as long as it's attached; $4/month if unattached and idle). |
-| HTTPS terminator | **Caddy** running on the EC2 box itself. Auto-renews Let's Encrypt certs. Reverse-proxies to the FastAPI container. |
+| HTTPS terminator | **Caddy** on the box. Reverse-proxies to the FastAPI container. |
+| TLS mode (pinned) | Cloudflare **proxied (orange-cloud)** + SSL mode **Full (strict)**. Because the origin sits behind the proxy, Caddy uses the **DNS-01 challenge via a Cloudflare API token** (scoped to this zone) instead of HTTP-01. This combination is what actually delivers the DDoS-protection claim — DNS-only (grey-cloud) would not. |
 | Why not ALB | ALB is $16/month minimum. For a single backend on a single box, Caddy + Let's Encrypt is functionally equivalent and free. |
-| DNS | **Cloudflare** in front (free tier). Gives DDoS protection + DNS + caching. Domain via Namecheap (~$10/year, free via Student Pack). |
+| DNS | **Cloudflare** free tier. Domain via Namecheap (~$10/year, free via Student Pack). |
 | Domain | `braintwin.app` or `braintwin.me` — TBD when Student Pack lands. |
 
 ### 3.5 Backups: litestream → S3
@@ -173,6 +209,13 @@ re-embed from the captures table (which is the source of truth).
 SHA256 hash (per Phase 2 design). Sync `data/images/` to S3 nightly;
 re-derive from URL fetch if a single file is lost.
 
+**3.5.3 EBS snapshots (belt-and-suspenders).** Daily EBS snapshot
+via **Data Lifecycle Manager**, retain 7. One CDK construct,
+~free at this volume size, and it covers everything litestream
+doesn't: Chroma between nightlies, the whisper model, Docker state,
+host config. Litestream remains the primary recovery path; the
+snapshot is the "I broke the box itself" path.
+
 ### 3.6 Secrets management: SSM Parameter Store (NOT Secrets Manager)
 
 | Aspect | Decision |
@@ -188,8 +231,10 @@ re-derive from URL fetch if a single file is lost.
 | Aspect | Decision |
 |--------|----------|
 | Mechanism | Static API token in `Authorization: Bearer <token>` header |
+| **Server side ships FIRST** | The FastAPI dependency that *checks* the token is an **M.1 deliverable** (~20 lines, testable locally with pytest), NOT an afterthought of the client cutover. v1 of this doc only had clients *sending* the header (M.7) with no milestone enforcing it server-side — which would have meant a publicly exposed `/recall` from M.3 to M.7: an open proxy to the Anthropic key and a readable corpus. Scanners find fresh public IPs within hours. Sequencing rule: **the API is never reachable from the open internet without auth.** Belt-and-suspenders: the security group stays operator-IP-only until M.7 anyway (§3.4). |
+| CORS at cutover | Tighten `allow_origins` from `*` to `chrome-extension://<extension-id>` and ensure `Authorization` is in `allow_headers` — the bearer header makes requests non-simple, so preflights must pass. |
 | Storage | Token generated once, stored in SSM Parameter Store, distributed to Chrome extension + Telegram bot via env config |
-| Why not OAuth | Multi-user OAuth is overkill for single-user v1. Designing speculative auth is one of the easier ways to waste a week. When use case A goes live, we swap this out — the seam already lives in `/recall`'s `user_id=DEFAULT_USER_ID` line, and adding a FastAPI auth dependency is a one-file change. |
+| Why not OAuth | Multi-user OAuth is overkill for single-user v1. Designing speculative auth is one of the easier ways to waste a week. When use case A goes live, we swap this out — the seam already lives in `/recall`'s `user_id=DEFAULT_USER_ID` line. |
 | Token rotation | Manual for now. Operator runs a script that generates a new token + updates SSM + redistributes to clients. Phase 5+ automates. |
 
 ### 3.8 Monitoring & cost alerts
@@ -197,7 +242,7 @@ re-derive from URL fetch if a single file is lost.
 | Aspect | Decision |
 |--------|----------|
 | App logs | CloudWatch Logs, log group `/braintwin/prod/app`. 5 GiB free, well within budget. |
-| Metrics | Built-in EC2 metrics (CPU, network) + custom CloudWatch metrics for `/recall` request count + latency (already structured in main.py logs) |
+| Metrics | Built-in EC2 metrics (CPU, network) are free. For `/recall` request count + latency, query the structured app logs with **CloudWatch Logs Insights** instead of publishing custom metrics — custom metrics are $0.30/metric/month after the first 10, and at single-user volume Insights queries over the logs we already ship answer the same questions for $0. |
 | Health check | A simple `GET /health` poll from an external uptime monitor (UptimeRobot free tier) — alerts to email if down |
 | **Budget alerts** | **CRITICAL.** Set up via AWS Budgets at $50, $100, $150, $180 thresholds. Email alerts. Set within 5 minutes of account creation, before anything else. |
 | Anthropic spend cap | Set in Anthropic dashboard separately. $20/month hard cap for v1. |
@@ -209,12 +254,36 @@ Bundled inside the Dockerfile (§5.1) so they live in the container,
 not on the host. Whisper model (~250 MB) sits on the EBS volume so
 container restarts don't re-download it.
 
+### 3.10 Process model: docker-compose is the deployment unit
+
+v1 of this doc had two gaps here: the Telegram bot — the #1 pain
+point in §1 — had **no deploy milestone at all** (it's a separate
+`run_polling` process in `backend/telegram_bot/bot.py`, it does not
+start with uvicorn), and Caddy's home was left as "sidecar or host?"
+Both resolve the same way: **one `docker-compose.yml` on the EC2
+host defines every process on the box.**
+
+| Service | Image | Role |
+|---------|-------|------|
+| `app` | `braintwin` (ECR) | uvicorn, 1 worker (§3.1), port 8000 internal |
+| `bot` | same image, different command | `python -m backend.telegram_bot.bot` — Telegram long-polling |
+| `caddy` | `caddy:2` | TLS termination (DNS-01 via Cloudflare token), reverse-proxy → `app:8000` |
+| `litestream` | `litestream/litestream` | continuous WAL replication → S3 |
+
+All services `restart: unless-stopped`, env from SSM at boot.
+One image, one compose file, four processes — the runbook story is
+"the compose file IS the box's process tree." No multi-process
+containers, no supervisord.
+
 ---
 
 ## 4. Infrastructure as Code — Terraform vs CDK
 
-This is the most open decision in the doc; here's the honest case
-for each so we can pick.
+> **LOCKED 2026-06-09: AWS CDK with TypeScript.** The §4.3 analysis
+> held up in review; the §4.4 "do both" split is rejected as
+> overengineering for v1 (Terraform stays available as a later
+> standalone portfolio piece). The trade-off analysis below is kept
+> for the record.
 
 ### 4.1 The two real options
 
@@ -296,51 +365,77 @@ Terraform later as a follow-up portfolio piece**.
 
 Each step is its own milestone within Phase 4.0.6, in order.
 
-### 5.1 M.1 — Containerize the app (laptop-only, no cloud yet)
+### 5.1 M.1 — Containerize + server-side auth (laptop-only, no cloud yet)
 
-- Write `Dockerfile` that:
+- **Bearer-token auth dependency in FastAPI** (~20 lines): reads
+  `BACKEND_API_TOKEN` from env; applied to `/capture` and `/recall`;
+  `/health` stays open. If the env var is unset (local dev), auth is
+  disabled — cloud always sets it. pytest coverage: 401 without
+  header, 401 with wrong token, 200 with right token, /health open.
+  **This ships before any cloud resource exists** (§3.7 sequencing
+  rule).
+- Write `Dockerfile`:
   - Starts from `python:3.11-slim`
   - Installs whisper.cpp + yt-dlp + ffmpeg
+  - **CPU-only torch wheel** (`--index-url .../whl/cpu`) — halves image size
   - Installs Python deps from `requirements.txt`
   - Copies `backend/` + `scripts/`
-  - Runs `uvicorn backend.main:app --host 0.0.0.0 --port 8000`
-- Write `docker-compose.yml` for local testing with mounted volumes
+  - Default command: `uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 1`
+- Build for **`linux/arm64`** via `docker buildx` (target is t4g, §3.1);
+  verify it also runs on the laptop (amd64 or Apple Silicon) for local testing
+- Write `docker-compose.yml` with the §3.10 service set — `app` and
+  `bot` testable locally now; `caddy` + `litestream` slots filled in
+  M.4/M.5
 - Verify `pytest tests/` still passes inside the container
 - Add `.dockerignore` to keep image size sane
 
-**No cloud touched yet.** This is the unit of deployment, validated locally.
+**No cloud touched yet.** The compose file is the unit of deployment, validated locally.
 
 ### 5.2 M.2 — CDK scaffold (no deploy)
 
 - `npm init` + `cdk init app --language typescript` in a new `infra/` directory
-- Define the stack: VPC (default), Security Group, EC2 instance with user-data, EBS volume, Elastic IP, S3 bucket, SSM parameters, CloudWatch log group, IAM role attached to EC2
+- Define the stack: VPC (default), Security Group (80/443 from operator IP only — no port 22, §3.4), EC2 `t4g.small` with user-data (Docker + compose install, SSM agent), EBS volume, **DLM daily snapshot policy (§3.5.3)**, Elastic IP, S3 bucket with **prefix-scoped lifecycle rules (§3.3)**, **ECR repo (§3.3.1)**, SSM parameters, CloudWatch log group, IAM role (SSM Parameter Store read + Session Manager + ECR pull + S3 litestream prefix write)
+- No EC2 keypair resource exists in the stack — Session Manager only
 - Run `cdk synth` — outputs CloudFormation template
-- Cost estimate via `cdk-cost-estimator` or hand-tally — should show <$30/month
+- Cost estimate via hand-tally against §6 — should show <$30/month
 - **Do not deploy yet.** Verify the synth looks right.
 
 ### 5.3 M.3 — First deploy
 
-- `aws configure` with credentials (use the IAM user, not root)
+- **Account signup on the Paid Plan** (NOT Free Plan — §2.1; Free
+  Plan accounts auto-close at 6 months). Budget alerts within the
+  first 5 minutes (§3.8), before anything else.
+- `aws configure` with credentials (use an IAM user, not root)
 - `cdk bootstrap` (one-time per account/region)
-- `cdk deploy` — creates everything
-- SSH into the new EC2 box
-- Install Docker (likely via user-data in the CDK), pull the BrainTwin image from a private ECR repo
-- Run the container with `--restart unless-stopped` and env vars from SSM
-- Smoke test via `curl` from laptop
+- `cdk deploy` — creates everything; security group is operator-IP-only at this point
+- Connect via **SSM Session Manager** (no SSH)
+- `docker compose pull && docker compose up -d` — **`app` AND `bot`
+  services both running** (the bot is why this phase exists; v1 of
+  this doc forgot to deploy it)
+- `BACKEND_API_TOKEN` set from SSM — auth enforced from the first boot
+- Smoke test via `curl` (with and without the bearer token) from laptop;
+  forward a Telegram message and confirm it lands in the captures table
 
 ### 5.4 M.4 — Caddy + Cloudflare + domain
 
-- Add Caddy to the Dockerfile as a sidecar or run it on the host
-- Point Cloudflare DNS at the Elastic IP
-- Let's Encrypt auto-issues cert
-- Verify `https://braintwin.app/health` returns 200
+- Add the `caddy` service to compose (§3.10)
+- Cloudflare: zone for the domain, **proxied (orange-cloud)** A record
+  → Elastic IP, SSL mode **Full (strict)**
+- Scoped Cloudflare API token into SSM; Caddy issues the Let's Encrypt
+  cert via **DNS-01** (HTTP-01 doesn't play well behind the proxy)
+- Verify `https://braintwin.app/health` returns 200 through Cloudflare
 
 ### 5.5 M.5 — Litestream backup
 
-- Install litestream binary in the container
-- Configure `litestream.yml` pointing at the S3 bucket
-- Run `litestream replicate` alongside uvicorn (supervisor or systemd-style)
-- Test: simulate DB loss, run `litestream restore`, verify recovery
+- Add the `litestream` service to compose (own container, §3.10 —
+  not bundled alongside uvicorn)
+- Configure `litestream.yml` pointing at the S3 bucket's `litestream/`
+  prefix; retention managed by litestream, not S3 lifecycle (§3.3)
+- Confirm the app opens SQLite in WAL mode (litestream requirement)
+- **Restore drill, with timings:** simulate DB loss, `litestream
+  restore` to a fresh path, verify row counts match. Record "restore
+  took X minutes" in the smoke-test doc — recoverability with numbers
+  is the portfolio sentence.
 
 ### 5.6 M.6 — Monitoring + cost alerts
 
@@ -349,13 +444,20 @@ Each step is its own milestone within Phase 4.0.6, in order.
 - CloudWatch dashboard with EC2 CPU, network, disk, plus app request count
 - Anthropic dashboard: monthly spend cap
 
-### 5.7 M.7 — Update Chrome extension + Telegram bot
+### 5.7 M.7 — Client cutover (Chrome extension) + open the front door
 
-- Change `BACKEND_URL` in `extension/content.js` and `extension/recall.js`
-  to the cloud URL
-- Add `Authorization: Bearer <token>` header to all requests
-- Same for the Telegram bot's env config
-- Reload extension; test end-to-end
+- **Centralize `BACKEND_URL` first** — it's currently duplicated in
+  `extension/content.js` and `extension/recall.js`; move it to one
+  shared config so this is the last time a URL change touches two files
+- Point it at the cloud URL; add `Authorization: Bearer <token>` to
+  all extension requests (the bot already runs server-side with its
+  env config since M.3)
+- Tighten backend CORS per §3.7 (extension origin, `Authorization`
+  in allowed headers)
+- Flip the security group from operator-IP-only to Cloudflare IP
+  ranges (§3.4) — this is the moment the API faces the internet,
+  and auth has been enforced since M.3
+- Reload extension; test capture + recall end-to-end from the cloud
 
 ### 5.8 M.8 — Documentation + smoke test
 
@@ -368,31 +470,41 @@ Each step is its own milestone within Phase 4.0.6, in order.
 
 ## 6. Budget reality check
 
-Hard numbers based on the AWS new free tier (post-July 2025):
+Hard numbers (estimates; verify against the AWS calculator for
+`ap-south-1` before M.3):
 
 | Item | $/month | Source |
 |------|---------|--------|
-| EC2 t3.micro 24/7 | $7.50 | AWS pricing |
+| EC2 t4g.small 24/7 (Mumbai) | ~$9 | AWS pricing — within ~$1–2 of t3.micro thanks to Graviton pricing (§3.1) |
 | EBS gp3 30 GiB | $2.40 | AWS pricing |
+| EBS snapshots (DLM, 7-day retention) | ~$0.50 | incremental, small at this size |
+| ECR private repo (~3 GB image) | ~$0.30 | $0.10/GB-month (§3.3.1) |
 | Elastic IP (attached, free) | $0 | AWS pricing |
 | S3 storage + requests | ~$1 | scale-dependent, low for v1 |
 | Data transfer out | ~$1 | small, mostly Anthropic API calls |
 | Route 53 / DNS | $0 | Cloudflare free |
 | Caddy + Let's Encrypt | $0 | open-source |
-| SSM Parameter Store | $0 | free up to 10K params |
-| CloudWatch Logs | $0 | well under 5 GiB free |
+| SSM Parameter Store + Session Manager | $0 | free tiers |
+| CloudWatch Logs (+ Logs Insights queries) | $0 | well under 5 GiB free; no custom metrics (§3.8) |
 | Domain | $1 | $12/year amortized; free via Student Pack |
-| **TOTAL** | **~$13/month** | |
+| **TOTAL** | **~$15/month** | |
 
-**Credit runway:**
+**Credit runway (corrected 2026-06-09 — v1 of this doc claimed 23
+months, which was wrong):**
 
-- AWS Free Plan: $200 / 6 months
-- GitHub Student Pack AWS: ~$100 (after approval)
-- **Combined: ~$300**
-- **Runway at $13/month: ~23 months**
+- Signup is on the **Paid Plan** (§2.1) — Free Plan accounts are
+  auto-closed at 6 months, which kills a production system.
+- Credits: $100 at signup + up to $100 for onboarding activities,
+  expiring **~12 months after issuance**.
+- GitHub Student Pack AWS credits: **not counted** until visible in
+  the account (the AWS Educate grant path largely ended in 2023).
+- $200 at ~$15/month covers ~13 months of spend, but the 12-month
+  expiry is the binding constraint: **realistic runway ≈ 12 months
+  at $0 out-of-pocket, then ~$15/month real money.**
 
 Plus the Anthropic API costs (~$5-15/month for the user's usage),
-which are unaffected by AWS deployment.
+which are unaffected by AWS deployment and are real money from
+day one.
 
 ---
 
@@ -411,17 +523,16 @@ which are unaffected by AWS deployment.
 
 ## 8. Decisions explicitly NOT locked yet
 
-These need your sign-off before M.1 starts:
+These need your sign-off before M.1 starts (CDK-vs-Terraform was
+resolved in review — locked to CDK TypeScript, §4):
 
-1. **CDK TypeScript vs Terraform** — see §4. My vote: CDK now,
-   Terraform as a follow-up portfolio side-quest.
-2. **Domain name** — needs you to claim one via Namecheap once
+1. **Domain name** — needs you to claim one via Namecheap once
    Student Pack approves. `braintwin.app` / `braintwin.me` /
    `braintwin.in` are all candidates.
-3. **Region final** — `ap-south-1` (Mumbai) is the assumption.
+2. **Region final** — `ap-south-1` (Mumbai) is the assumption.
    Verify latency from your typical work location is acceptable
    (it should be).
-4. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
+3. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
    manual is faster to ship; GitHub Actions adds resume value but
    is one more thing to break.
 
@@ -432,11 +543,15 @@ These need your sign-off before M.1 starts:
 The phase is shippable when:
 
 - `https://<your-domain>/recall` answers from the cloud, returns
-  the same shape as local
+  the same shape as local — and returns **401 without the bearer
+  token**
 - A capture posted from the Chrome extension to the cloud URL is
   retrievable via recall on the cloud URL within a minute
-- Litestream restore verifies — can recover the DB to a fresh EC2
-  instance in under 5 minutes
+- A Telegram forward sent while the laptop is closed lands in the
+  captures table (the §1 pain point, demonstrated)
+- Litestream restore drill done **with recorded timings** — "DB
+  restored to a fresh instance in X minutes" written into the
+  smoke-test doc
 - AWS Budgets has email alerts wired
 - The infra is reproducible: `cdk destroy && cdk deploy` rebuilds
   the same stack from scratch (modulo data, which restores from
