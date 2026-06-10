@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "BrainTwin",
+  "name": "DigitalTwin",
   "version": "0.4.0",
   "description": "Captures what you read and lets you remember it back — vague-recall search over your personal corpus.",
   "permissions": ["activeTab", "storage"],
@@ -17,7 +17,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "BrainTwin"
+    "default_title": "DigitalTwin"
   },
   "icons": {
     "16": "icons/icon16.png",
