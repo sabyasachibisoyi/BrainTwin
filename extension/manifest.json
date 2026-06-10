@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "BrainTwin Capture",
-  "version": "0.1.0",
-  "description": "Captures content you actively read to build your knowledge twin.",
+  "name": "BrainTwin",
+  "version": "0.4.0",
+  "description": "Captures what you read and lets you remember it back — vague-recall search over your personal corpus.",
   "permissions": ["activeTab", "storage"],
   "host_permissions": ["<all_urls>"],
   "background": {

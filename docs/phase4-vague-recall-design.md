@@ -1,18 +1,32 @@
 # Phase 4 — Agent Layer (Vague-Recall Search + Retrieval Foundations)
 
-> **Status as of 2026-06-02 — DESIGN LOCKED, AWAITING IMPLEMENTATION.**
+> **Status as of 2026-06-03 — PHASE 4.0 SHIPPED.**
 >
-> Phase 4 is where BrainTwin stops being plumbing and becomes a thing
-> you actually open. This document scopes the **first slice of the agent
-> layer**: use case B from the Phase 3 design — vague-recall search ("I
-> read something about X a few weeks ago, find it for me") — plus the
-> retrieval foundations that use cases A (synthesis quizzes) and C
-> (clue inference) will later sit on top of.
+> All five milestones (M.1 FTS5 index, M.2 RetrievalService, M.3 Recaller,
+> M.4 `POST /recall` endpoint, M.5 Chrome extension Remember tab) are
+> built, merged to main, and in daily use. See the per-milestone
+> "✅ built" notes below for what landed in each.
 >
-> A and C are explicitly **out of scope** here. They get their own
-> design docs (`phase4.1-quizzes-design.md`, `phase4.2-clue-game-design.md`)
-> once vague recall is shipped and we know how the retrieval layer
-> actually behaves on real queries.
+> **What's deferred (in order):**
+>
+> - **Phase 4.0.5 — Eval harness.** Golden query dataset, Recall@1 /
+>   Recall@6 / MRR metrics, LLM-as-judge graders for the answer
+>   paragraph, Langfuse self-hosted for production traces. Locked in
+>   the "NOT building in Phase 4.0" section below — the call was to
+>   ship and dogfood first, then build eval against real failure modes
+>   instead of imagined ones.
+> - **Phase 4.1 — Synthesis quizzes (Use case A).** Separate design
+>   doc once we have a month of real recall usage to calibrate
+>   quiz-quality bars against.
+> - **Phase 4.2 — Clue inference game (Use case C).** Includes the
+>   per-chunk entity tagging work that V.8 deferred.
+> - **M.6 Telegram bot `/recall` command.** Phone-side recall — Chrome
+>   was prioritized as the laptop surface. Pick up when the bot's UX
+>   becomes the bottleneck.
+>
+> A and C are explicitly **out of scope** for this document — they
+> get their own design docs (`phase4.1-quizzes-design.md`,
+> `phase4.2-clue-game-design.md`) when their time comes.
 >
 > **Locked decisions at a glance:**
 > - **V.1** Hybrid retrieval — Chroma (vector) + SQLite FTS5 (BM25), both querying the same `chunks` table
@@ -607,15 +621,36 @@ prompt design.
   cap, tenant isolation, vector_store args plumbing, pure fusion math
   with crafted inputs.
 
-### M.3 — Recaller agent
+### M.3 — Recaller agent ✅ built
 
-- New module `backend/agent/recaller.py`
-- Class `Recaller` wrapping `RetrievalService` with the Sonnet
-  re-rank prompt
-- Owns conversation-state dict for U.3
-- Manages confidence threshold and closest-miss logic (V.7, U.4)
-- Returns a `RecallResponse` dataclass with the exact shape of S.3
-- Prompts and JSON schemas live in `backend/agent/prompts.py`
+- `backend/agent/recaller.py` — `Recaller`, `RecallResponse`,
+  `RankedResult`, `ConversationStore`, `_ConversationEntry`.
+- Wraps `RetrievalService` + `LLMClient.complete_json` (Sonnet) into
+  the end-to-end pipeline: retrieval → fusion (in M.2) → Sonnet
+  rerank → confidence gate → closest-miss courtesy if no_match.
+- `LLMClient.complete_json(model, system_prompt, user_prompt)`
+  added — same retry/error contract as `enrich()` but model-agnostic,
+  defaults to `settings.agent_model` (Sonnet).
+- `EnrichmentRepository.get_summaries_by_capture_ids` added —
+  bulk fetch in one SQL call, threaded through the Recaller so
+  both the Sonnet prompt and the result blocks carry the summary.
+- Multi-turn flow (U.3) — first turn does fresh retrieval; refinement
+  turns use `prior.last_candidates`, no new retrieval call. If a
+  refinement empties the filter pool, falls back to fresh retrieval
+  and resets the anchor (pivot detection).
+- Conversation TTL eviction is enforced both lazily on `get()` and
+  proactively on `save()` (so abandoned conversations don't leak
+  memory for 30 minutes after closure).
+- Confidence gate (V.7) reads `results[0].confidence`, NOT
+  `max(confidences)` — the headline confidence has to match the
+  result shown first, and a low-confidence top result must trigger
+  no-match even if a lower-ranked candidate scored higher.
+- Tests: `tests/test_recaller.py` — empty query short-circuit,
+  first-turn flow, refinement uses prior candidates, anchor
+  preservation, pivot path, no-match + closest-miss, LLM failure
+  degradation (transient / permanent / malformed), conversation
+  TTL eviction (lazy + proactive sweep), summary join end-to-end,
+  Sonnet response shape validation, confidence-gate is top-1.
 
 ### M.4 — POST /recall endpoint ✅ built
 
@@ -653,14 +688,44 @@ prompt design.
       owns that no-match)
     * legacy `/ask` route is 404
 
-### M.5 — Chrome extension Remember tab
+### M.5 — Chrome extension Remember tab ✅ built
 
-- Add tab switcher to `extension/popup.html`
-- Add Remember view (input + result card template)
-- New `extension/recall.js` that posts to `/recall` and renders
-- Reuses CORS config that already permits the extension origin
-- Conversation state lives in `chrome.storage.local` keyed by tab,
-  cleared on tab close
+- `extension/popup.html` restructured: tab switcher at the top
+  (`Capture` | `Remember`), each tab a separate `.view` block.
+  Popup widened from 280px → **380px** so result cards have room to
+  breathe — capture tab still works fine at the new width.
+- `extension/recall.js` — owns the Remember tab. POSTs to
+  `http://127.0.0.1:8000/recall` (same `BACKEND_URL` as
+  `content.js` uses for capture), parses the `RecallResponse` shape,
+  renders one card per result with the full U.2 field set: title,
+  source domain, captured-at date, client, dwell time, confidence
+  badge (color-coded — green ≥60%, amber below), why-this-matches,
+  snippet, "Open original →" link.
+- `extension/popup.js` — kept the existing Capture-tab logic; added
+  the tab switcher. Active tab persists to `chrome.storage.local`
+  under `activeTab` so reopening the popup drops you back into the
+  same view. Switching to Remember auto-focuses the search input.
+- Conversation state: a single module-level `conversationId`
+  variable in `recall.js`. Set on first response, sent on every
+  subsequent submit, **cleared on popup close** by virtue of the
+  popup being a fresh document. Matches U.3's "intentionally
+  short-lived" semantic. A "start over" button surfaces once a
+  conversation is active, lets the user explicitly reset without
+  closing the popup.
+- Error surfaces match the backend contract:
+    * 503 (no Recaller) → "The recall agent isn't running. Set
+      ANTHROPIC_API_KEY in .env and restart the backend."
+    * Network failure → "Couldn't reach the backend. Is uvicorn
+      running at http://127.0.0.1:8000?"
+    * Timeout (30s) → "Search took too long. Try a shorter query…"
+- The closest-miss path (U.4) renders as a soft "not confident this
+  is it — here's the closest match" banner above the single result
+  card, keeping the courtesy match visible.
+- `manifest.json` — version bumped to **0.4.0**, name simplified to
+  "BrainTwin", description updated to reflect both capture and
+  recall. Permissions / host_permissions unchanged (the existing
+  `<all_urls>` host permission already covers `127.0.0.1:8000` for
+  the fetch, and CORS on the backend permits `*`).
 
 ### M.6 — Telegram bot /recall command (Phase 4.0.1)
 
@@ -739,6 +804,42 @@ Goal for v1: ≥80% click-through-or-refinement on the first response,
 Measurement: log every `/recall` request and the next action by the
 same `conversation_id`. Build a small `/admin/recall-stats` view to
 read these.
+
+---
+
+## For contributors — where to start if you want to change something
+
+Phase 4.0 is small enough that you can hold the whole layer in your head, but big enough that knowing where to look saves a chunk of bisecting. Map of the layer:
+
+| You want to change… | The file is |
+|---------------------|-------------|
+| How BM25 tokens are extracted from a query | `backend/storage/repositories/chunk_repo.py:_build_fts_match_query` |
+| Per-ranker top-K, top-N captures, RRF constant | `backend/agent/retrieval.py` — `DEFAULT_*` constants at the top |
+| Whether vector or BM25 runs in their own session | `backend/agent/retrieval.py` — `_run_vector` / `_run_bm25` |
+| How RRF math combines the two rankers | `backend/agent/retrieval.py:_fuse` (pure function, easy to unit test) |
+| The Sonnet rerank prompt or its JSON schema | `backend/agent/prompts.py` |
+| Confidence threshold (V.7), conversation TTL (U.3) | `backend/agent/recaller.py` — `DEFAULT_CONFIDENCE_THRESHOLD`, `CONVERSATION_TTL_SECONDS` |
+| The Recaller pipeline (when to call retrieval vs reuse prior) | `backend/agent/recaller.py:recall` |
+| Refinement filter logic (substring placeholder for v1) | `backend/agent/recaller.py:_apply_filters` — replace with LLM filter parser in 4.0.5 |
+| The HTTP request/response shape | `backend/main.py:RecallPayload` + `backend/agent/recaller.py:RecallResponse` |
+| Chrome extension popup HTML / CSS | `extension/popup.html` (380px popup, vanilla CSS) |
+| Remember tab JS — search, render, errors | `extension/recall.js` |
+| Tab switcher / Capture tab state | `extension/popup.js` |
+
+**Test surfaces:**
+
+- `tests/test_chunks_fts.py` — FTS5 sanitization, BM25 ranking, trigger sync, proper-noun (Tamasha) case
+- `tests/test_retrieval_service.py` — fusion math, parallel rankers, diversification, tenant isolation, fault isolation
+- `tests/test_recaller.py` — pipeline, multi-turn flow, no-match, LLM degradation, confidence gate, summary join
+- `tests/test_recall_endpoint.py` — FastAPI handler with stubbed Recaller
+
+**Iteration loop:**
+
+Backend: `pytest tests/` runs everything; targeted runs like `pytest tests/test_recaller.py -v` are how individual files get tightened. No build step.
+
+Chrome extension: edit the file, go to `chrome://extensions`, click reload on the BrainTwin card. The popup re-renders from the updated files immediately. Inspect → Inspect popup window opens DevTools against the popup document.
+
+Backend changes affect the extension only via the HTTP contract — so as long as `RecallResponse.to_dict()` keeps producing the U.2 field set, the extension keeps rendering without changes.
 
 ---
 
