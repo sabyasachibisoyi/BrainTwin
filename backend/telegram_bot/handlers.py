@@ -142,7 +142,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = user.first_name or "there"
     if _is_allowed(user):
         msg = (
-            f"👋 Hi {name}. BrainTwin is active for you.\n\n"
+            f"👋 Hi {name}. DigitalTwin is active for you.\n\n"
             "Forward articles, images, or memes here — I'll capture them silently.\n"
             "Type /help for commands."
         )
@@ -150,7 +150,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = (
             f"👋 Hi {name}.\n\n"
             f"Your Telegram user ID is {user.id}.\n\n"
-            "To activate BrainTwin, paste this ID into ALLOWED_TELEGRAM_USER_IDS "
+            "To activate DigitalTwin, paste this ID into ALLOWED_TELEGRAM_USER_IDS "
             "in your .env, then restart the bot."
         )
     # plain text — Markdown gets fragile with names containing _ or *
@@ -162,7 +162,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat is None:
         return
     await chat.send_message(
-        "*BrainTwin Telegram bot*\n\n"
+        "*DigitalTwin Telegram bot*\n\n"
         "Send / forward me anything you'd like remembered:\n"
         "• A URL (or text containing one) → I fetch the page\n"
         "• An image (single or album) → I capture it + any sender caption\n\n"

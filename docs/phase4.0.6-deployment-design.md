@@ -1,8 +1,23 @@
 # Phase 4.0.6 — Cloud Deployment (AWS)
 
-> **Status as of 2026-06-09 — DESIGN REVISED AFTER REVIEW.**
+> **Status as of 2026-06-10 — DESIGN UPDATED (region + diagrams + branding).**
 >
-> Revision summary (2026-06-09 senior-eng review): budget reworked
+> Update summary (2026-06-10):
+>   1. **Region:** Primary region is now **`us-west-2` (Oregon/PDX)** for
+>      Seattle-based development latency. `ap-south-1` (Mumbai) is
+>      **NOT** deployed on day one — the CDK stack is region-parameterized
+>      so a second region is `cdk deploy --context region=...`, but
+>      active-active is a Phase 5+ decision (§3.0).
+>   2. **HLD diagrams:** New §6 — Python `diagrams` library for the
+>      topology, Mermaid for flows, `cdk-dia` later for auto-verification.
+>      All version-controlled in `docs/diagrams/`. Miro rejected for
+>      canonical diagrams.
+>   3. **Product naming:** New §11 — customer-facing brand is
+>      **DigitalTwin**; codebase / internal stays **BrainTwin**.
+>      Domain: `digitaltwin.app` / `.me` / `.io`. No code rename;
+>      the swap is at presentation surfaces only.
+>
+> Previous revision (2026-06-09 senior-eng review): budget reworked
 > around the real post-July-2025 AWS credit rules (Paid Plan at
 > signup, ~12-month runway, NOT 23); server-side auth pulled forward
 > into M.1 so the API is never publicly exposed unauthenticated;
@@ -91,8 +106,10 @@ Locked because:
 - **Most mature deployment ecosystem.** Every IaC tool (Terraform,
   CDK, Pulumi) has first-class AWS support. Every CI/CD platform
   (GitHub Actions, CircleCI) has AWS deployment recipes.
-- **Mumbai region (`ap-south-1`).** Sub-100ms latency for Indian
-  capture / recall traffic.
+- **Region presence near operator.** `us-west-2` (Oregon / PDX) for
+  Seattle-based development gives sub-50ms latency to the laptop and
+  Chrome extension. `ap-south-1` is a one-line CDK switch when needed.
+  See §3.0 for the multi-region story.
 
 ### 2.2 Considered and rejected
 
@@ -128,16 +145,35 @@ SQLite-on-EBS**. The Phase 3 design already keeps the schema
 Postgres-ready, so the SQLite-vs-RDS choice can flip later without
 schema changes.
 
+### 3.0 Regions: us-west-2 primary, multi-region CDK from day one
+
+The previous revision assumed Mumbai (`ap-south-1`) for Indian-context
+latency. The user is now developing from Seattle, so:
+
+| Aspect | Decision |
+|--------|----------|
+| **Primary region** | **`us-west-2` (Oregon / PDX)** — closest to Seattle, sub-50ms latency from the operator's laptop |
+| **Single AZ within primary** | `us-west-2a` for v1 (cheapest, simplest) |
+| **Secondary region** | `ap-south-1` (Mumbai) — **NOT deployed on day one**. Configured as a CDK target but not provisioned. |
+| **CDK shape** | **Region-parameterized stack.** `bin/braintwin.ts` reads region from CDK context (or environment) so `cdk deploy` defaults to `us-west-2`, and `cdk deploy --context region=ap-south-1` would deploy a separate parallel stack to Mumbai. No code change needed to add a region. |
+| **When to actually deploy a second region** | When use case A (multi-user quizzes) goes live AND user concentration in another geography justifies the ~2x cost. Until then, a warm Mumbai stack is a $15/month tax with no return. Documented as Phase 5+. |
+| **Why not active-active now** | Would roughly double the bill (extra EC2, EBS, cross-region S3 replication, Route 53 latency routing). For a single user, the win is zero. The CDK parameterization gives us the *option* without the bill. |
+| **Data residency** | Single-region for now means user data lives in `us-west-2` only. Acceptable per Phase 3 design A.2 (multi-tenant from day one, but data-residency boundaries are a use-case-A concern). |
+
+**Cost delta `us-west-2` vs `ap-south-1`**: roughly equivalent for the
+services we use (within ~5%). No material difference; the choice is
+on latency.
+
 ### 3.1 Compute: EC2 `t4g.small` (single instance, all-in-one)
 
 | Aspect | Decision |
 |--------|----------|
 | Instance type | `t4g.small` (2 vCPU Graviton/ARM, 2 GiB RAM) |
-| Region | `ap-south-1` (Mumbai) |
-| AZ | Single AZ — no multi-AZ until use case A goes multi-user |
+| Region | **`us-west-2` (Oregon / PDX)** primary — see §3.0 for the region story and CDK multi-region shape |
+| AZ | `us-west-2a` — single AZ for v1; no multi-AZ until use case A goes multi-user |
 | OS | Amazon Linux 2023 (arm64) |
 | Why not ECS Fargate | Fargate is NOT in the free tier — costs ~$9/month minimum. A single EC2 box is cheaper AND the "I ran a containerized FastAPI app on EC2 + Docker" bullet is still solid resume material. |
-| Why not t3.micro (1 GiB) | This was v1 of this doc and it was the riskiest call in it. sentence-transformers pulls in PyTorch (~0.5–1 GB RSS with the model resident), Chroma keeps its HNSW index in RAM, and whisper.cpp spikes during transcription. On 1 GiB that means living in swap on EBS and an eventual OOM-kill of uvicorn mid-transcription. Swap is a strategy for occasional spikes, not for a resident model. Graviton pricing makes t4g.small land within ~$1–2/month of t3.micro in Mumbai — double the RAM for roughly the same money. |
+| Why not t3.micro (1 GiB) | This was v1 of this doc and it was the riskiest call in it. sentence-transformers pulls in PyTorch (~0.5–1 GB RSS with the model resident), Chroma keeps its HNSW index in RAM, and whisper.cpp spikes during transcription. On 1 GiB that means living in swap on EBS and an eventual OOM-kill of uvicorn mid-transcription. Swap is a strategy for occasional spikes, not for a resident model. Graviton pricing makes t4g.small land within ~$1–2/month of t3.micro in `us-west-2` — double the RAM for roughly the same money. |
 | ARM consequence | Docker image built for `linux/arm64` via `docker buildx`. Everything in the stack (torch CPU wheels, sentence-transformers, whisper.cpp, ffmpeg) has aarch64 support. Cross-building from the laptop is itself a nice portfolio detail. |
 | CPU credit mode | `standard`, NOT `unlimited` — whisper runs will burn burst credits, and unlimited mode silently bills overages. Better to throttle than to surprise-bill. |
 | RAM strategy | 2 GiB physical + 2 GiB swap file on EBS as headroom, not as the plan. |
@@ -468,14 +504,124 @@ Each step is its own milestone within Phase 4.0.6, in order.
 
 ---
 
-## 6. Budget reality check
+## 6. High-level design (HLD) — diagrams in the codebase
+
+> Added 2026-06-10 per request. The goal: one canonical architecture
+> picture plus per-flow sequence diagrams, both lives in `docs/diagrams/`
+> so they're version-controlled, PR-reviewable, and regenerable.
+
+### 6.1 Three-layer diagram strategy
+
+| Layer | Tool | What it captures | Output |
+|-------|------|-----------------|--------|
+| **Topology** | Python [`diagrams`](https://diagrams.mingrammer.com) library (mingrammer/diagrams) | The big static architecture picture: EC2, EBS, S3, ECR, SSM, CloudWatch, Cloudflare, Anthropic API. Official AWS icons. | `architecture.png` |
+| **Flows** | [Mermaid](https://mermaid.js.org) (markdown-embedded sequence + flowchart diagrams) | Per-request lifecycle: capture path, recall path, refinement turn, failure modes (Sonnet down, Chroma down, etc.). GitHub renders natively. | inline in markdown |
+| **Verification** | [`cdk-dia`](https://github.com/pistazie/cdk-dia) (post-M.2) | Auto-generated topology from the actual CDK code — proves the manual diagram matches what's deployed. | `cdk-generated.png` |
+
+### 6.2 Why this combination
+
+- **Python `diagrams`** wins on code-as-diagram + AWS icon fidelity.
+  The script that produces the PNG IS the documentation. Edit the
+  script, regenerate, PR with both the script change and the PNG diff.
+- **Mermaid** wins on per-flow detail. Sequence diagrams for "user
+  hits /recall → vector + BM25 → RRF → Sonnet → response" are the
+  artifact a future contributor reads to understand what calls what.
+  Mermaid renders in GitHub markdown so the doc itself is the view.
+- **cdk-dia** wins on truth-vs-claim drift. The Python `diagrams`
+  picture is the architect's intent; `cdk-dia` is what's actually
+  in the cloud. If they diverge, something's drifted.
+
+### 6.3 Why not Miro / Lucidchart / drawio
+
+- **Miro** — Excellent whiteboard, terrible for repo. Not
+  version-controlled, can't be reviewed in a PR, can't be grepped.
+  Fine for ad-hoc brainstorming; rejected as the canonical source.
+- **Lucidchart** — Same issues as Miro, plus paid.
+- **drawio** — `.drawio` XML can be checked in, but the editor is
+  GUI-only so PR review shows blob diffs, not human-readable changes.
+  Acceptable backup if `diagrams`/Mermaid fail us, not the primary.
+
+### 6.4 What lives where
+
+```
+docs/diagrams/
+├── README.md                   # folder guide + regenerate/maintenance instructions
+├── architecture.py             # Python `diagrams` script — source of truth for topology
+├── architecture.png            # generated; committed alongside the script
+├── flow-capture.md             # Mermaid sequence diagram for the /capture path
+├── flow-recall.md              # Mermaid sequence diagram for /recall + Sonnet rerank
+├── flow-refinement.md          # Mermaid for multi-turn refinement (U.3)
+├── flow-failure-modes.md       # Mermaid for fault-isolated ranker degradation, Sonnet failures
+├── flow-backup-restore.md      # Mermaid for the M.5 litestream + DLM restore drill
+└── cdk-generated.png           # post-M.2: auto-generated by `cdk-dia` from the CDK code
+```
+
+### 6.5 Architecture script outline (to land in M.0)
+
+The `architecture.py` script will use the official AWS provider in
+`diagrams` and show the layered topology:
+
+- **External actors:** Chrome extension, Telegram bot (mobile),
+  external Anthropic API
+- **Edge:** Cloudflare (DDoS / DNS / TLS)
+- **Compute:** EC2 t4g.small in `us-west-2a` with docker-compose
+  (`app`, `bot`, `caddy`, `litestream` services)
+- **Storage:** EBS gp3 volume (SQLite + Chroma + whisper model),
+  S3 bucket (litestream WAL prefix, nightly Chroma tarballs, image
+  backups), ECR (the BrainTwin image)
+- **Config / Secrets:** SSM Parameter Store
+- **Observability:** CloudWatch Logs + Budgets + UptimeRobot (external)
+- **Operator access:** SSM Session Manager (no SSH, no port 22)
+
+Each node labelled with its CDK construct name so the picture maps
+1:1 to `infra/lib/braintwin-stack.ts`.
+
+### 6.6 Sequence diagrams that earn their keep
+
+Five Mermaid flows worth the time, all in `docs/diagrams/flow-*.md`:
+
+1. **Capture path** — Chrome extension → /capture → enrichment
+   worker → SQL + Chroma + S3 (image upload)
+2. **Recall happy path** — /recall → RetrievalService (Chroma +
+   FTS5 in parallel) → RRF fusion → Sonnet rerank → response
+3. **Recall refinement turn** — second call with conversation_id,
+   showing the "no fresh retrieval" branch from U.3
+4. **Failure mode: Sonnet 503** — degraded rule-based rerank,
+   bm25-only / vector-only paths
+5. **Backup + restore drill** — litestream WAL → S3, restore to a
+   fresh EBS volume — for the M.5 restore exercise
+
+These give a new contributor the on-ramp from "what is this thing"
+to "I can find where to make my change" in 15 minutes.
+
+### 6.7 Setup cost
+
+- `pip install diagrams` + Graphviz installed on the dev laptop.
+  One-time, ~5 min.
+- Mermaid: zero setup; GitHub renders it natively.
+- `cdk-dia`: deferred until after M.2 (CDK exists). Installed via npm,
+  runs against the CDK assembly.
+
+### 6.8 Maintenance contract
+
+- The diagrams are source-of-truth for review. PR descriptions that
+  add or remove infrastructure resources MUST update either
+  `architecture.py` or the appropriate flow doc.
+- `architecture.png` is regenerated on every change to
+  `architecture.py` and both committed together.
+- A CI check (Phase 4.0.6.1, after the GitHub Actions pipeline is up)
+  will fail if `architecture.png` is stale relative to its script.
+
+---
+
+## 7. Budget reality check
 
 Hard numbers (estimates; verify against the AWS calculator for
-`ap-south-1` before M.3):
+`us-west-2` before M.3):
 
 | Item | $/month | Source |
 |------|---------|--------|
-| EC2 t4g.small 24/7 (Mumbai) | ~$9 | AWS pricing — within ~$1–2 of t3.micro thanks to Graviton pricing (§3.1) |
+| EC2 t4g.small 24/7 (`us-west-2`) | ~$12 | AWS pricing — within ~$1–2 of t3.micro thanks to Graviton pricing (§3.1) |
 | EBS gp3 30 GiB | $2.40 | AWS pricing |
 | EBS snapshots (DLM, 7-day retention) | ~$0.50 | incremental, small at this size |
 | ECR private repo (~3 GB image) | ~$0.30 | $0.10/GB-month (§3.3.1) |
@@ -508,7 +654,7 @@ day one.
 
 ---
 
-## 7. What's deferred to later sub-phases
+## 8. What's deferred to later sub-phases
 
 | Item | When |
 |------|------|
@@ -521,24 +667,24 @@ day one.
 
 ---
 
-## 8. Decisions explicitly NOT locked yet
+## 9. Decisions explicitly NOT locked yet
 
 These need your sign-off before M.1 starts (CDK-vs-Terraform was
-resolved in review — locked to CDK TypeScript, §4):
+resolved in review — locked to CDK TypeScript, §4; region resolved
+2026-06-10 — locked to `us-west-2`, §3.0):
 
 1. **Domain name** — needs you to claim one via Namecheap once
-   Student Pack approves. `braintwin.app` / `braintwin.me` /
-   `braintwin.in` are all candidates.
-2. **Region final** — `ap-south-1` (Mumbai) is the assumption.
-   Verify latency from your typical work location is acceptable
-   (it should be).
-3. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
+   Student Pack approves. **Preferred: `digitaltwin.app`** (see §11
+   for the customer brand split); fallbacks `digitaltwin.me` /
+   `digitaltwin.io`. `braintwin.*` is no longer the public-facing
+   pick.
+2. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
    manual is faster to ship; GitHub Actions adds resume value but
    is one more thing to break.
 
 ---
 
-## 9. Success criteria for Phase 4.0.6
+## 10. Success criteria for Phase 4.0.6
 
 The phase is shippable when:
 
@@ -561,7 +707,79 @@ The phase is shippable when:
 
 ---
 
-## 10. Next docs after Phase 4.0.6 ships
+## 11. Product naming — DigitalTwin (public) vs BrainTwin (internal)
+
+> Added 2026-06-10 per request. "DigitalTwin" reads more clearly to
+> a stranger than "BrainTwin", which sounds biotech / clinical.
+> But renaming the whole codebase is busywork that buys nothing —
+> internal code, docs, branches, commit history all stay as
+> **BrainTwin**. The split is at the presentation surface only.
+
+### 11.1 The split
+
+| Layer | Name | Why |
+|-------|------|-----|
+| Codebase / repo / commit messages / internal docs | **BrainTwin** | Stable identifier the team knows. Renames are a refactor tax with zero feature value. |
+| Customer-facing UI (extension popup, web pages, Telegram bot greetings) | **DigitalTwin** | Cleaner brand. "Your digital twin remembers what you read" is a one-line elevator pitch. |
+| Domain | **`digitaltwin.app`** (preferred) | Matches public brand. `.me` / `.io` are fallbacks. |
+| AWS resources / CDK stack name | `BrainTwin*` | Internal — never seen by users. |
+
+### 11.2 Files to flip when the brand surface changes
+
+Only the following user-visible strings flip from "BrainTwin" to
+"DigitalTwin". Everything else stays:
+
+| File | Current string | New string |
+|------|---------------|-----------|
+| `extension/manifest.json` → `name` | `"BrainTwin"` | `"DigitalTwin"` |
+| `extension/manifest.json` → `description` | `"Captures what you read…"` | unchanged, possibly soften wording |
+| `extension/manifest.json` → `action.default_title` | `"BrainTwin"` | `"DigitalTwin"` |
+| `extension/popup.html` → `<h1>BrainTwin</h1>` | `BrainTwin` | `DigitalTwin` |
+| `app/main.py` → FastAPI `title=` | `"BrainTwin"` | `"DigitalTwin"` |
+| `app/main.py` → `/health` response `{"service": "BrainTwin"}` | `BrainTwin` | `DigitalTwin` |
+| `telegram_bot/bot.py` → greeting messages and `/start` text | `BrainTwin` | `DigitalTwin` |
+| Cloudflare DNS / Caddy site block | `braintwin.*` | `digitaltwin.*` |
+
+Anything not in that table — Python module names, AWS resource
+names in CDK, README, CHANGELOG, internal phase docs (including
+this one) — stays as BrainTwin.
+
+### 11.3 What's explicitly NOT changing
+
+- Repo name on GitHub — stays `BrainTwin`.
+- Docker image names in ECR — stays `braintwin-*`.
+- CDK stack names — stays `BrainTwinStack*`.
+- SQLite DB filename, Chroma collection name — stay BrainTwin-flavored.
+- S3 bucket names — stay BrainTwin-flavored.
+- Python package layout (`app/`, `agents/`, `services/`) — stays.
+- All phase doc filenames (`phase4.0.6-…md` etc.) — stay.
+
+### 11.4 Migration order
+
+The brand surface flip happens **after** the cloud deploy works, not
+before. Concrete sequencing:
+
+1. Phase 4.0.6 ships under whatever subdomain (`api.<your-domain>`).
+   Internal name in code = BrainTwin; serves successfully.
+2. You buy `digitaltwin.app` (or fallback) via Namecheap once
+   Student Pack credit covers it.
+3. Cloudflare DNS update — point `digitaltwin.app` and
+   `api.digitaltwin.app` at the EC2.
+4. Brand-surface PR: flip the rows in §11.2, ship Chrome extension v0.5
+   to the store under the new public name.
+
+This sequencing keeps M.1–M.6 about infra correctness, not branding.
+
+### 11.5 If you change your mind later
+
+If you ever do want to rename the codebase to DigitalTwin, the
+refactor is mechanical: `git grep -i braintwin` gives the full
+delta. Easier to defer that decision until you've shipped, gotten
+real feedback on the name, and have headroom for cleanup work.
+
+---
+
+## 12. Next docs after Phase 4.0.6 ships
 
 - `phase4.0.6-deployment-smoke-test.md` — the operator runbook
 - `phase4.0.7-postgres-migration.md` — when SQLite starts hurting
@@ -573,4 +791,6 @@ The phase is shippable when:
 
 *Author: Sabya (with Claude as design partner). Decisions captured
 2026-06-04 from conversation around AWS free tier restructure +
-portfolio audience targeting.*
+portfolio audience targeting. Revised 2026-06-10: region
+(`us-west-2`), HLD diagram strategy, and DigitalTwin/BrainTwin
+brand split.*

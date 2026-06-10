@@ -60,3 +60,10 @@ pytest-asyncio
 
 # Utilities
 rich
+
+# Docs / HLD diagrams (docs/diagrams/architecture.py)
+# Regenerates docs/diagrams/architecture.png. Requires the Graphviz
+# system binary too — `brew install graphviz` (macOS) or
+# `apt-get install graphviz` (Linux); pip can't supply it.
+# See docs/diagrams/README.md for the regenerate workflow.
+diagrams==0.25.1
