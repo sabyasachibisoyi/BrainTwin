@@ -1,13 +1,31 @@
 """BrainTwin Configuration — loads settings from .env file."""
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings
 from pathlib import Path
 
 
+def reveal(value: "SecretStr | str | None") -> str:
+    """Return the plaintext of a secret as a plain ``str``.
+
+    Phase 4.0.6 M.1 review fix: secrets are stored as ``SecretStr`` so they
+    don't leak through ``repr(settings)``, tracebacks, or log lines. Call
+    sites that actually need the cleartext go through this helper. It is
+    deliberately tolerant of plain ``str`` and ``None`` too, so tests that
+    monkeypatch a setting with a bare string keep working unchanged.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return str(value)
+
+
 class Settings(BaseSettings):
-    # API Keys
-    anthropic_api_key: str = ""
-    telegram_bot_token: str = ""
+    # API Keys — SecretStr so they never render in repr()/logs/tracebacks.
+    # Read the cleartext at use sites via config.reveal(...).
+    anthropic_api_key: SecretStr = SecretStr("")
+    telegram_bot_token: SecretStr = SecretStr("")
 
     # Telegram allowlist — comma-separated Telegram user IDs that the bot
     # will accept messages from. Anything outside this list is silently
@@ -17,6 +35,14 @@ class Settings(BaseSettings):
     # Server
     backend_host: str = "127.0.0.1"
     backend_port: int = 8000
+
+    # ----- Phase 4.0.6 M.1 — bearer-token auth ---------------------------
+    # Shared bearer token. Required for protected routes (/capture,
+    # /recall, /stats, /failures). Empty string disables those routes
+    # with a 503 ("auth not configured") — that's the fail-closed
+    # default. In cloud, this is fetched from SSM Parameter Store at
+    # boot; locally, set it in .env. SecretStr — read via config.reveal().
+    backend_bearer_token: SecretStr = SecretStr("")
 
     # Capture
     dwell_time_threshold: int = 30

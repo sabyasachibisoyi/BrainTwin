@@ -152,10 +152,24 @@ async function capturePageContent() {
     },
   };
 
+  // Phase 4.0.6 M.1 — bearer-token auth. Stored in chrome.storage.local
+  // under `bearerToken`. For local dev, paste it via DevTools:
+  //   chrome.storage.local.set({bearerToken: 'your-token'})
+  const { bearerToken } = await chrome.storage.local.get("bearerToken");
+  const headers = { "Content-Type": "application/json" };
+  if (bearerToken) {
+    headers["Authorization"] = `Bearer ${bearerToken}`;
+  } else {
+    console.warn(
+      "[BrainTwin] No bearerToken in chrome.storage.local; backend will 401. " +
+      "Set with: chrome.storage.local.set({bearerToken: 'your-token'})"
+    );
+  }
+
   try {
     const response = await fetch(`${BACKEND_URL}/capture`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(payload),
     });
 
@@ -167,6 +181,10 @@ async function capturePageContent() {
         platform: platform,
       });
       console.log("[BrainTwin] Content captured:", payload.title);
+    } else if (response.status === 401) {
+      console.warn("[BrainTwin] Backend rejected capture: 401 — bearer token missing or wrong.");
+    } else if (response.status === 503) {
+      console.warn("[BrainTwin] Backend rejected capture: 503 — server says auth not configured.");
     } else {
       console.warn("[BrainTwin] Backend rejected capture:", response.status);
     }

@@ -1,65 +1,71 @@
 # BrainTwin Dependencies
+#
+# Fully pinned for reproducible Docker/cloud builds (Phase 4.0.6 M.1
+# review fix). Versions reflect the known-good local venv. Bump
+# deliberately, not implicitly — an unpinned `docker build` weeks apart
+# must not silently pull a different (or yanked/compromised) release.
+# Regenerate exact pins with: `pip freeze` inside the project venv.
 
 # Backend
-fastapi
-uvicorn[standard]
-python-dotenv
-pydantic
-pydantic-settings
+fastapi==0.136.1
+uvicorn[standard]==0.47.0
+python-dotenv==1.2.2
+pydantic==2.13.4
+pydantic-settings==2.14.1
 
 # LLM & AI
-anthropic
+anthropic==0.104.0
 # Intel macOS only ships torch wheels up to 2.2.2 (compiled against numpy 1.x).
-# Pin numpy<2 to keep torch importable, and cap transformers/sentence-transformers
-# at the last releases that still support torch 2.2.
-numpy<2
+# numpy stays <2 to keep torch importable; transformers/sentence-transformers
+# are the last releases that still support torch 2.2.
+numpy==1.26.4
 torch==2.2.2
-transformers<5
-sentence-transformers<4
+transformers==4.57.6
+sentence-transformers==3.4.1
 
 # Vector Database
-chromadb
+chromadb==1.5.9
 
 # Content Extraction
-readability-lxml
-lxml
-beautifulsoup4
-newspaper3k
-youtube-transcript-api
+readability-lxml==0.8.4.1
+lxml==6.1.1
+beautifulsoup4==4.14.3
+newspaper3k==0.2.8
+youtube-transcript-api==1.2.4
 # Phase 2.5 Fix 2 — fast HTML parser for OG / Twitter Card metadata.
 # 5x faster than BeautifulSoup, no lxml C-ext dependency footprint
 # beyond what readability-lxml already pulls in.
-selectolax
+selectolax==0.4.9
 # Phase 2.5 Fix 3 — pulls audio-only streams from IG/FB/TikTok/YouTube
-# for local Whisper transcription. Update with `pip install -U yt-dlp`
-# every 2-4 weeks when extractors break — that's the maintenance cost
-# we accepted at sign-off.
-yt-dlp
+# for local Whisper transcription. yt-dlp extractors break often; bump
+# this pin every 2-4 weeks (`pip install -U yt-dlp` then re-freeze) —
+# that's the maintenance cost we accepted at sign-off.
+yt-dlp==2026.3.17
 
 # Image Processing
-Pillow
+Pillow==12.2.0
 
 # Telegram Bot
-python-telegram-bot
+python-telegram-bot==22.7
 
 # HTTP
-httpx
-aiohttp
+httpx==0.28.1
+aiohttp==3.13.5
 
 # Database
-aiosqlite
+aiosqlite==0.22.1
 # Phase 3 storage layer — SQLAlchemy Core (not the Declarative ORM) for
 # query building + dialect handling, with aiosqlite (local) and asyncpg
 # (cloud) as async drivers. Same schema works in both.
-sqlalchemy[asyncio]>=2.0
-asyncpg                            # Postgres async driver, pulled in for cloud migration
+sqlalchemy[asyncio]==2.0.49
+asyncpg==0.31.0                    # Postgres async driver, pulled in for cloud migration
 
 # Testing
-pytest
-pytest-asyncio
+pytest==9.0.3
+pytest-asyncio==1.3.0
 
 # Utilities
-rich
+rich==15.0.0
 
 # Docs / HLD diagrams (docs/diagrams/architecture.py)
 # Regenerates docs/diagrams/architecture.png. Requires the Graphviz

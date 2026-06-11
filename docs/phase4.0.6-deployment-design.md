@@ -257,7 +257,7 @@ snapshot is the "I broke the box itself" path.
 | Aspect | Decision |
 |--------|----------|
 | Secret store | **AWS SSM Parameter Store** with `SecureString` type (KMS-encrypted, **free**) |
-| Secrets stored | `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `BACKEND_API_TOKEN` (the bearer token Chrome + Telegram bot send) |
+| Secrets stored | `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `BACKEND_BEARER_TOKEN` (the bearer token Chrome + Telegram bot send) |
 | Naming | `/braintwin/prod/anthropic_api_key`, etc. |
 | Why not Secrets Manager | Secrets Manager is $0.40/secret/month. SSM Parameter Store SecureString is functionally equivalent for our needs and **free**. The portfolio bullet "I used AWS-native secrets management" works equally for both. |
 | Access | EC2 instance role with `ssm:GetParameter` on `/braintwin/prod/*` |
@@ -285,10 +285,23 @@ snapshot is the "I broke the box itself" path.
 
 ### 3.9 Whisper.cpp + yt-dlp on the cloud host
 
-These are system binaries the Phase 2.5 hydration depends on.
-Bundled inside the Dockerfile (§5.1) so they live in the container,
-not on the host. Whisper model (~250 MB) sits on the EBS volume so
-container restarts don't re-download it.
+These are the hydration binaries Phase 2.5 depends on, all bundled in
+the image (§5.1) so the same image transcribes locally and in cloud —
+nothing installed on the host:
+
+- **`whisper-cli`** — compiled from `whisper.cpp` (pinned to a release
+  tag) in a dedicated build stage, copied into the runtime image at
+  `/usr/local/bin/whisper-cli` (the path `config.whisper_binary_path`
+  defaults to).
+- **`ffmpeg`** — apt-installed in the runtime stage; whisper.cpp can't
+  decode compressed audio, so `video_transcriber.py` converts to 16 kHz
+  mono WAV via ffmpeg first.
+- **`yt-dlp`** — pip dependency (pinned in `requirements.txt`).
+
+The Whisper **model** (~250 MB) is the one piece NOT baked into the
+image — it lives on the data volume (`WHISPER_MODEL_PATH=/data/models/…`,
+on EBS in cloud) so container restarts don't re-download it. Download it
+once via `scripts/setup_whisper.sh`.
 
 ### 3.10 Process model: docker-compose is the deployment unit
 
@@ -403,29 +416,88 @@ Each step is its own milestone within Phase 4.0.6, in order.
 
 ### 5.1 M.1 — Containerize + server-side auth (laptop-only, no cloud yet)
 
-- **Bearer-token auth dependency in FastAPI** (~20 lines): reads
-  `BACKEND_API_TOKEN` from env; applied to `/capture` and `/recall`;
-  `/health` stays open. If the env var is unset (local dev), auth is
-  disabled — cloud always sets it. pytest coverage: 401 without
-  header, 401 with wrong token, 200 with right token, /health open.
-  **This ships before any cloud resource exists** (§3.7 sequencing
-  rule).
-- Write `Dockerfile`:
-  - Starts from `python:3.11-slim`
-  - Installs whisper.cpp + yt-dlp + ffmpeg
-  - **CPU-only torch wheel** (`--index-url .../whl/cpu`) — halves image size
-  - Installs Python deps from `requirements.txt`
-  - Copies `backend/` + `scripts/`
-  - Default command: `uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 1`
-- Build for **`linux/arm64`** via `docker buildx` (target is t4g, §3.1);
-  verify it also runs on the laptop (amd64 or Apple Silicon) for local testing
-- Write `docker-compose.yml` with the §3.10 service set — `app` and
-  `bot` testable locally now; `caddy` + `litestream` slots filled in
-  M.4/M.5
-- Verify `pytest tests/` still passes inside the container
-- Add `.dockerignore` to keep image size sane
+**Status: SHIPPED 2026-06-11** — see
+`docs/phase4.0.6-M1-local-smoke-test.md` for the runbook.
 
-**No cloud touched yet.** The compose file is the unit of deployment, validated locally.
+#### What landed
+
+- **`backend/auth.py`** — bearer-token FastAPI dependency. Reads
+  `BACKEND_BEARER_TOKEN` from settings (pydantic). Distinguishes
+  config bug (503, "auth not configured") from credential bug
+  (401, "bearer token required" / "bearer token invalid"). Constant-
+  time compare via `hmac.compare_digest`.
+- **Routes protected by the dep:** `/capture`, `/recall`, `/stats`,
+  `/failures`. Routes left public: `/` (root JSON), `/health`
+  (UptimeRobot probe surface).
+- **`tests/test_auth.py`** — coverage for: missing header, wrong
+  scheme, empty token, wrong token, correct token, lowercase scheme,
+  `/health` and `/` ignoring auth, public routes still respond when
+  token env var is unset.
+- **Chrome extension wired:** `content.js` (capture path) and
+  `recall.js` (Remember tab) read `bearerToken` from
+  `chrome.storage.local`, include `Authorization: Bearer …` on every
+  request, and surface helpful errors for 401 vs 503.
+- **Telegram bot wired:** `backend/telegram_bot/client.py` reads the
+  same `BACKEND_BEARER_TOKEN` env var and sends the header on every
+  POST /capture.
+- **`Dockerfile`** — multi-stage (builder + whisper-builder + runtime),
+  base `python:3.12-slim-bookworm` pinned by digest, non-root user
+  (`braintwin`, UID 10001), HEALTHCHECK on `/health`, default CMD runs
+  `uvicorn`. Bundles the hydration binaries: `ffmpeg` (apt) and
+  `whisper-cli` (compiled from pinned `whisper.cpp`, see §3.9).
+- **`docker-compose.yml`** — `app` service (auto-starts) and `bot`
+  service (gated behind `--profile with-bot`). `./data` bind-mounted at
+  `/data`; both services run with `no-new-privileges` + `cap_drop: ALL`.
+  Caddy + Litestream NOT in this compose file — they're cloud-only and
+  arrive in M.4 / M.5.
+
+#### Review fixes folded into M.1
+
+- **`requirements.txt` fully pinned** (`==`) for reproducible builds —
+  was mostly floating, which an image headed to cloud can't afford.
+- **Secrets are `SecretStr`** (`anthropic_api_key`, `telegram_bot_token`,
+  `backend_bearer_token`) so they don't leak via `repr(settings)`, logs,
+  or tracebacks; cleartext is read at use sites through `config.reveal()`.
+- **CORS `allow_credentials=False`** — auth is a Bearer header, not a
+  cookie, so credentialed CORS isn't needed and the `*`+credentials combo
+  (which makes Starlette reflect any origin) is removed. Origin lock to
+  `chrome-extension://<id>` still lands at M.7.
+- **SSM↔env name** — the bearer secret is `BACKEND_BEARER_TOKEN`
+  everywhere (was inconsistently `BACKEND_API_TOKEN` in §3.6/§5.3).
+- **`.dockerignore`** — strips `.git`, `data/`, `env/`, `node_modules`,
+  docs, `.env`, the cdk bootstrap folder, etc.
+- **`.env.example`** — adds `BACKEND_BEARER_TOKEN` at the top with a
+  one-liner generator command.
+
+#### What we deliberately did NOT do in M.1
+
+- No Caddy locally (TLS adds zero local value).
+- No Litestream locally (no S3 to back up to).
+- No CDK (M.2).
+- No cross-arch `docker buildx` (this is local-Mac only; arm64 cross-
+  build comes when we cut the image into ECR in M.3 / M.4).
+- No extension options page (M.6 / M.7) — the token is pasted into
+  `chrome.storage.local` via DevTools for local testing.
+
+#### Validate locally
+
+```bash
+cp .env.example .env
+# edit .env: set BACKEND_BEARER_TOKEN and ANTHROPIC_API_KEY
+docker compose build
+docker compose up app
+# in another terminal:
+curl -s http://127.0.0.1:8000/health                          # → 200
+curl -s -X POST http://127.0.0.1:8000/recall \
+     -H 'Content-Type: application/json' -d '{"query":"x"}'   # → 401
+curl -s -X POST http://127.0.0.1:8000/recall \
+     -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer $(grep BACKEND_BEARER_TOKEN .env | cut -d= -f2)" \
+     -d '{"query":"x"}'                                       # → 200 (or 503 if ANTHROPIC_API_KEY unset)
+```
+
+**No cloud touched yet.** The compose file is the unit of deployment,
+validated locally before M.2 introduces any infra code.
 
 ### 5.2 M.2 — CDK scaffold (no deploy)
 
@@ -448,7 +520,10 @@ Each step is its own milestone within Phase 4.0.6, in order.
 - `docker compose pull && docker compose up -d` — **`app` AND `bot`
   services both running** (the bot is why this phase exists; v1 of
   this doc forgot to deploy it)
-- `BACKEND_API_TOKEN` set from SSM — auth enforced from the first boot
+- `BACKEND_BEARER_TOKEN` set from SSM — auth enforced from the first boot
+  (the SSM parameter name MUST map to env var `BACKEND_BEARER_TOKEN`, which
+  is what pydantic `Settings.backend_bearer_token` reads — a mismatch here
+  fails closed with a silent 503 on every protected route)
 - Smoke test via `curl` (with and without the bearer token) from laptop;
   forward a Telegram message and confirm it lands in the captures table
 
@@ -504,11 +579,12 @@ Each step is its own milestone within Phase 4.0.6, in order.
 
 ---
 
-## 6. High-level design (HLD) — diagrams in the codebase
+## 6. High-level design (HLD) — diagrams across two repos
 
-> Added 2026-06-10 per request. The goal: one canonical architecture
-> picture plus per-flow sequence diagrams, both lives in `docs/diagrams/`
-> so they're version-controlled, PR-reviewable, and regenerable.
+> Added 2026-06-10; **revised 2026-06-11** to reflect the two-repo
+> split (BrainTwin = application; BrainTwinCDK = infrastructure).
+> The goal: one canonical AWS topology picture plus per-flow sequence
+> diagrams, both version-controlled, PR-reviewable, and regenerable.
 
 ### 6.1 Three-layer diagram strategy
 
@@ -541,20 +617,31 @@ Each step is its own milestone within Phase 4.0.6, in order.
   GUI-only so PR review shows blob diffs, not human-readable changes.
   Acceptable backup if `diagrams`/Mermaid fail us, not the primary.
 
-### 6.4 What lives where
+### 6.4 What lives where (two-repo split)
 
 ```
-docs/diagrams/
-├── README.md                   # folder guide + regenerate/maintenance instructions
+BrainTwin/docs/diagrams/        # application repo — request lifecycles
+├── README.md
+├── flow-capture.md             # Chrome → /capture → SQL + Chroma + S3
+├── flow-recall.md              # /recall → RetrievalService + RRF + Sonnet rerank
+├── flow-refinement.md          # multi-turn refinement (U.3)
+└── flow-failure-modes.md       # degraded behavior per component
+
+BrainTwinCDK/diagrams/          # infra repo — cloud topology + restore drill
+├── README.md
 ├── architecture.py             # Python `diagrams` script — source of truth for topology
 ├── architecture.png            # generated; committed alongside the script
-├── flow-capture.md             # Mermaid sequence diagram for the /capture path
-├── flow-recall.md              # Mermaid sequence diagram for /recall + Sonnet rerank
-├── flow-refinement.md          # Mermaid for multi-turn refinement (U.3)
-├── flow-failure-modes.md       # Mermaid for fault-isolated ranker degradation, Sonnet failures
 ├── flow-backup-restore.md      # Mermaid for the M.5 litestream + DLM restore drill
 └── cdk-generated.png           # post-M.2: auto-generated by `cdk-dia` from the CDK code
 ```
+
+The split rationale: a reader who only cares about "what does this
+product do" reads BrainTwin and sees request flows. A reader who
+cares about "how is it deployed" reads BrainTwinCDK and sees the
+topology + restore drill. App-behavior changes are PRs against
+BrainTwin; cloud-topology changes are PRs against BrainTwinCDK. PRs
+that span both (e.g. a new outbound dependency) require coordinated
+commits.
 
 ### 6.5 Architecture script outline (to land in M.0)
 
@@ -574,22 +661,25 @@ The `architecture.py` script will use the official AWS provider in
 - **Operator access:** SSM Session Manager (no SSH, no port 22)
 
 Each node labelled with its CDK construct name so the picture maps
-1:1 to `infra/lib/braintwin-stack.ts`.
+1:1 to `BrainTwinCDK/lib/braintwin-stack.ts` once M.2 lands. The
+construct-ID convention is locked in `BrainTwinCDK/lib/README.md`.
 
 ### 6.6 Sequence diagrams that earn their keep
 
-Five Mermaid flows worth the time, all in `docs/diagrams/flow-*.md`:
+Five Mermaid flows worth the time, four of which live in
+`BrainTwin/docs/diagrams/flow-*.md` (app behavior) and one in
+`BrainTwinCDK/diagrams/flow-backup-restore.md` (infra operation):
 
-1. **Capture path** — Chrome extension → /capture → enrichment
-   worker → SQL + Chroma + S3 (image upload)
-2. **Recall happy path** — /recall → RetrievalService (Chroma +
-   FTS5 in parallel) → RRF fusion → Sonnet rerank → response
-3. **Recall refinement turn** — second call with conversation_id,
-   showing the "no fresh retrieval" branch from U.3
-4. **Failure mode: Sonnet 503** — degraded rule-based rerank,
-   bm25-only / vector-only paths
-5. **Backup + restore drill** — litestream WAL → S3, restore to a
-   fresh EBS volume — for the M.5 restore exercise
+1. **Capture path** (BrainTwin) — Chrome extension → /capture →
+   enrichment worker → SQL + Chroma + S3 (image upload)
+2. **Recall happy path** (BrainTwin) — /recall → RetrievalService
+   (Chroma + FTS5 in parallel) → RRF fusion → Sonnet rerank → response
+3. **Recall refinement turn** (BrainTwin) — second call with
+   conversation_id, showing the "no fresh retrieval" branch from U.3
+4. **Failure mode: degraded paths** (BrainTwin) — Sonnet 503 / Chroma
+   down → rule-based rerank, bm25-only or vector-only branches
+5. **Backup + restore drill** (BrainTwinCDK) — litestream WAL → S3,
+   restore to a fresh EBS volume — for the M.5 restore exercise
 
 These give a new contributor the on-ramp from "what is this thing"
 to "I can find where to make my change" in 15 minutes.
@@ -606,11 +696,16 @@ to "I can find where to make my change" in 15 minutes.
 
 - The diagrams are source-of-truth for review. PR descriptions that
   add or remove infrastructure resources MUST update either
-  `architecture.py` or the appropriate flow doc.
-- `architecture.png` is regenerated on every change to
-  `architecture.py` and both committed together.
-- A CI check (Phase 4.0.6.1, after the GitHub Actions pipeline is up)
-  will fail if `architecture.png` is stale relative to its script.
+  `architecture.py` (in BrainTwinCDK) or the appropriate flow doc.
+- `architecture.png` lives in BrainTwinCDK alongside its source. It's
+  regenerated on every change to `architecture.py` and both committed
+  together.
+- A CI check in BrainTwinCDK (Phase 4.0.6.1) will fail PRs where
+  `architecture.png` is older than its script.
+- Cross-repo discipline: a PR in BrainTwin that adds a new outbound
+  AWS dependency MUST be accompanied by a coordinated PR in
+  BrainTwinCDK updating `architecture.py`. Each repo's PR description
+  should link the other.
 
 ---
 

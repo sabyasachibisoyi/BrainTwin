@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from backend.config import settings
+from backend.config import reveal, settings
 
 
 logger = logging.getLogger(__name__)
@@ -29,12 +29,26 @@ class CaptureClient:
         base_url: str | None = None,
         min_interval_ms: int | None = None,
         timeout_s: float = 60.0,
+        bearer_token: str | None = None,
     ) -> None:
         self.url = base_url or settings.backend_capture_url
         self._min_interval_s = (min_interval_ms or settings.telegram_post_min_interval_ms) / 1000.0
         self._lock = asyncio.Lock()
         self._last_post_at: float = 0.0
-        self._client = httpx.AsyncClient(timeout=timeout_s)
+        # Phase 4.0.6 M.1 — share the bearer with the FastAPI app. Same
+        # process pulls the same env var, but accept an override so a
+        # caller can inject a different token (tests, future per-bot
+        # tokens).
+        self._bearer_token = bearer_token if bearer_token is not None else reveal(settings.backend_bearer_token)
+        headers = {}
+        if self._bearer_token:
+            headers["Authorization"] = f"Bearer {self._bearer_token}"
+        else:
+            logger.warning(
+                "CaptureClient starting WITHOUT a bearer token — POST /capture "
+                "will 503/401 against any backend that has M.1 auth on."
+            )
+        self._client = httpx.AsyncClient(timeout=timeout_s, headers=headers)
 
     async def aclose(self) -> None:
         await self._client.aclose()
