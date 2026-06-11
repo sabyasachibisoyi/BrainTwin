@@ -1,79 +1,49 @@
-# `docs/diagrams/` — architecture HLD
+# `BrainTwin/docs/diagrams/` — per-flow Mermaid diagrams
 
-Canonical source of truth for the BrainTwin / DigitalTwin cloud
-architecture. See `docs/phase4.0.6-deployment-design.md` §6 for the
-design rationale; this folder holds the actual artifacts.
+This folder holds **application-behavior** diagrams (what happens
+inside the request lifecycle). AWS topology + the backup/restore
+drill live in the companion repo at
+**[sabyasachibisoyi/BrainTwinCDK/diagrams/](https://github.com/sabyasachibisoyi/BrainTwinCDK/tree/main/diagrams)**.
 
-## Layout
+## What's here
 
-```
-docs/diagrams/
-├── README.md                 # this file
-├── architecture.py           # Python `diagrams` topology source
-├── architecture.png          # ← regenerated from architecture.py
-├── flow-capture.md           # Mermaid: capture path
-├── flow-recall.md            # Mermaid: recall happy path
-├── flow-refinement.md        # Mermaid: multi-turn refinement (U.3)
-├── flow-failure-modes.md     # Mermaid: degraded-mode behavior
-└── flow-backup-restore.md    # Mermaid: backup + restore drill
-```
+| File | Captures |
+|------|----------|
+| `flow-capture.md` | Capture path: Chrome → /capture → SQLite + Chroma + S3 |
+| `flow-recall.md` | Recall happy path: RetrievalService + RRF + Sonnet rerank |
+| `flow-refinement.md` | Multi-turn refinement (U.3) — "no fresh retrieval" branch |
+| `flow-failure-modes.md` | Degraded behavior per component (Chroma / Sonnet / EBS / …) |
 
-After Phase 4.0.6 M.2 (CDK lands), one more file gets auto-generated:
+## What moved to BrainTwinCDK
 
-```
-└── cdk-generated.png         # ← `cdk-dia` output; compare against architecture.png
-```
+| File | Why it moved |
+|------|--------------|
+| `architecture.py` / `architecture.png` | AWS topology — belongs next to the CDK that creates the resources |
+| `flow-backup-restore.md` | Pure infra operation; runs against AWS |
 
-## Three-layer strategy (recap)
+## Why the split
 
-| Layer | Tool | What it captures |
-|-------|------|------------------|
-| Topology | `architecture.py` → PNG (Python `diagrams`, official AWS icons) | The big static picture |
-| Flows | `flow-*.md` (Mermaid, renders inline on GitHub) | Per-request lifecycles |
-| Verification | `cdk-dia` (post-M.2) | Auto-generated from CDK; catches drift |
+Two-repo design: `BrainTwin` is the **application**, `BrainTwinCDK` is
+the **cloud infrastructure**. A reader who only cares about "what does
+this product do" reads BrainTwin and sees the request flows. A reader
+who cares about "how is it deployed" reads BrainTwinCDK and sees the
+topology + the restore drill.
 
-## How to regenerate `architecture.png`
+Design rationale in `phase4.0.6-deployment-design.md` §6.
 
-One-time setup on your Mac:
+## Viewing Mermaid
 
-```bash
-brew install graphviz
-pip install diagrams
-```
+All files in this folder are Mermaid. To preview locally:
 
-Then any time you change `architecture.py`:
-
-```bash
-cd /path/to/BrainTwin
-python docs/diagrams/architecture.py
-```
-
-This writes `docs/diagrams/architecture.png`. Commit both files in
-the same PR so the picture and its source never drift.
-
-## How to view the Mermaid flows
-
-Just open the `.md` files on GitHub — they render natively. Locally,
-any IDE with Mermaid preview (VS Code + Markdown Preview Mermaid
-Support, JetBrains, Obsidian) will render them inline.
+- **GitHub** — renders natively in the web UI; just push the branch
+- **Cursor / VS Code** — install the `bierner.markdown-mermaid`
+  extension, then `Cmd+Shift+V` on any `.md` file
+- **CLI** — `npx -p @mermaid-js/mermaid-cli mmdc -i flow-capture.md -o /tmp/x.png`
 
 ## Maintenance contract
 
-A PR that adds or removes infrastructure resources MUST also update:
-
-- `architecture.py` (and regenerate the PNG) if a topology node /
-  edge changes
-- The relevant `flow-*.md` if a request path / failure path changes
-
-A future CI check (Phase 4.0.6.1, with the GitHub Actions pipeline)
-will fail if `architecture.png` is older than `architecture.py`.
-
-## Why not Miro / Lucidchart / drawio
-
-- **Miro / Lucidchart** — not version-controlled, not PR-reviewable,
-  not greppable. Fine for ad-hoc whiteboards; rejected as canonical.
-- **drawio** — the XML *can* be committed, but the editor is GUI-only
-  so PR review shows blob diffs, not human-readable changes.
-
-The picture-as-code approach above is the smallest setup that gives us
-a diagram every reviewer can read AND a diff every reviewer can review.
+A PR that changes application request flow MUST update the relevant
+`flow-*.md` here. A PR that changes AWS topology MUST update
+`architecture.py` over in BrainTwinCDK. PRs that change both
+(e.g. introduce a new outbound dependency) require coordinated commits
+to both repos.

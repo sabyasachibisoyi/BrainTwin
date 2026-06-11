@@ -2,6 +2,36 @@
 
 Your Knowledge Twin Agent — captures everything you consume digitally, builds a living knowledge base, and competes against you in knowledge battles.
 
+> **Naming.** Codename is **BrainTwin** (repo, code, docs, IAM, stacks).
+> Public product brand is **DigitalTwin** (Chrome extension, Telegram
+> bot greetings, `digitaltwin.app`). The split is locked in
+> [`docs/phase4.0.6-deployment-design.md` §11](docs/phase4.0.6-deployment-design.md).
+
+## Companion repo — infrastructure
+
+This repo is the **application**: FastAPI backend, Chrome extension,
+Telegram bot, ML pipelines.
+
+The **cloud infrastructure** (AWS CDK TypeScript stack, topology
+diagrams, backup/restore drill, ops runbooks) lives in
+**[sabyasachibisoyi/BrainTwinCDK](https://github.com/sabyasachibisoyi/BrainTwinCDK)**.
+
+Read here if you want to understand how the product works. Read there
+if you want to understand how it's deployed. The split rationale is in
+[`docs/phase4.0.6-deployment-design.md` §3.0 and §6](docs/phase4.0.6-deployment-design.md).
+
+| What you'll find | Here (`BrainTwin`) | Over there ([`BrainTwinCDK`](https://github.com/sabyasachibisoyi/BrainTwinCDK)) |
+|---|---|---|
+| FastAPI app code | ✅ `backend/` | — |
+| Chrome extension | ✅ `extension/` | — |
+| Telegram bot | ✅ `backend/telegram_bot/` | — |
+| Phase design docs | ✅ `docs/phase*.md` | — |
+| Per-flow Mermaid diagrams | ✅ `docs/diagrams/flow-*.md` | — |
+| AWS CDK stack | — | ✅ `lib/braintwin-stack.ts` (M.2) |
+| Cloud topology picture | — | ✅ `diagrams/architecture.py` + `.png` |
+| Backup + restore drill | — | ✅ `diagrams/flow-backup-restore.md` |
+| Ops runbooks | — | ✅ `docs/` (post-M.2) |
+
 ## Quick Start
 
 ### Prerequisites
