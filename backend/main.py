@@ -10,14 +10,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.agent.recaller import Recaller
 from backend.agent.retrieval import RetrievalService
+from backend.auth import require_bearer_token
 from backend.capture.processor import CaptureInput, process
-from backend.config import settings
+from backend.config import reveal, settings
 from backend.knowledge.enrichment_worker import (
     enqueue_enrichment,
     hydrate_processed_from_capture,
@@ -50,11 +51,18 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Allow Chrome extension to talk to local backend
+# Allow Chrome extension to talk to local backend.
+#
+# allow_credentials is False: auth is a Bearer header (the bearer token),
+# never a cookie, so credentialed CORS isn't needed — and "*" +
+# allow_credentials=True makes Starlette reflect ANY origin back, which is
+# the misconfig we don't want. allow_origins stays "*" for local dev; M.7
+# tightens it to chrome-extension://<id> at the cloud cutover (see
+# phase4.0.6-deployment-design.md §3.7).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -167,7 +175,7 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "vision_api_configured": bool(settings.anthropic_api_key),
+        "vision_api_configured": bool(reveal(settings.anthropic_api_key)),
     }
 
 
@@ -253,7 +261,7 @@ async def _startup() -> None:
         )
 
     global _llm_client, _recaller
-    if not settings.anthropic_api_key:
+    if not reveal(settings.anthropic_api_key):
         logger.warning(
             "ANTHROPIC_API_KEY is empty — Phase 2 enrichment AND Phase 4 "
             "recall are DISABLED. Captures will still be persisted; set "
@@ -317,7 +325,7 @@ def _detect_source(payload: CapturePayload) -> str:
     return "unknown"
 
 
-@app.post("/capture")
+@app.post("/capture", dependencies=[Depends(require_bearer_token)])
 async def capture_content(payload: CapturePayload, background_tasks: BackgroundTasks):
     """Receive captured content from Chrome extension or Telegram bot.
 
@@ -351,7 +359,7 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
         )
         # If no API key is set, skip the Vision call so the pipeline still
         # works end-to-end for local testing.
-        skip_vision = not bool(settings.anthropic_api_key)
+        skip_vision = not bool(reveal(settings.anthropic_api_key))
         processed = process(capture, skip_vision_api=skip_vision)
     except Exception as e:
         logger.exception("Capture processing failed")
@@ -427,7 +435,7 @@ async def capture_content(payload: CapturePayload, background_tasks: BackgroundT
     }
 
 
-@app.post("/recall")
+@app.post("/recall", dependencies=[Depends(require_bearer_token)])
 async def recall(payload: RecallPayload):
     """Phase 4 M.4 — vague-recall search (use case B).
 
@@ -478,7 +486,7 @@ async def recall(payload: RecallPayload):
     return response.to_dict()
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(require_bearer_token)])
 async def get_stats():
     """Knowledge base statistics, read from SQL.
 
@@ -549,7 +557,7 @@ def _count_enrichment_skipped(failures_log: Path) -> int:
     return count
 
 
-@app.get("/failures")
+@app.get("/failures", dependencies=[Depends(require_bearer_token)])
 async def get_failures(
     limit: int = 10,
     phase: str | None = None,

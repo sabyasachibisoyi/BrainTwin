@@ -31,7 +31,7 @@ from telegram.ext import (
     filters,
 )
 
-from backend.config import settings
+from backend.config import reveal, settings
 from backend.telegram_bot import handlers
 from backend.telegram_bot.client import CaptureClient
 
@@ -67,7 +67,7 @@ PLACEHOLDER_TOKEN = "123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
 
 
 def build_application() -> Application:
-    token = settings.telegram_bot_token.strip()
+    token = reveal(settings.telegram_bot_token).strip()
     if not token:
         print(
             "ERROR: TELEGRAM_BOT_TOKEN is empty. Set it in .env (see .env.example).",
@@ -85,7 +85,7 @@ def build_application() -> Application:
 
     app = (
         Application.builder()
-        .token(settings.telegram_bot_token)
+        .token(token)
         .post_init(_on_startup)
         .post_shutdown(_on_shutdown)
         .build()

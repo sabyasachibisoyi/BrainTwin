@@ -1,0 +1,66 @@
+# --- Things that bloat the build context for no reason ---
+.git
+.github
+.gitignore
+.gitattributes
+
+# Local virtualenvs / Python build artifacts
+env
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Data — never bake the user's corpus into the image
+data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Node / extension build output
+extension/node_modules
+node_modules
+
+# Editor & OS
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local secrets — defense in depth (the .env at root must NOT land
+# in the image; secrets come from SSM Parameter Store in cloud and
+# from compose env_file at local dev time)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Docs that don't need to ship
+docs
+README.md
+braintwin-cdk-bootstrap
+
+# Build artifacts
+build
+dist
+
+# CI
+.gitlab-ci.yml
+.circleci
+
+# The Dockerfile itself doesn't need to be in the build context
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

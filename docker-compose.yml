@@ -1,0 +1,136 @@
+# DigitalTwin / BrainTwin — local docker-compose.
+#
+# Phase 4.0.6 M.1 scope: prove the FastAPI app boots inside a container,
+# with the bearer-token auth gate, against a host-mounted data volume.
+# Telegram bot included as a profile so it's opt-in (you can run app-only
+# during dev without the bot trying to authenticate to Telegram).
+#
+# Caddy and Litestream are intentionally absent at M.1 — they're for the
+# cloud profile (M.3+, M.4+). Local testing uses plain HTTP on :8000.
+#
+# Usage:
+#   cp .env.example .env                    # then edit secrets
+#   docker compose build                    # build the image once
+#   docker compose up app                   # foreground; Ctrl+C to stop
+#   docker compose --profile with-bot up    # also run telegram bot
+#   docker compose down                     # stop & remove containers
+#
+# Data persistence: we bind-mount the host's ./data/ directory into the
+# container at /data. This way the container reads/writes the SAME files
+# that local `uvicorn backend.main:app` writes — no migration when you
+# switch between dev modes, and your existing local corpus is visible
+# through the container immediately.
+#
+# CAUTION: don't run `uvicorn` AND `docker compose up app` at the same
+# time — both want write access to ./data/braintwin.db's SQLite WAL and
+# one will lose. Pick one mode for any given session.
+#
+# This same pattern goes to the cloud unchanged: on EC2 the host path
+# `/var/lib/braintwin/data/` lives on the EBS volume and is bind-mounted
+# into the container at /data. The Dockerfile and code are identical;
+# only the backing filesystem of the mount changes.
+
+services:
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: braintwin:local
+    container_name: braintwin-app
+    restart: unless-stopped
+
+    # Hardening (review fix). The app already runs as non-root (Dockerfile);
+    # these stop a compromised process from escalating: no new privileges,
+    # and drop every Linux capability it never needs (it binds :8000 > 1024
+    # and shells out to ffmpeg/whisper — none of which needs a capability).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # FastAPI on :8000 → bind to host :8000 so the Chrome extension's
+    # http://127.0.0.1:8000 keeps working unchanged.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      # ----- Paths inside the container — point at /data so the bind
+      # mount surfaces the host's ./data/ contents.
+      SQLITE_PATH: /data/braintwin.db
+      CHROMA_PATH: /data/chroma
+      IMAGES_PATH: /data/images
+      TELEGRAM_STATE_PATH: /data/telegram_state.json
+      CAPTURE_FAILURES_PATH: /data/capture_failures.jsonl
+      ENRICHMENTS_PATH: /data/enrichments.jsonl
+      HYDRATIONS_PATH: /data/hydrations.jsonl
+      # Storage layer's async URL. Note 4 slashes — sqlite absolute path.
+      DATABASE_URL: sqlite+aiosqlite:////data/braintwin.db
+      # FastAPI binds 0.0.0.0 inside the container; Docker maps to host.
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: "8000"
+      # whisper.cpp binary is baked into the image at /usr/local/bin/whisper-cli
+      # (config default). The ~250 MB model is NOT in the image — it lives on
+      # the data mount; download it once with scripts/setup_whisper.sh.
+      WHISPER_MODEL_PATH: /data/models/ggml-small.en.bin
+      # M.1 — bearer token is read from .env (env_file above).
+
+    volumes:
+      # Bind-mount the host ./data into the container's /data. On Mac,
+      # Docker Desktop handles UID/GID translation transparently — files
+      # written by the container's `braintwin` user (UID 10001) appear
+      # owned by your Mac user. On Linux (the EC2 host later), we'll
+      # chown /var/lib/braintwin/data/ to 10001 once at instance launch
+      # in M.3 user-data.
+      - ./data:/data
+
+    healthcheck:
+      # Mirrors the Dockerfile's HEALTHCHECK so `docker compose ps` shows
+      # "healthy" once /health responds.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: braintwin:local
+    container_name: braintwin-bot
+    restart: unless-stopped
+    # Hardening (review fix) — same rationale as the app service.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Opt-in. Start with `docker compose --profile with-bot up`.
+    profiles:
+      - with-bot
+
+    env_file:
+      - .env
+
+    environment:
+      # The bot posts captures to the app container by service name.
+      BACKEND_CAPTURE_URL: http://app:8000/capture
+      SQLITE_PATH: /data/braintwin.db
+      CHROMA_PATH: /data/chroma
+      IMAGES_PATH: /data/images
+      TELEGRAM_STATE_PATH: /data/telegram_state.json
+      CAPTURE_FAILURES_PATH: /data/capture_failures.jsonl
+      DATABASE_URL: sqlite+aiosqlite:////data/braintwin.db
+
+    volumes:
+      # Same bind-mount as `app` — bot writes to the same SQLite + Chroma.
+      - ./data:/data
+
+    command: ["python", "-m", "backend.telegram_bot.bot"]
+
+    depends_on:
+      app:
+        condition: service_healthy

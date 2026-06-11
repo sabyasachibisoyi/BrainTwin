@@ -20,7 +20,7 @@ from typing import Any
 
 import anthropic
 
-from backend.config import settings
+from backend.config import reveal, settings
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ class LLMClient:
     """
 
     def __init__(self, *, api_key: str | None = None, model: str | None = None):
-        key = api_key if api_key is not None else settings.anthropic_api_key
+        key = api_key if api_key is not None else reveal(settings.anthropic_api_key)
         if not key:
             raise PermanentLLMError(
                 "ANTHROPIC_API_KEY is empty — set it in .env. See .env.example."

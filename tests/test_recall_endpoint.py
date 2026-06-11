@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from backend import main as main_mod  # noqa: E402
 from backend.agent.recaller import RankedResult, RecallResponse  # noqa: E402
+from backend.auth import require_bearer_token  # noqa: E402
 from backend.storage import DEFAULT_USER_ID  # noqa: E402
 
 
@@ -98,8 +99,17 @@ def _make_response(
 @pytest.fixture
 def client():
     """FastAPI TestClient — uses the real `app` but tests inject the
-    Recaller via monkeypatch."""
-    return TestClient(main_mod.app)
+    Recaller via monkeypatch.
+
+    Phase 4.0.6 M.1: bypass the bearer-token dep so these tests stay
+    focused on recall behavior. Auth itself is covered in
+    tests/test_auth.py.
+    """
+    main_mod.app.dependency_overrides[require_bearer_token] = lambda: None
+    try:
+        yield TestClient(main_mod.app)
+    finally:
+        main_mod.app.dependency_overrides.pop(require_bearer_token, None)
 
 
 @pytest.fixture

@@ -84,6 +84,15 @@ async function postRecall(query, convId) {
   const body = { query };
   if (convId) body.conversation_id = convId;
 
+  // Phase 4.0.6 M.1 — bearer-token auth. Stored in chrome.storage.local
+  // under `bearerToken`. For local dev, paste it via DevTools:
+  //   chrome.storage.local.set({bearerToken: 'your-token'})
+  const { bearerToken } = await chrome.storage.local.get("bearerToken");
+  const headers = { "Content-Type": "application/json" };
+  if (bearerToken) {
+    headers["Authorization"] = `Bearer ${bearerToken}`;
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), RECALL_TIMEOUT_MS);
 
@@ -91,7 +100,7 @@ async function postRecall(query, convId) {
   try {
     response = await fetch(`${BACKEND_URL}/recall`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -104,7 +113,22 @@ async function postRecall(query, convId) {
     clearTimeout(timeoutId);
   }
 
+  if (response.status === 401) {
+    throw new Error("UNAUTHORIZED");
+  }
   if (response.status === 503) {
+    // 503 from /recall is ambiguous between "Recaller not running"
+    // (missing ANTHROPIC_API_KEY) and "auth not configured" (M.1).
+    // Peek at detail to disambiguate so the user gets a useful message.
+    try {
+      const peek = await response.clone().json();
+      const detail = String(peek?.detail || "").toLowerCase();
+      if (detail.includes("auth")) {
+        throw new Error("AUTH_NOT_CONFIGURED");
+      }
+    } catch (_) {
+      // fall through
+    }
     throw new Error("NO_RECALLER");
   }
   if (response.status === 422) {
@@ -126,6 +150,13 @@ function friendlyError(err) {
     case "TIMEOUT":
       return "Search took too long. Try a shorter query, or check " +
              "if Sonnet is reachable.";
+    case "UNAUTHORIZED":
+      return "Bearer token missing or wrong. Open this popup's " +
+             "DevTools console and run: " +
+             "chrome.storage.local.set({bearerToken: 'your-token'})";
+    case "AUTH_NOT_CONFIGURED":
+      return "Backend has auth turned on but no token set. Set " +
+             "BACKEND_BEARER_TOKEN in the backend's .env and restart.";
     case "NO_RECALLER":
       return "The recall agent isn't running. Set ANTHROPIC_API_KEY in " +
              ".env and restart the backend.";

@@ -17,7 +17,7 @@ from typing import Optional
 
 import httpx
 
-from backend.config import settings
+from backend.config import reveal, settings
 
 
 logger = logging.getLogger(__name__)
@@ -192,10 +192,10 @@ def describe_image(data: bytes, mime: str) -> tuple[str, str]:
     except ImportError as e:
         raise RuntimeError("anthropic SDK not installed") from e
 
-    if not settings.anthropic_api_key:
+    if not reveal(settings.anthropic_api_key):
         raise RuntimeError("ANTHROPIC_API_KEY not set in .env")
 
-    client = Anthropic(api_key=settings.anthropic_api_key)
+    client = Anthropic(api_key=reveal(settings.anthropic_api_key))
     b64 = base64.b64encode(data).decode("ascii")
 
     response = client.messages.create(
