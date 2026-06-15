@@ -80,9 +80,17 @@ WORKDIR /tmp/whisper.cpp
 # BUILD_SHARED_LIBS=OFF → static link libwhisper/libggml into the binary,
 # so we copy ONE self-contained file into runtime (no libwhisper.so.1 to
 # chase). Server/tests off to keep the build lean.
+#
+# GGML_NATIVE=OFF → don't probe the build host's CPU. When buildx
+# cross-builds linux/arm64 under QEMU emulation, ggml's auto-detection
+# emits an `-mcpu=native+nodotprod+noi8mm+nosve` flag that the container's
+# GCC rejects, failing the whole compile. Disabling it produces a portable
+# armv8-a baseline binary — correct here, since the build host (emulated)
+# is never the run host (Graviton).
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_NATIVE=OFF \
         -DWHISPER_BUILD_TESTS=OFF \
         -DWHISPER_BUILD_SERVER=OFF \
  && cmake --build build -j --config Release \

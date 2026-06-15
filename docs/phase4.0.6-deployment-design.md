@@ -1,6 +1,16 @@
 # Phase 4.0.6 — Cloud Deployment (AWS)
 
-> **Status as of 2026-06-10 — DESIGN UPDATED (region + diagrams + branding).**
+> **Status as of 2026-06-15 — M.1 + M.2 + M.3 SHIPPED. M.4 next (Caddy + Cloudflare + cert).**
+>
+> Update summary (2026-06-15):
+>   1. **M.3 first cloud deploy shipped.** Two-phase deploy sequence
+>      (bootstrap tag → populate SSM secrets → push real image →
+>      redeploy), per-service awslogs driver, SSM Session Manager
+>      smoke test, both app+bot services running. Runbook in
+>      `phase4.0.6-M3-first-cloud-deploy.md`. §5.3 rewritten.
+>   2. **Brand consolidation.** `digitaltwin.*` was unavailable;
+>      consolidated on **BrainTwin everywhere**, domain `braintwin.net`.
+>      §11 rewritten as decision history.
 >
 > Update summary (2026-06-10):
 >   1. **Region:** Primary region is now **`us-west-2` (Oregon/PDX)** for
@@ -556,22 +566,83 @@ validated locally before M.2 introduces any infra code.
 
 ### 5.3 M.3 — First deploy
 
-- **Account signup on the Paid Plan** (NOT Free Plan — §2.1; Free
-  Plan accounts auto-close at 6 months). Budget alerts within the
-  first 5 minutes (§3.8), before anything else.
-- `aws configure` with credentials (use an IAM user, not root)
-- `cdk bootstrap` (one-time per account/region)
-- `cdk deploy` — creates everything; security group is operator-IP-only at this point
-- Connect via **SSM Session Manager** (no SSH)
-- `docker compose pull && docker compose up -d` — **`app` AND `bot`
-  services both running** (the bot is why this phase exists; v1 of
-  this doc forgot to deploy it)
-- `BACKEND_BEARER_TOKEN` set from SSM — auth enforced from the first boot
-  (the SSM parameter name MUST map to env var `BACKEND_BEARER_TOKEN`, which
-  is what pydantic `Settings.backend_bearer_token` reads — a mismatch here
-  fails closed with a silent 503 on every protected route)
-- Smoke test via `curl` (with and without the bearer token) from laptop;
-  forward a Telegram message and confirm it lands in the captures table
+Shipped 2026-06-15. See full runbook in
+[`phase4.0.6-M3-first-cloud-deploy.md`](phase4.0.6-M3-first-cloud-deploy.md);
+this section summarizes what landed and why.
+
+**The two-phase first deploy.** ECR doesn't exist on day one, so we
+can't push an image until CDK creates the repo. Resolved with a
+deliberate two-phase sequence:
+
+1. `cdk deploy --context imageTag=bootstrap` — creates ECR + S3 + EC2 +
+   everything else. The EC2 boots, user-data fails on the `docker pull`
+   (expected — the synth warning calls this out loudly).
+2. `BrainTwinCDK/scripts/put-secrets.sh` — populates the four
+   SecureString SSM parameters (CFN can't create SecureStrings; the
+   helper feeds values via stdin, never argv).
+3. `BrainTwin/scripts/build-and-push.sh` — buildx cross-compiles
+   `linux/arm64`, pushes to ECR, writes the tag to `.last-deploy-tag`.
+4. `BrainTwinCDK/scripts/deploy.sh` — reads `.last-deploy-tag`, runs
+   `cdk deploy --context imageTag=<real-tag>`. The user-data change
+   triggers a CFN replacement of the EC2; the new instance picks up
+   the existing EBS volume (RETAIN policy) on first boot, so no data
+   loss.
+
+**Image tag scheme (locked).**
+- Pre-launch: `snapshot-<git-sha>` (or `snapshot-<sha>-dirty-<ts>`
+  if the working tree has uncommitted changes — the timestamp avoids
+  ECR's immutable-tag collision when iterating on the same commit).
+- Releases: `v<MAJOR>.<MINOR>.<PATCH>` semver. The build script
+  refuses release builds from a dirty tree.
+- ECR is configured with `imageTagMutability: IMMUTABLE` — every push
+  is a distinct unique tag. No `:latest`, no mutable convenience
+  pointers.
+
+**Both services in this milestone (not deferred).** Decision rationale:
+the bot is one of the two product surfaces and the compose template
+already covers both — splitting them across M.3 / M.4 was extra
+complexity without payoff. M.3 success criteria covers both: app
+answers `/health` AND the bot DMs you your Telegram user ID on
+`/start` (smoke-tested via SSM Session Manager).
+
+**What the user-data does at boot (`compute.ts`).** End-to-end app
+bring-up: install Docker + AWS CLI + jq → wait for the EBS data volume
+to attach by size-match → mount at `/var/lib/braintwin/data` (preserves
+filesystem if one exists) → resolve account+region from IMDSv2 →
+fetch the four SSM secrets into `/etc/braintwin/secrets.env` (mode
+0600, `umask 077` belt-and-suspenders) → `docker login` to ECR via
+`get-login-password --password-stdin` → write
+`/etc/braintwin/docker-compose.yml` with the imageTag + ECR registry
++ both log group names interpolated → `docker compose pull && up -d`.
+
+**Per-service awslogs driver in the compose template.** App container's
+stdout streams to `/braintwin/app`, bot to `/braintwin/bot`. The
+instance role has `logs:CreateLogStream + PutLogEvents` on both
+groups via `observability.grantLogWrite()`. `aws logs tail` from the
+laptop is the off-EC2 log read path.
+
+**SSM Session Manager — no SSH, no port :22.** The instance role has
+`AmazonSSMManagedInstanceCore`; the Ubuntu 22.04 AMI ships the SSM
+agent. `aws ssm start-session --target i-xxx` is the only shell path
+into the box, ever. Smoke testing for M.3 runs entirely inside that
+session: `curl 127.0.0.1:8000/health`, `docker compose ps`,
+`docker compose logs -f app`. The Cloudflare-only SG is in place but
+public ingress on :443 has nothing listening on it until M.4 adds
+Caddy.
+
+**Bearer-token auth enforced from the first boot.** Same fail-closed
+behaviour from M.1: empty `BACKEND_BEARER_TOKEN` makes every protected
+route return 503 ("auth not configured"), not 200. The SSM parameter
+name (`/braintwin/bearer_token`) maps to env var `BACKEND_BEARER_TOKEN`
+via the heredoc in user-data — pydantic `Settings.backend_bearer_token`
+reads it. A name mismatch fails closed silently.
+
+**Deferred to M.4 / M.5.** Caddy reverse proxy + Cloudflare DNS +
+ACME DNS-01 cert + Authenticated Origin Pulls land in M.4 (the only
+piece that opens the EC2 to the public internet). Litestream WAL
+streaming to S3 lands in M.5. CloudWatch Agent for host-level metrics
+(CPU / memory / disk) lands in M.6. A 5th SSM parameter for
+`ALLOWED_TELEGRAM_USER_IDS` is Phase 4.0.6.1 polish.
 
 ### 5.4 M.4 — Caddy + Cloudflare + domain
 
@@ -580,7 +651,7 @@ validated locally before M.2 introduces any infra code.
   → Elastic IP, SSL mode **Full (strict)**
 - Scoped Cloudflare API token into SSM; Caddy issues the Let's Encrypt
   cert via **DNS-01** (HTTP-01 doesn't play well behind the proxy)
-- Verify `https://braintwin.app/health` returns 200 through Cloudflare
+- Verify `https://braintwin.net/health` returns 200 through Cloudflare
 
 ### 5.5 M.5 — Litestream backup
 
@@ -1197,4 +1268,7 @@ portfolio audience targeting. Revised 2026-06-10: region
 brand split. Revised 2026-06-11: §13 horizontal scaling path
 documented for future reference. Revised 2026-06-15: brand split
 abandoned (§11) — `digitaltwin.*` unavailable, consolidated on
-BrainTwin with `braintwin.net`.*
+BrainTwin with `braintwin.net`. Revised 2026-06-15 (later same day):
+M.3 first-cloud-deploy shipped — §5.3 rewritten with the two-phase
+deploy sequence + image-tag scheme + SSM Session Manager smoke
+test; runbook in `phase4.0.6-M3-first-cloud-deploy.md`.*
