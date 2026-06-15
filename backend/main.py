@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 app = FastAPI(
-    title="DigitalTwin",
+    title="BrainTwin",
     description="Your Knowledge Twin Agent",
     version="0.1.0",
 )
@@ -165,7 +165,7 @@ class RecallPayload(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "name": "DigitalTwin",
+        "name": "BrainTwin",
         "status": "running",
         "version": "0.1.0",
     }

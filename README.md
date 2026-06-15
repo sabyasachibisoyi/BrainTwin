@@ -2,10 +2,11 @@
 
 Your Knowledge Twin Agent — captures everything you consume digitally, builds a living knowledge base, and competes against you in knowledge battles.
 
-> **Naming.** Codename is **BrainTwin** (repo, code, docs, IAM, stacks).
-> Public product brand is **DigitalTwin** (Chrome extension, Telegram
-> bot greetings, `digitaltwin.app`). The split is locked in
-> [`docs/phase4.0.6-deployment-design.md` §11](docs/phase4.0.6-deployment-design.md).
+> **Naming.** The product is **BrainTwin** everywhere — repo, code,
+> docs, IAM, customer-facing UI, and the public domain `braintwin.net`.
+> An earlier design considered a "DigitalTwin" public brand split, but
+> the domain wasn't available; the rationale and trade-offs are
+> recorded in [`docs/phase4.0.6-deployment-design.md` §11](docs/phase4.0.6-deployment-design.md).
 
 ## Companion repo — infrastructure
 

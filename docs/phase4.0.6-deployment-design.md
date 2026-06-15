@@ -12,10 +12,10 @@
 >      topology, Mermaid for flows, `cdk-dia` later for auto-verification.
 >      All version-controlled in `docs/diagrams/`. Miro rejected for
 >      canonical diagrams.
->   3. **Product naming:** New §11 — customer-facing brand is
->      **DigitalTwin**; codebase / internal stays **BrainTwin**.
->      Domain: `digitaltwin.app` / `.me` / `.io`. No code rename;
->      the swap is at presentation surfaces only.
+>   3. **Product naming:** New §11 — originally split the public
+>      brand (**DigitalTwin**) from the codename (**BrainTwin**), but
+>      `digitaltwin.*` domains were unavailable, so consolidated on
+>      **BrainTwin** everywhere. Public domain: `braintwin.net`.
 >
 > Previous revision (2026-06-09 senior-eng review): budget reworked
 > around the real post-July-2025 AWS credit rules (Paid Plan at
@@ -163,6 +163,52 @@ latency. The user is now developing from Seattle, so:
 **Cost delta `us-west-2` vs `ap-south-1`**: roughly equivalent for the
 services we use (within ~5%). No material difference; the choice is
 on latency.
+
+#### 3.0.1 AZ parameterization — designed for plug-in tomorrow
+
+The CDK is **both region- AND AZ-parameterized** from day one in
+`lib/stack-config.ts`. Both are typed lists, not single strings:
+
+```ts
+export const CONFIG: Record<string, RegionConfig> = {
+  'us-west-2':   { availabilityZones: ['us-west-2a'],   ... },
+  'ap-south-1':  { availabilityZones: ['ap-south-1a'],  ... },
+};
+```
+
+`compute.ts` iterates the list and produces one EC2 + one EBS pair per
+AZ. Adding a second AZ is therefore literally a one-line change:
+`availabilityZones: ['us-west-2a', 'us-west-2b']`. `cdk diff` shows the
+new resources; `cdk deploy` creates them.
+
+**What this design ENABLES as a config change:**
+
+- Swapping the AZ within a region (e.g. evacuating us-west-2a during
+  an AWS-reported AZ event)
+- Adding a cold-standby EC2 in a second AZ for disaster recovery
+  (where the standby has its own EBS, populated by a Litestream replica
+  from S3 and brought online during a failover drill)
+- Adding a second region (already covered above)
+
+**What this design does NOT magically enable** — these stay Phase 5+ rebuilds:
+
+1. **Active-active multi-AZ for real.** Two EC2s serving traffic
+   simultaneously requires an ALB ($22/month idle) for traffic split,
+   a shared database (Postgres RDS multi-AZ, not SQLite on EBS), and
+   externalising the in-process `ConversationStore` (Redis or sticky
+   sessions). All three are independent migrations; none is a
+   "just add an AZ" knob.
+2. **Cross-AZ data plane.** Chroma's HNSW index does not survive on a
+   shared filesystem like EFS; the EBS-attached-to-one-EC2 pattern
+   is intrinsic to single-writer compute.
+3. **Sub-second AZ failover.** Even with the standby pattern, the
+   failover is "operator initiates restore, ~minutes". Active-active
+   sub-second failover is Phase 5+ work.
+
+The reason for this section: a future reader looking at
+`availabilityZones: string[]` shouldn't think "great, multi-AZ is one
+knob" and ship a half-built design. The knob is real; the
+architectural rebuild that hides behind it is also real.
 
 ### 3.1 Compute: EC2 `t4g.small` (single instance, all-in-one)
 
@@ -768,14 +814,14 @@ These need your sign-off before M.1 starts (CDK-vs-Terraform was
 resolved in review — locked to CDK TypeScript, §4; region resolved
 2026-06-10 — locked to `us-west-2`, §3.0):
 
-1. **Domain name** — needs you to claim one via Namecheap once
-   Student Pack approves. **Preferred: `digitaltwin.app`** (see §11
-   for the customer brand split); fallbacks `digitaltwin.me` /
-   `digitaltwin.io`. `braintwin.*` is no longer the public-facing
-   pick.
-2. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
+1. **CI/CD via GitHub Actions or manual `cdk deploy` for v1?** —
    manual is faster to ship; GitHub Actions adds resume value but
    is one more thing to break.
+
+> Previously listed: domain name. Resolved 2026-06-15 — registered
+> **`braintwin.net`** via Cloudflare Registrar after `digitaltwin.app`
+> (and `.dev` / `.me` / `.io`) turned out to be unavailable. See §11
+> for the resulting brand consolidation.
 
 ---
 
@@ -802,75 +848,65 @@ The phase is shippable when:
 
 ---
 
-## 11. Product naming — DigitalTwin (public) vs BrainTwin (internal)
+## 11. Product naming — consolidated on BrainTwin (history of decision)
 
-> Added 2026-06-10 per request. "DigitalTwin" reads more clearly to
-> a stranger than "BrainTwin", which sounds biotech / clinical.
-> But renaming the whole codebase is busywork that buys nothing —
-> internal code, docs, branches, commit history all stay as
-> **BrainTwin**. The split is at the presentation surface only.
+> Added 2026-06-10, revised 2026-06-15 after the brand search.
+> Originally split the public brand ("DigitalTwin") from the codename
+> ("BrainTwin"), but the `digitaltwin.*` domains were either taken or
+> priced out of the budget. Consolidated on **BrainTwin everywhere**.
+> This section is preserved as a record of the decision and the
+> trade-offs, not as a forward plan.
 
-### 11.1 The split
+### 11.1 What was considered
 
-| Layer | Name | Why |
-|-------|------|-----|
-| Codebase / repo / commit messages / internal docs | **BrainTwin** | Stable identifier the team knows. Renames are a refactor tax with zero feature value. |
-| Customer-facing UI (extension popup, web pages, Telegram bot greetings) | **DigitalTwin** | Cleaner brand. "Your digital twin remembers what you read" is a one-line elevator pitch. |
-| Domain | **`digitaltwin.app`** (preferred) | Matches public brand. `.me` / `.io` are fallbacks. |
-| AWS resources / CDK stack name | `BrainTwin*` | Internal — never seen by users. |
+The original brief: "DigitalTwin" sounds friendlier to a stranger than
+"BrainTwin" (which has biotech / clinical overtones). The plan was to
+keep the codebase as BrainTwin (no refactor tax) but flip only the
+user-visible surfaces — Chrome extension popup, Telegram bot greetings,
+domain — to "DigitalTwin." That split was locked on 2026-06-10.
 
-### 11.2 Files to flip when the brand surface changes
+### 11.2 Why it was abandoned
 
-Only the following user-visible strings flip from "BrainTwin" to
-"DigitalTwin". Everything else stays:
+On 2026-06-15 the domain search came back empty:
 
-| File | Current string | New string |
-|------|---------------|-----------|
-| `extension/manifest.json` → `name` | `"BrainTwin"` | `"DigitalTwin"` |
-| `extension/manifest.json` → `description` | `"Captures what you read…"` | unchanged, possibly soften wording |
-| `extension/manifest.json` → `action.default_title` | `"BrainTwin"` | `"DigitalTwin"` |
-| `extension/popup.html` → `<h1>BrainTwin</h1>` | `BrainTwin` | `DigitalTwin` |
-| `app/main.py` → FastAPI `title=` | `"BrainTwin"` | `"DigitalTwin"` |
-| `app/main.py` → `/health` response `{"service": "BrainTwin"}` | `BrainTwin` | `DigitalTwin` |
-| `telegram_bot/bot.py` → greeting messages and `/start` text | `BrainTwin` | `DigitalTwin` |
-| Cloudflare DNS / Caddy site block | `braintwin.*` | `digitaltwin.*` |
+- `digitaltwin.app` — taken (likely industrial-IoT enterprise; "digital
+  twin" is an established term in that space)
+- `digitaltwin.com` — taken
+- `digitaltwin.dev` — taken
+- `digitaltwin.me` / `.io` — also unavailable in the price band we
+  were willing to pay
+- Prefixed variants (`mydigitaltwin.app`, `getdigitaltwin.app`) — felt
+  like settling, not a brand
 
-Anything not in that table — Python module names, AWS resource
-names in CDK, README, CHANGELOG, internal phase docs (including
-this one) — stays as BrainTwin.
+`braintwin.net` was available, ~$12/year via Cloudflare Registrar, and
+the user accepted the trade-off: a slightly less polished brand for a
+real domain and a simpler mental model. `.net` doesn't carry the HSTS
+preload that `.app` would have, so we add an explicit
+`Strict-Transport-Security` header in Caddy (M.4) to compensate.
 
-### 11.3 What's explicitly NOT changing
+### 11.3 What the consolidation means in practice
 
-- Repo name on GitHub — stays `BrainTwin`.
-- Docker image names in ECR — stays `braintwin-*`.
-- CDK stack names — stays `BrainTwinStack*`.
-- SQLite DB filename, Chroma collection name — stay BrainTwin-flavored.
-- S3 bucket names — stay BrainTwin-flavored.
-- Python package layout (`app/`, `agents/`, `services/`) — stays.
-- All phase doc filenames (`phase4.0.6-…md` etc.) — stay.
+| Layer | Name |
+|-------|------|
+| Codebase / repo / commit messages / internal docs | **BrainTwin** |
+| Customer-facing UI (extension popup, Telegram bot greetings) | **BrainTwin** |
+| Domain | **`braintwin.net`** |
+| AWS resources / CDK stack name | `BrainTwin*` (unchanged) |
 
-### 11.4 Migration order
+One name, one mental model, no surface-vs-internal mapping to remember.
 
-The brand surface flip happens **after** the cloud deploy works, not
-before. Concrete sequencing:
+### 11.4 Sunk cost from the split work
 
-1. Phase 4.0.6 ships under whatever subdomain (`api.<your-domain>`).
-   Internal name in code = BrainTwin; serves successfully.
-2. You buy `digitaltwin.app` (or fallback) via Namecheap once
-   Student Pack credit covers it.
-3. Cloudflare DNS update — point `digitaltwin.app` and
-   `api.digitaltwin.app` at the EC2.
-4. Brand-surface PR: flip the rows in §11.2, ship Chrome extension v0.5
-   to the store under the new public name.
+Negligible. The brand-flip PR that landed under the original plan
+(task #36) touched ~6 customer-facing strings. The revert (task #56)
+flipped them back. Cost: one small commit each way.
 
-This sequencing keeps M.1–M.6 about infra correctness, not branding.
+### 11.5 If a real public brand becomes warranted later
 
-### 11.5 If you change your mind later
-
-If you ever do want to rename the codebase to DigitalTwin, the
-refactor is mechanical: `git grep -i braintwin` gives the full
-delta. Easier to defer that decision until you've shipped, gotten
-real feedback on the name, and have headroom for cleanup work.
+If the product gets external users and "BrainTwin" turns out to be a
+real growth blocker (which is unlikely — names matter much less than
+people assume), the rename is mechanical: `git grep -i braintwin`
+gives the full delta. Easier to defer until there's real feedback.
 
 ---
 
@@ -884,8 +920,281 @@ real feedback on the name, and have headroom for cleanup work.
 
 ---
 
+## 13. Horizontal scaling path — when one EC2 isn't enough
+
+> Added 2026-06-11. Captured as documentation, **not** built. Phase
+> 4.0.6 is one EC2 by deliberate choice. This section exists so the
+> Sabya-of-tomorrow who hits a real traffic ceiling has a written
+> migration plan instead of a panic redesign.
+
+### 13.1 When this becomes a real problem
+
+The single-EC2 architecture is sufficient for:
+
+- **Single user (you), Phase 4.0.6** — capacity headroom is ~100x
+  what one person can generate
+- **Phase 4.1 multi-user (use case A)**, up to maybe **100 concurrent
+  users on /recall**. The bottleneck before EC2 saturates is usually
+  Sonnet rerank latency (3–8 sec) and the Anthropic API's per-account
+  rate limit (60 req/min on the free tier, more on Build/Scale).
+
+The horizontal-scaling conversation becomes real when ANY of:
+
+1. **Sustained CPU > 70%** for >10 min during weekday peaks. Vertical
+   scale (bump to t4g.medium / large) first — that's a one-liner
+   `instanceType: "t4g.medium"` in `stack-config.ts`, ~$30 → ~$60/mo.
+   Horizontal is only worth it once vertical hits diminishing returns.
+2. **Single-AZ disaster window unacceptable.** Currently RTO is
+   "minutes to bring a new instance up, restore EBS snapshot." If the
+   product needs sub-minute failover, you need an active-active multi-
+   AZ shape — which is the same architecture as horizontal scaling.
+3. **You hit Anthropic's per-account rate limit at the application
+   level.** This is solved by upgrading the Anthropic tier first;
+   adding more EC2s doesn't get you more LLM throughput.
+
+### 13.2 The seven layers that change
+
+Going from one EC2 to "N EC2s behind a load balancer" is **not** just
+adding more EC2s. It touches seven independent pieces:
+
+| Layer | Today (Phase 4.0.6) | Scale-out shape |
+|---|---|---|
+| **1. Traffic split** | Cloudflare → EIP → single EC2 | Cloudflare → **ALB** → target group → multiple EC2s |
+| **2. Instance count** | Hardcoded 1 in stack-config | **Auto Scaling Group** (ASG) — min/max/desired, scales on CPU/request-count metric |
+| **3. Structured DB** | SQLite on EBS, single writer | **RDS Postgres** (multi-AZ, automated backups) — schema already Postgres-ready since Phase 3 |
+| **4. Vector store** | Chroma local on EBS | **pgvector** (in the same RDS Postgres) **OR** Pinecone / OpenSearch Vector |
+| **5. Conversation state** | In-process dict, 15-min TTL | **Redis (ElastiCache)** OR **ALB sticky sessions** by `conversation_id` cookie |
+| **6. Images** | EBS local | **S3** (already designed for this — just point image_path at S3) |
+| **7. Backup** | Litestream WAL → S3 | RDS automated snapshots (Litestream retires) |
+
+### 13.3 ALB vs NLB — why ALB
+
+The user will read about both. We'd pick ALB. Quick comparison:
+
+| Concern | Application Load Balancer (ALB) | Network Load Balancer (NLB) |
+|---|---|---|
+| Layer | 7 (HTTP/HTTPS aware) | 4 (TCP/UDP, agnostic) |
+| Routes by | Host, path, header, cookie | IP + port only |
+| TLS termination | Yes, ACM certs | Yes (pass-through or terminate) |
+| Sticky sessions | Yes (per cookie or duration) | No |
+| WAF integration | Native (AWS WAF Web ACL) | No |
+| Latency | ~5ms | <1ms |
+| Cost | ~$22/mo + LCU charges | ~$22/mo + LCU charges |
+| When to pick | HTTP/REST APIs, websocket, sticky | gRPC streams, gaming, raw TCP |
+
+Our `/capture` and `/recall` are HTTP request/response — **ALB wins on
+sticky sessions + WAF + path routing**. NLB would only matter if we
+later add a streaming endpoint (Sonnet token streaming via SSE could
+warrant it, but ALB handles SSE too).
+
+### 13.4 The architectural picture
+
+```
+   Cloudflare (public DNS, edge TLS, DDoS, WAF tier 1)
+        │
+        ▼ HTTPS — Cloudflare → AWS origin
+   ┌────────────────────────────────────────────────────────┐
+   │                  AWS us-west-2                         │
+   │  ┌─────────────────────────────────────────────────┐   │
+   │  │   Public subnets across us-west-2a + us-west-2b │   │
+   │  │                                                  │   │
+   │  │     ALB ── target group ───┐                     │   │
+   │  │           (health: /health) │                     │   │
+   │  │                             ▼                     │   │
+   │  │   ┌──────────────┐    ┌──────────────┐           │   │
+   │  │   │  EC2-a (ASG) │    │  EC2-b (ASG) │           │   │
+   │  │   │  Caddy+app   │    │  Caddy+app   │           │   │
+   │  │   └──────┬───────┘    └───────┬──────┘           │   │
+   │  │          │                    │                   │   │
+   │  └──────────┼────────────────────┼───────────────────┘   │
+   │             │                    │                       │
+   │             ▼                    ▼                       │
+   │  ┌──────────────────────────────────────────┐            │
+   │  │  Private subnets across both AZs         │            │
+   │  │  ┌─────────────────────┐  ┌────────────┐ │            │
+   │  │  │ RDS Postgres (M-AZ) │  │ ElastiCache│ │            │
+   │  │  │  schemas + pgvector │  │  Redis     │ │            │
+   │  │  │  Litestream retires │  │  conv state│ │            │
+   │  │  └─────────────────────┘  └────────────┘ │            │
+   │  │  S3 (images, model artifacts, snapshots) │            │
+   │  └──────────────────────────────────────────┘            │
+   └────────────────────────────────────────────────────────┘
+```
+
+Key changes from today:
+
+- **Two AZs minimum** (ALB requires ≥2 AZs even with one instance per).
+  This is the "AZ list grows from length-1 to length-2" point that
+  §3.0.1's parameterization makes a config change.
+- **Private subnets appear** — RDS and ElastiCache live there, not in
+  public subnets. Public subnets only hold ALB + (optionally) EC2s.
+- **NAT Gateway becomes necessary IF EC2s move to private subnets** —
+  ~$32/month per AZ. Choice: keep EC2s in public subnets (cheaper, more
+  exposed) or move them private and pay for NAT.
+- **No more EIP** — ALB has its own DNS name. Cloudflare A record →
+  ALB. EIP is freed.
+
+### 13.5 The cost model — realistic numbers at each tier
+
+| Component | Now (4.0.6) | Tier 1 — 2 EC2 + ALB | Tier 2 — 4 EC2 + RDS + Redis |
+|---|---|---|---|
+| EC2 | 1 × t4g.small | 2 × t4g.small ($30) | 4 × t4g.medium ($120) |
+| Storage | 20 GiB gp3 ($2) | (EBS gone, RDS instead) | (EBS gone, RDS instead) |
+| EIP | $0 (attached) | $0 (replaced by ALB) | $0 |
+| **ALB** | n/a | $22 + LCU ~$5 | $22 + LCU ~$15 |
+| **RDS Postgres** | n/a | db.t4g.small Multi-AZ ($40) | db.t4g.medium Multi-AZ ($80) |
+| **ElastiCache Redis** | n/a | cache.t4g.micro ($12) | cache.t4g.small ($30) |
+| **NAT Gateway** | n/a | optional ($32) | optional ($64 for 2 AZ) |
+| **S3 + transfer** | $0 | $2-5 | $10-30 |
+| **CloudWatch** | $0 (free tier) | $10 | $25 |
+| **Total** | **~$17/mo** | **~$120/mo** | **~$400/mo** |
+
+So horizontal scaling **6×** the bill at the first step, **~25×** for
+serious load. The decision is "is this product earning >$120/month in
+value" — for a portfolio project the answer stays "no" indefinitely,
+which is why we built single-EC2.
+
+### 13.6 Migration sequence — the order that minimizes risk
+
+When the moment comes, do these in order. **Each step is
+independently shippable** — none requires "swing everything at once."
+
+1. **Migrate SQLite → RDS Postgres first.** Schema is already
+   Postgres-ready (Phase 3 design decision A.3). App keeps running on
+   single EC2, just points at RDS. Validate under existing load.
+   Litestream → S3 backup retires (RDS automated snapshots replace it).
+   *Cost delta:* +~$40/mo. *Risk:* migration script must be correct;
+   parallel-run for ~1 week to verify.
+
+2. **Externalize ConversationStore.** Move the in-process dict to
+   ElastiCache Redis OR commit to ALB sticky sessions on the
+   `conversation_id` cookie. Sticky is simpler ($0); Redis is more
+   reliable through scale events ($12). For a 15-min TTL, sticky is
+   fine. *Cost delta:* +$0 or $12. *Risk:* low.
+
+3. **Introduce ALB as a single-target proxy.** Put the ALB in front
+   of the existing EC2. Just ONE target initially. Cloudflare points
+   at the ALB DNS name. Single-EC2 behind a load balancer — boring
+   change, no traffic split, no horizontal scaling yet. *Cost delta:*
+   +$22 + LCU. *Risk:* low; reverse with a Cloudflare A record edit.
+
+4. **Replace single EC2 with an Auto Scaling Group.** Min=1, Max=N
+   with a launch template that runs the same user-data + image. EBS
+   data volume becomes per-instance ephemeral (since RDS now holds
+   the state). *Cost delta:* +$15/mo per added instance. *Risk:*
+   moderate; first scale-up event is when surprises surface.
+
+5. **(Later) Migrate Chroma → pgvector inside the same RDS.** Single
+   data store, transactional consistency, easier ops. *Cost delta:*
+   $0 — pgvector is in-process to Postgres. *Risk:* moderate; HNSW
+   index needs careful tuning.
+
+Total elapsed engineering time at a measured pace: **6–8 weeks** with
+testing. That's worth knowing when planning ahead — when traffic
+starts climbing, you have 2–4 weeks of headroom on vertical scaling
+to execute steps 1–3 cleanly.
+
+### 13.7 What stays the same
+
+The point of designing 4.0.6 with future scale in mind: most things
+DON'T change.
+
+- Dockerfile is identical
+- docker-compose.yml is identical
+- The application code (FastAPI, backend/, agent/) is identical
+- Caddy config is identical
+- Cloudflare Authenticated Origin Pulls behavior is identical
+- Bearer-token auth is identical
+- Chrome extension is identical
+
+What changes is the **deployment shape around the app**. The app's
+contract — listen on :8000, expect `/data` to be writable, read SSM
+parameters at boot — stays stable. This is the architectural payoff
+of the M.1 / M.2 separation of concerns.
+
+### 13.8 What's NOT in this section (deferred to a future doc)
+
+When the time comes, a `phase5-horizontal-scaling-design.md` (or
+similar) covers:
+
+- Exact CDK refactor — `lib/constructs/loadbalancer.ts`,
+  `lib/constructs/database.ts`, ASG launch templates, target group
+  health-check tuning
+- Application code changes needed (move ConversationStore behind an
+  interface so Redis can drop in)
+- Connection pooling story (pgbouncer or RDS Proxy)
+- Sonnet rate-limit shaping at the ALB level (request budgets per
+  source IP)
+- Blue/green deploy strategy via two target groups
+
+### 13.9 The bigger jump — Kubernetes (EKS / AKS)
+
+Section 13.4 describes "ALB + ASG + RDS" on EC2 — the natural next
+step from single-EC2. The jump *beyond* that, when you want **rolling
+deploys, self-healing across hosts, and many independent services**,
+is Kubernetes.
+
+The good news: the work in Phase 4.0.6 transfers cleanly. The same
+Docker image runs unchanged on k8s; the architectural patterns we
+established (externalized secrets, stateless containers, image-as-
+deploy-unit, persistent storage as a separate mount) are exactly what
+k8s expects.
+
+What changes shape:
+
+| Phase 4.0.6 (compose on EC2) | Kubernetes equivalent |
+|---|---|
+| `services:` in docker-compose | `Deployment` resource (one per service, with `replicas: N`) |
+| docker-compose internal network + service-name DNS | `Service` resource backed by CoreDNS |
+| `volumes:` bind-mount | `PersistentVolumeClaim` |
+| `healthcheck:` | `livenessProbe` + `readinessProbe` |
+| SSM Parameter → user-data → `.env` | `Secret` resource, or external-secrets-operator bridging from SSM |
+| Cloudflare → EIP → Caddy | `Ingress` + `LoadBalancer` Service |
+| ECR | ECR (k8s on AWS = EKS; image registry unchanged) |
+| `cdk deploy` | `kubectl apply` / Helm / Argo CD |
+
+When this jump makes sense:
+
+- You have **10+ services** with independent lifecycles
+- You need **rolling deploys with zero downtime** beyond what compose
+  can offer (~10 sec of `restart`)
+- You're running across **multiple hosts** and need automatic
+  rescheduling when a host dies
+- You're at a scale where the **k8s control-plane cost** (~$75/month
+  for EKS even at idle) is a small fraction of total bill
+
+For BrainTwin's single-service-on-one-host model, k8s would be
+~10× the operational complexity for the same workload. Stay on
+compose-on-EC2 until at least one of the three triggers above is
+real.
+
+**Migration path if it ever happens:**
+
+1. Same Docker image — push to ECR (already done)
+2. `kompose convert docker-compose.yml` — autogenerates first-cut
+   k8s manifests
+3. Replace SSM-fetched env vars with `Secret` resources (or
+   external-secrets-operator for zero-rewrite)
+4. Add `Deployment.spec.replicas` for horizontal scale
+5. Wire `Ingress` to whatever the cluster's ingress controller is
+   (AWS Load Balancer Controller, ingress-nginx, Caddy on k8s, etc.)
+
+The CDK code in BrainTwinCDK stays useful: the same VPC, S3 bucket,
+ECR repo, SSM parameters, IAM roles get reused. Only the
+`compute.ts` construct would be replaced with an EKS cluster
+construct.
+
+This section (§13) is the **what + why + when**, not the **how to
+build it**. The how-to lives in its own design doc when the work
+actually starts.
+
+---
+
 *Author: Sabya (with Claude as design partner). Decisions captured
 2026-06-04 from conversation around AWS free tier restructure +
 portfolio audience targeting. Revised 2026-06-10: region
 (`us-west-2`), HLD diagram strategy, and DigitalTwin/BrainTwin
-brand split.*
+brand split. Revised 2026-06-11: §13 horizontal scaling path
+documented for future reference. Revised 2026-06-15: brand split
+abandoned (§11) — `digitaltwin.*` unavailable, consolidated on
+BrainTwin with `braintwin.net`.*

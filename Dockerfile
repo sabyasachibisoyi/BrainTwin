@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# DigitalTwin / BrainTwin — single multi-stage Dockerfile.
+# BrainTwin — single multi-stage Dockerfile.
 #
 # Two stages:
 #   builder  — full toolchain, builds the venv at /opt/venv
