@@ -1,4 +1,4 @@
-# DigitalTwin / BrainTwin — local docker-compose.
+# BrainTwin — local docker-compose.
 #
 # Phase 4.0.6 M.1 scope: prove the FastAPI app boots inside a container,
 # with the bearer-token auth gate, against a host-mounted data volume.

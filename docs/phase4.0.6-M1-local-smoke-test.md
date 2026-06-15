@@ -122,7 +122,7 @@ Expected: `HTTP/1.1 200 OK`, JSON body with `status: ok`.
 curl -s http://127.0.0.1:8000/ | python -m json.tool
 ```
 
-Expected: `name: DigitalTwin`, status: running.
+Expected: `name: BrainTwin`, status: running.
 
 ### /recall without token → 401
 
@@ -248,7 +248,7 @@ docker compose --profile with-bot up
 
 In Telegram, send `/start` to your bot. Expected greeting:
 
-> 👋 Hi <name>. DigitalTwin is active for you.
+> 👋 Hi <name>. BrainTwin is active for you.
 
 Forward an article. Check `docker compose logs bot | tail`:
 
@@ -292,7 +292,7 @@ Mark these before considering M.1 done:
 - [ ] `docker compose build` succeeds
 - [ ] `docker compose up app` brings the container to `healthy`
 - [ ] GET /health returns 200 with no Authorization header
-- [ ] GET / returns 200 with `name: DigitalTwin`
+- [ ] GET / returns 200 with `name: BrainTwin`
 - [ ] POST /recall without Authorization returns 401
 - [ ] POST /recall with wrong Bearer returns 401
 - [ ] POST /recall with the correct Bearer returns 200 (or a known 503)

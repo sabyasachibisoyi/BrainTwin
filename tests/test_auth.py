@@ -158,7 +158,7 @@ class TestPublicRoutes:
     def test_root_is_public(self, client, configured_token):
         r = client.get("/")
         assert r.status_code == 200
-        assert r.json()["name"] == "DigitalTwin"
+        assert r.json()["name"] == "BrainTwin"
 
     def test_health_is_public(self, client, configured_token):
         r = client.get("/health")

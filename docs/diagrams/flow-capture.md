@@ -12,7 +12,7 @@ sequenceDiagram
     participant U as User (Chrome)
     participant CS as Content script
     participant SW as Service worker<br/>(background.js)
-    participant CF as Cloudflare<br/>(digitaltwin.app)
+    participant CF as Cloudflare<br/>(braintwin.net)
     participant Cad as Caddy<br/>(EC2 :443)
     participant API as FastAPI app<br/>(:8000)
     participant SQL as SQLite<br/>(EBS)
