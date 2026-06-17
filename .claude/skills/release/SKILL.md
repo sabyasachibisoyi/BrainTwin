@@ -83,7 +83,21 @@ irreversible step (ECR push / AWS deploy / GitHub push). Then:
 - Commit with a message that lists the milestones included and flags any
   known `§14` user-data consequence.
 
-### 3. Build + push images (from BrainTwin, clean tree)
+### 3. Test gate — full suite, block on red
+Run the COMPLETE suites (not the pre-commit fast subset) before building any
+immutable image. A release must not ship a red tree.
+```bash
+# BrainTwin — full pytest (do NOT set BRAINTWIN_FAST_TESTS; the @slow
+# embedder/chroma/whisper files must run here). ~60s.
+cd ../BrainTwin && env/bin/pytest -q
+# BrainTwinCDK — full jest (tsc + cdk synth snapshot assertions). ~3 min.
+cd ../BrainTwinCDK && npm test
+```
+If either is red, STOP and report — do not build/push/deploy. The per-commit
+git hook only runs the fast subset (BrainTwin) / `tsc --noEmit` (CDK), so this
+gate is the first time the heavy tests + CDK synth snapshots run in the flow.
+
+### 4. Build + push images (from BrainTwin, clean tree)
 ```bash
 ./scripts/build-and-push.sh --release vX.Y.Z        # app  → braintwin/app
 ./scripts/build-and-push-caddy.sh --release vX.Y.Z  # caddy → braintwin/caddy
@@ -95,7 +109,7 @@ irreversible step (ECR push / AWS deploy / GitHub push). Then:
 - Skip the Caddy build if `caddy/Dockerfile` is unchanged (it bumps every few
   months, not every release) — just reuse the existing `.last-deploy-caddy-tag`.
 
-### 4. Deploy (gated)
+### 5. Deploy (gated)
 ```bash
 cd ../BrainTwinCDK && npx cdk diff --profile braintwin --context region=us-west-2
 ```
@@ -110,7 +124,7 @@ cd ../BrainTwinCDK && npx cdk diff --profile braintwin --context region=us-west-
   this deploy needs the manual EBS unblock and confirm scope with the user
   before proceeding.
 
-#### 4b. SSM-direct refresh (fallback when cdk can't auth, app-only)
+#### 5b. SSM-direct refresh (fallback when cdk can't auth, app-only)
 Only the two image-tag params change; never touches user-data, so it cannot
 trigger an instance replacement. Use the working aws CLI + `braintwin` profile:
 ```bash
@@ -129,7 +143,7 @@ aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$INSTANC
 ```
 Then poll `aws ssm get-command-invocation` for `Success`.
 
-### 5. Push to GitHub (both repos) — needs operator auth
+### 6. Push to GitHub (both repos) — needs operator auth
 - Push the release branch in each repo. If push prompts/fails on auth, ask the
   operator to authenticate and retry (see Authentication above).
 - Tag the release commit `git tag -a vX.Y.Z -m "…"` and push tags (keeps the
@@ -137,12 +151,12 @@ Then poll `aws ssm get-command-invocation` for `Success`.
 - **Open a PR to merge each release branch into `main`** (`gh pr create --base main`).
   This is the default — the operator reviews/merges. Don't push straight to main.
 
-### 6. Post-deploy smoke test
+### 7. Post-deploy smoke test
 - `curl -fsS https://api.braintwin.net/` should return 200 (public health route).
 - Confirm `/openapi.json` is **404** in prod (docs hardening, M.4.1).
 - Optionally tail the in-place refresh result from `deploy.sh` output.
 
-### 7. Report
+### 8. Report
 - Image tags pushed, deploy outcome, PR/tag URLs, and any `§14` follow-up.
 
 ## Defaults (override via env on the scripts)
