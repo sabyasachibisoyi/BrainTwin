@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#
+# BrainTwin pre-commit gate — FAST test subset.
+#
+# Enable once per clone (not auto-installed; git won't run repo code on
+# clone for safety):
+#
+#   git config core.hooksPath scripts/git-hooks
+#
+# What it runs
+# ------------
+# The fast pytest subset via BRAINTWIN_FAST_TESTS=1, which tells
+# tests/conftest.py to `collect_ignore` the torch/chromadb/whisper test
+# files (they dominate wall-clock at *import* time, before any marker
+# filtering applies). ~7s vs ~60s for the full suite. The full suite is
+# the /release gate's job (.claude/skills/release/SKILL.md step 3), not
+# every commit's.
+#
+# Bypass deliberately with:  git commit --no-verify
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# Find a pytest: project venv (env/), then .venv, then the active venv,
+# then PATH. Keeps working whether or not the venv is activated.
+PYTEST=""
+for cand in "env/bin/pytest" ".venv/bin/pytest" "${VIRTUAL_ENV:-}/bin/pytest"; do
+  if [ -n "$cand" ] && [ -x "$cand" ]; then PYTEST="$cand"; break; fi
+done
+if [ -z "$PYTEST" ] && command -v pytest >/dev/null 2>&1; then
+  PYTEST="pytest"
+fi
+
+if [ -z "$PYTEST" ]; then
+  echo "pre-commit: pytest not found (no env/ venv, none on PATH) — skipping." >&2
+  echo "            Install deps or activate the venv. The /release full-suite" >&2
+  echo "            gate is the backstop." >&2
+  exit 0
+fi
+
+echo "pre-commit: fast test subset (BRAINTWIN_FAST_TESTS=1)…"
+# --disable-warnings keeps the commit output terse: pre-existing
+# deprecation / aiosqlite-teardown warnings are noise here. The full
+# release-gate run (without this flag) still surfaces them.
+if ! BRAINTWIN_FAST_TESTS=1 "$PYTEST" -q --disable-warnings; then
+  echo "" >&2
+  echo "pre-commit: FAST TESTS FAILED — commit blocked." >&2
+  echo "  Fix the tests, or bypass deliberately:  git commit --no-verify" >&2
+  exit 1
+fi

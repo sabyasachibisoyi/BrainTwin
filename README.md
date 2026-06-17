@@ -65,7 +65,20 @@ uvicorn backend.main:app --reload --port 8000
 
 # 6. Load the Chrome extension
 # Go to chrome://extensions → Enable Developer Mode → Load Unpacked → select /extension folder
+
+# 7. Enable the pre-commit test gate (once per clone)
+git config core.hooksPath scripts/git-hooks
 ```
+
+### Pre-commit hook
+
+`scripts/git-hooks/pre-commit` runs the **fast** test subset on every commit
+(~7s): `BRAINTWIN_FAST_TESTS=1 pytest`, which skips importing the heavy
+torch/chromadb/whisper test files (see `tests/conftest.py`). The full suite —
+including those — is run by the release flow, not on every commit. Enable it
+once per clone with the `git config core.hooksPath` line above (git won't
+auto-install repo hooks on clone). Bypass a single commit with
+`git commit --no-verify`.
 
 ### Inspecting captures & enrichment
 

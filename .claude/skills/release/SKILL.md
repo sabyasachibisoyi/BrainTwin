@@ -59,17 +59,40 @@ operator's behalf. Confirm these before the irreversible steps:
 
 ## Versioning
 
-- App + Caddy images share the `vX.Y.Z` release scheme (`--release vX.Y.Z`).
-  - App tag: `v0.1.0`. Caddy tag: `caddy-<upstream>-v0.1.0` (script derives it).
-- `v0.x` = pre-API-stability. MAJOR=breaking API, MINOR=feature, PATCH=fix.
+`vMAJOR.MINOR.PATCH` — leftmost is breaking, rightmost is fixes:
+
+| Position | Bump when… | From `v0.1.0` → |
+|---|---|---|
+| **MAJOR** (leftmost) | breaking API change | `v1.0.0` |
+| **MINOR** (middle) | new backwards-compatible feature | `v0.2.0` |
+| **PATCH** (rightmost) | bug fix / refactor / dep bump | `v0.1.1` |
+
+- **`v0.x` (pre-API-stability) override:** while the leading number is `0` the
+  API isn't promised stable, so treat **MINOR as the de-facto breaking bump**
+  and PATCH for everything else. Reserve `v1.0.0` for "the API is now stable",
+  not just "it works on AWS".
+- App + Caddy images share this scheme (`--release vX.Y.Z`). App tag `v0.1.0`;
+  Caddy tag `caddy-<upstream>-v0.1.0` (the script derives it).
 - Release builds **refuse a dirty tree** (reproducible-from-git) → commit first.
 - ECR is `IMMUTABLE` → a tag can't be reused. Bump the version to re-release.
 - The extension `manifest.json` version is independent of the image version.
 
+### Choosing the version — recommend, then confirm
+Do NOT ask the operator for a version cold. In the review step you already
+classify the changes, so:
+1. Read the latest release tag: `git describe --tags --abbrev=0` (or `git tag`).
+2. Classify the pending diff: fix → PATCH, feature → MINOR, breaking → MINOR in
+   `0.x` else MAJOR.
+3. **Propose** the resulting version with a one-line rationale (e.g. "extension
+   feature + backend fix → MINOR → `v0.2.0`"), then ask the operator to confirm
+   or override. They have final say (the tag is immutable), but the default is
+   a grounded suggestion, never a blank prompt.
+
 ## Checklist
 
-Confirm the **version** and **deploy scope** with the user before any
-irreversible step (ECR push / AWS deploy / GitHub push). Then:
+**Propose** the version and deploy scope (see "Choosing the version"), then get
+the operator's confirmation before any irreversible step (ECR push / AWS deploy
+/ GitHub push). Then:
 
 ### 1. Review (read-only)
 - `git -C ../BrainTwin status` and `git -C ../BrainTwinCDK status`.
@@ -77,13 +100,30 @@ irreversible step (ECR push / AWS deploy / GitHub push). Then:
   `compute.ts` user-data (triggers `§14` deadlock), secret handling, CORS/auth,
   and the extension `BACKEND_URL`/`config.js`.
 - Report findings. Do **not** fix unless asked — releases ship what's reviewed.
+- From the diff classification + the latest tag, **recommend the next version**
+  (fix/feature/breaking → the right position; MINOR for breaking while in
+  `0.x`) with a one-line rationale, and ask the operator to confirm or override.
 
 ### 2. Branch + commit (both repos)
 - `git checkout -b release/vX.Y.Z` in each repo (or the user's branch name).
 - Commit with a message that lists the milestones included and flags any
   known `§14` user-data consequence.
 
-### 3. Build + push images (from BrainTwin, clean tree)
+### 3. Test gate — full suite, block on red
+Run the COMPLETE suites (not the pre-commit fast subset) before building any
+immutable image. A release must not ship a red tree.
+```bash
+# BrainTwin — full pytest (do NOT set BRAINTWIN_FAST_TESTS; the @slow
+# embedder/chroma/whisper files must run here). ~60s.
+cd ../BrainTwin && env/bin/pytest -q
+# BrainTwinCDK — full jest (tsc + cdk synth snapshot assertions). ~3 min.
+cd ../BrainTwinCDK && npm test
+```
+If either is red, STOP and report — do not build/push/deploy. The per-commit
+git hook only runs the fast subset (BrainTwin) / `tsc --noEmit` (CDK), so this
+gate is the first time the heavy tests + CDK synth snapshots run in the flow.
+
+### 4. Build + push images (from BrainTwin, clean tree)
 ```bash
 ./scripts/build-and-push.sh --release vX.Y.Z        # app  → braintwin/app
 ./scripts/build-and-push-caddy.sh --release vX.Y.Z  # caddy → braintwin/caddy
@@ -95,7 +135,7 @@ irreversible step (ECR push / AWS deploy / GitHub push). Then:
 - Skip the Caddy build if `caddy/Dockerfile` is unchanged (it bumps every few
   months, not every release) — just reuse the existing `.last-deploy-caddy-tag`.
 
-### 4. Deploy (gated)
+### 5. Deploy (gated)
 ```bash
 cd ../BrainTwinCDK && npx cdk diff --profile braintwin --context region=us-west-2
 ```
@@ -110,7 +150,7 @@ cd ../BrainTwinCDK && npx cdk diff --profile braintwin --context region=us-west-
   this deploy needs the manual EBS unblock and confirm scope with the user
   before proceeding.
 
-#### 4b. SSM-direct refresh (fallback when cdk can't auth, app-only)
+#### 5b. SSM-direct refresh (fallback when cdk can't auth, app-only)
 Only the two image-tag params change; never touches user-data, so it cannot
 trigger an instance replacement. Use the working aws CLI + `braintwin` profile:
 ```bash
@@ -129,7 +169,7 @@ aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$INSTANC
 ```
 Then poll `aws ssm get-command-invocation` for `Success`.
 
-### 5. Push to GitHub (both repos) — needs operator auth
+### 6. Push to GitHub (both repos) — needs operator auth
 - Push the release branch in each repo. If push prompts/fails on auth, ask the
   operator to authenticate and retry (see Authentication above).
 - Tag the release commit `git tag -a vX.Y.Z -m "…"` and push tags (keeps the
@@ -137,12 +177,12 @@ Then poll `aws ssm get-command-invocation` for `Success`.
 - **Open a PR to merge each release branch into `main`** (`gh pr create --base main`).
   This is the default — the operator reviews/merges. Don't push straight to main.
 
-### 6. Post-deploy smoke test
+### 7. Post-deploy smoke test
 - `curl -fsS https://api.braintwin.net/` should return 200 (public health route).
 - Confirm `/openapi.json` is **404** in prod (docs hardening, M.4.1).
 - Optionally tail the in-place refresh result from `deploy.sh` output.
 
-### 7. Report
+### 8. Report
 - Image tags pushed, deploy outcome, PR/tag URLs, and any `§14` follow-up.
 
 ## Defaults (override via env on the scripts)
