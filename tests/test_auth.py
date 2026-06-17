@@ -169,3 +169,60 @@ class TestPublicRoutes:
         # and UptimeRobot would page the operator forever.
         r = client.get("/")
         assert r.status_code == 200
+
+
+# ---- M.4.1 hardening: auto-generated docs disabled by default --------
+
+class TestApiDocsDisabledByDefault:
+    """Phase 4.0.6 M.4.1 — /docs, /redoc, /openapi.json must 404 in the
+    default (production) config so scanners can't enumerate routes.
+
+    Importantly, these are evaluated by FastAPI at app construction
+    time (module import), so the assertions reflect the env var as it
+    was when the test process started. The test process runs without
+    BRAINTWIN_DOCS_ENABLED set, which is exactly the production case.
+    """
+
+    def test_swagger_ui_returns_404(self, client, configured_token):
+        r = client.get("/docs")
+        assert r.status_code == 404
+
+    def test_redoc_returns_404(self, client, configured_token):
+        r = client.get("/redoc")
+        assert r.status_code == 404
+
+    def test_openapi_json_returns_404(self, client, configured_token):
+        # The biggest leak: openapi.json is the machine-readable
+        # schema. With it, anyone can generate a full client.
+        r = client.get("/openapi.json")
+        assert r.status_code == 404
+
+
+# ---- M.7.a — CORS posture (open, bearer-token does the auth) --------
+
+class TestCorsOpenByDesign:
+    """Phase 4.0.6 M.7.a — CORS is intentionally allow_origins=["*"].
+
+    See backend/main.py for the rationale. The summary is: content
+    scripts in the Chrome extension run with the page's origin (e.g.
+    https://nytimes.com), not chrome-extension://, so any origin-based
+    lockdown would 405 every capture preflight. The bearer token in
+    the Authorization header carries the real auth, and browsers
+    don't auto-attach Authorization headers cross-origin, so CSRF
+    doesn't apply.
+    """
+
+    def test_random_page_origin_gets_preflight_response(self, client, configured_token):
+        # Captures originate from arbitrary article pages. The
+        # preflight from any one of them must succeed or capture
+        # would 405.
+        r = client.options(
+            "/capture",
+            headers={
+                "Origin": "https://nytimes.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "*"

@@ -16,7 +16,9 @@
  * Remember tab. Both are loaded by popup.html.
  */
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+// M.7.a: read from config.js (loaded first via popup.html script order).
+const BACKEND_URL =
+  globalThis.BrainTwinConfig?.BACKEND_URL ?? "http://127.0.0.1:8000";
 const RECALL_TIMEOUT_MS = 30000; // Sonnet calls can be slow; be generous.
 
 // ---- Module state ---------------------------------------------------

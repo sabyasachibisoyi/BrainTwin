@@ -1261,6 +1261,98 @@ actually starts.
 
 ---
 
+## 14. Operational invariants (lessons earned the hard way)
+
+These are architectural truths we discovered by violating them.
+Anything that breaks one of these invariants is going to bite again.
+
+### 14.1 The EBS-deadlock invariant
+
+> **Any change to EC2 user-data forces an instance replacement, and
+> our single RETAIN EBS data volume cannot be detached from the old
+> instance and reattached to the new instance in the same CFN
+> transaction. Result: every user-data change deadlocks the deploy.**
+
+How we learned it. M.4.b set `userDataCausesReplacement: true` on the
+EC2 to fix a different bug (M.3.a user-data changes were silently
+ignored — CFN updated the LaunchTemplate but didn't replace the
+instance, so cloud-init never re-ran). That fix exposed a worse
+problem: now ANY user-data change tries to replace the EC2, and the
+new EC2 can't attach the EBS volume that the old EC2 hasn't released.
+First seen on an image-tag bump (Codex fixed by moving tags to SSM —
+see §14.2). Repeated on M.7.5 when a 5th SSM secret was added (the
+new fetch line was a user-data change).
+
+### 14.2 The runtime-vs-buildtime split
+
+Combined with §14.1, this gives the rule for what can go in user-data:
+
+| Trait | Where it must live |
+|---|---|
+| Bytes change between deploys | NOT in user-data — must be fetched at runtime from SSM by stable NAME |
+| Bytes are immutable (true infrastructure) | OK in user-data |
+| References a structure that itself changes (e.g. list of secrets) | Same as "changes between deploys" — must be discovered at runtime |
+
+The image-tag pattern works because the refresh script reads the
+tag from SSM at runtime: the bash line containing
+`aws ssm get-parameter --name /braintwin/image_tag` is byte-identical
+forever, while the SSM value can be updated freely. The TAG VALUE is
+runtime data; the PARAM NAME is build-time data.
+
+The secrets pattern (M.7.5) broke this. Adding a 5th secret
+*added a new bash line* to the refresh script. That line was build-time
+data — a different shape than the existing 4 fetches. The fact that
+"it's just one more SSM fetch" felt like runtime data fooled the
+author; it isn't.
+
+### 14.3 The discovery escape hatch
+
+The general fix is to make the refresh script enumerate its inputs
+instead of hard-coding them, so the script body stays byte-identical
+no matter how many secrets exist:
+
+```bash
+aws ssm get-parameters-by-path \
+  --path /braintwin/ \
+  --recursive \
+  --with-decryption \
+  --query 'Parameters[*].[Name,Value]' \
+  --output text \
+| while IFS=$'\t' read -r name value; do
+    env_key=$(basename "$name" | tr '[:lower:]' '[:upper:]')
+    echo "$env_key=$value"
+  done > /etc/braintwin/secrets.env
+```
+
+This makes "add a new secret" a pure SSM operation: new
+`put-parameter` + new `deploy.sh` → refresh-only → container swap.
+Zero instance churn forever.
+
+The trade-off: SSM param names become the env var names (after
+uppercasing). The existing secrets would need a one-time rename:
+`/braintwin/anthropic_key` → `/braintwin/anthropic_api_key` so the
+derived env var `ANTHROPIC_API_KEY` matches what the backend reads.
+Deferred to Phase 4.0.6.1 (M.10) as polish work.
+
+### 14.4 The instance-immutability ceiling
+
+Even with §14.3, **structural** user-data changes (adding a 4th
+container to the compose template, switching from gp3 to io2 EBS,
+changing the cloud-init runcmd order) still require replacement.
+Today that's fine: it happens rarely and we can do the manual
+unblock dance (terminate the old EC2 so CFN can attach EBS to the
+new one). When we eventually externalize state (RDS for SQLite,
+hosted Chroma — see §13), this ceiling lifts because the EBS volume
+stops being a single point of contention; instances become
+stateless and CFN can replace them freely.
+
+For now, the operational discipline is: **any PR that touches
+`compute.ts` user-data is automatically a "this deploy will require
+manual unblock" PR**. Routine work (image tags, secret rotation)
+never touches user-data.
+
+---
+
 *Author: Sabya (with Claude as design partner). Decisions captured
 2026-06-04 from conversation around AWS free tier restructure +
 portfolio audience targeting. Revised 2026-06-10: region
@@ -1271,4 +1363,10 @@ abandoned (§11) — `digitaltwin.*` unavailable, consolidated on
 BrainTwin with `braintwin.net`. Revised 2026-06-15 (later same day):
 M.3 first-cloud-deploy shipped — §5.3 rewritten with the two-phase
 deploy sequence + image-tag scheme + SSM Session Manager smoke
-test; runbook in `phase4.0.6-M3-first-cloud-deploy.md`.*
+test; runbook in `phase4.0.6-M3-first-cloud-deploy.md`. Revised
+2026-06-16: M.4 (Cloudflare + Caddy + AOP + braintwin.net),
+M.7 (Chrome extension cutover with CORS=*), M.7.5 (5th SSM param
+for Telegram allowlist) shipped. Added §14 capturing the
+EBS-deadlock + user-data-immutability invariants discovered through
+two consecutive deploys that hit the same root cause. M.10 follow-up
+task created for the discovery-pattern refactor.*
