@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -49,16 +50,45 @@ app = FastAPI(
     title="BrainTwin",
     description="Your Knowledge Twin Agent",
     version="0.1.0",
+    # Hardening (Phase 4.0.6 M.4.1): disable the auto-generated docs so
+    # the public attack surface doesn't include a complete API schema.
+    # /docs (Swagger UI), /redoc (ReDoc), and /openapi.json each leak
+    # every route path, parameter shape, and validation rule - useful
+    # for scanners enumerating endpoints to attack. We don't need them
+    # in production: the Chrome extension and Telegram bot are the only
+    # clients, and both are built from the same repo as the backend.
+    #
+    # For local development, set BRAINTWIN_DOCS_ENABLED=1 in your .env
+    # to flip these back on without an image rebuild.
+    docs_url="/docs" if os.environ.get("BRAINTWIN_DOCS_ENABLED") == "1" else None,
+    redoc_url="/redoc" if os.environ.get("BRAINTWIN_DOCS_ENABLED") == "1" else None,
+    openapi_url="/openapi.json" if os.environ.get("BRAINTWIN_DOCS_ENABLED") == "1" else None,
 )
 
-# Allow Chrome extension to talk to local backend.
+# CORS — open to all origins, bearer token does the auth.
 #
-# allow_credentials is False: auth is a Bearer header (the bearer token),
-# never a cookie, so credentialed CORS isn't needed — and "*" +
-# allow_credentials=True makes Starlette reflect ANY origin back, which is
-# the misconfig we don't want. allow_origins stays "*" for local dev; M.7
-# tightens it to chrome-extension://<id> at the cloud cutover (see
-# phase4.0.6-deployment-design.md §3.7).
+# Why "*" is the right call here (M.7.a revisited):
+#
+# The Chrome extension does its fetches from a CONTENT SCRIPT, which
+# runs in the page's context (Origin = https://nytimes.com, etc.),
+# not from the extension's chrome-extension:// origin. So a CORS
+# lockdown to chrome-extension://* would reject preflight from
+# captures on real pages and return 405. Background-worker fetches
+# would carry the extension origin, but that's a bigger refactor
+# (move fetch off content script) and orthogonal to the security
+# story.
+#
+# allow_credentials is False: auth is a Bearer header (the bearer
+# token), never a cookie. Browsers don't auto-attach Authorization
+# headers cross-origin (unlike cookies), so CSRF doesn't apply. A
+# malicious site cannot trick the user's browser into sending the
+# token. The bearer token IS the load-bearing security; CORS here
+# would only be hygiene, not real defense, and the hygiene breaks
+# real usage.
+#
+# Telegram bot requests originate server-side (inside the docker
+# network) and don't go through CORS, so this allow_origins setting
+# doesn't affect them.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

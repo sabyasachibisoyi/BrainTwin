@@ -7,7 +7,12 @@
  * the moment the user hits "Pause Capture".
  */
 
-const BACKEND_URL = "http://127.0.0.1:8000";
+// M.7.a: read from config.js (loaded first via manifest content_scripts).
+// Defensive fallback: if config.js failed to load for any reason, fall
+// back to local so dev still works rather than silently sending POSTs
+// to "undefined/capture".
+const BACKEND_URL =
+  globalThis.BrainTwinConfig?.BACKEND_URL ?? "http://127.0.0.1:8000";
 const DWELL_THRESHOLD_MS = 30000; // 30 seconds
 
 let startTime = null;
