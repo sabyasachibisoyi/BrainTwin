@@ -31,6 +31,32 @@ fetch *line*, EBS/cloud-init changes) **requires the manual EBS-unblock dance**
 user-data / instance replacement, STOP and tell the user it needs the manual
 unblock — do not let `deploy.sh` churn the instance unattended.**
 
+## Authentication — do this FIRST (needs the operator)
+
+Both AWS and GitHub require interactive auth that Claude cannot perform on the
+operator's behalf. Confirm these before the irreversible steps:
+
+- **AWS (SSO):** the `braintwin` profile is AWS IAM Identity Center (SSO). The
+  token expires (~8h). The aws CLI uses it fine, but `cdk` may fail with
+  "no credentials have been configured" / "Unable to resolve AWS account" even
+  when the CLI works. If either happens, have the operator run (in their own
+  shell, e.g. `! aws sso login --profile braintwin`):
+  ```bash
+  aws sso login --profile braintwin
+  ```
+  Verify with `aws sts get-caller-identity --profile braintwin`.
+- **`cdk` can't read SSO?** If `cdk diff/deploy` still can't authenticate after
+  `aws sso login` (old CLI ↔ SDK SSO-cache mismatch), fall back to the
+  **SSM-direct image refresh** for app-only releases (see step 4b): update the
+  `/braintwin/image_tag` + `/braintwin/caddy_image_tag` params with the aws CLI
+  and trigger `braintwin-refresh.sh` over SSM RunCommand. This is byte-for-byte
+  what `deploy.sh` does after `cdk deploy`, and it CANNOT touch user-data, so
+  it's the safest app-only path.
+- **GitHub:** `git push` / `gh pr create` need the operator's credentials and
+  approval. Don't assume push will succeed unattended; if it prompts or fails
+  on auth, ask the operator to authenticate (`gh auth login` or their git
+  credential helper) and retry.
+
 ## Versioning
 
 - App + Caddy images share the `vX.Y.Z` release scheme (`--release vX.Y.Z`).
@@ -84,11 +110,32 @@ cd ../BrainTwinCDK && npx cdk diff --profile braintwin --context region=us-west-
   this deploy needs the manual EBS unblock and confirm scope with the user
   before proceeding.
 
-### 5. Push to GitHub (both repos)
-- Push the release branch in each repo.
+#### 4b. SSM-direct refresh (fallback when cdk can't auth, app-only)
+Only the two image-tag params change; never touches user-data, so it cannot
+trigger an instance replacement. Use the working aws CLI + `braintwin` profile:
+```bash
+aws ssm put-parameter --profile braintwin --region us-west-2 --overwrite \
+  --name /braintwin/image_tag --type String --value vX.Y.Z
+aws ssm put-parameter --profile braintwin --region us-west-2 --overwrite \
+  --name /braintwin/caddy_image_tag --type String --value caddy-<ver>-vX.Y.Z
+# find the instance, then refresh:
+INSTANCE=$(aws cloudformation describe-stack-resources \
+  --stack-name BrainTwinStack-us-west-2 --profile braintwin --region us-west-2 \
+  --query "StackResources[?ResourceType=='AWS::EC2::Instance'].PhysicalResourceId" --output text)
+aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$INSTANCE" \
+  --comment "BrainTwin app image refresh (vX.Y.Z)" \
+  --parameters 'commands=["/usr/local/bin/braintwin-refresh.sh"]' \
+  --profile braintwin --region us-west-2
+```
+Then poll `aws ssm get-command-invocation` for `Success`.
+
+### 5. Push to GitHub (both repos) — needs operator auth
+- Push the release branch in each repo. If push prompts/fails on auth, ask the
+  operator to authenticate and retry (see Authentication above).
 - Tag the release commit `git tag -a vX.Y.Z -m "…"` and push tags (keeps the
   git tag aligned with the image tag).
-- Open a PR per repo (`gh pr create`) unless the user wants a direct merge.
+- **Open a PR to merge each release branch into `main`** (`gh pr create --base main`).
+  This is the default — the operator reviews/merges. Don't push straight to main.
 
 ### 6. Post-deploy smoke test
 - `curl -fsS https://api.braintwin.net/` should return 200 (public health route).
