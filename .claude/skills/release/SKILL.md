@@ -59,17 +59,40 @@ operator's behalf. Confirm these before the irreversible steps:
 
 ## Versioning
 
-- App + Caddy images share the `vX.Y.Z` release scheme (`--release vX.Y.Z`).
-  - App tag: `v0.1.0`. Caddy tag: `caddy-<upstream>-v0.1.0` (script derives it).
-- `v0.x` = pre-API-stability. MAJOR=breaking API, MINOR=feature, PATCH=fix.
+`vMAJOR.MINOR.PATCH` — leftmost is breaking, rightmost is fixes:
+
+| Position | Bump when… | From `v0.1.0` → |
+|---|---|---|
+| **MAJOR** (leftmost) | breaking API change | `v1.0.0` |
+| **MINOR** (middle) | new backwards-compatible feature | `v0.2.0` |
+| **PATCH** (rightmost) | bug fix / refactor / dep bump | `v0.1.1` |
+
+- **`v0.x` (pre-API-stability) override:** while the leading number is `0` the
+  API isn't promised stable, so treat **MINOR as the de-facto breaking bump**
+  and PATCH for everything else. Reserve `v1.0.0` for "the API is now stable",
+  not just "it works on AWS".
+- App + Caddy images share this scheme (`--release vX.Y.Z`). App tag `v0.1.0`;
+  Caddy tag `caddy-<upstream>-v0.1.0` (the script derives it).
 - Release builds **refuse a dirty tree** (reproducible-from-git) → commit first.
 - ECR is `IMMUTABLE` → a tag can't be reused. Bump the version to re-release.
 - The extension `manifest.json` version is independent of the image version.
 
+### Choosing the version — recommend, then confirm
+Do NOT ask the operator for a version cold. In the review step you already
+classify the changes, so:
+1. Read the latest release tag: `git describe --tags --abbrev=0` (or `git tag`).
+2. Classify the pending diff: fix → PATCH, feature → MINOR, breaking → MINOR in
+   `0.x` else MAJOR.
+3. **Propose** the resulting version with a one-line rationale (e.g. "extension
+   feature + backend fix → MINOR → `v0.2.0`"), then ask the operator to confirm
+   or override. They have final say (the tag is immutable), but the default is
+   a grounded suggestion, never a blank prompt.
+
 ## Checklist
 
-Confirm the **version** and **deploy scope** with the user before any
-irreversible step (ECR push / AWS deploy / GitHub push). Then:
+**Propose** the version and deploy scope (see "Choosing the version"), then get
+the operator's confirmation before any irreversible step (ECR push / AWS deploy
+/ GitHub push). Then:
 
 ### 1. Review (read-only)
 - `git -C ../BrainTwin status` and `git -C ../BrainTwinCDK status`.
@@ -77,6 +100,9 @@ irreversible step (ECR push / AWS deploy / GitHub push). Then:
   `compute.ts` user-data (triggers `§14` deadlock), secret handling, CORS/auth,
   and the extension `BACKEND_URL`/`config.js`.
 - Report findings. Do **not** fix unless asked — releases ship what's reviewed.
+- From the diff classification + the latest tag, **recommend the next version**
+  (fix/feature/breaking → the right position; MINOR for breaking while in
+  `0.x`) with a one-line rationale, and ask the operator to confirm or override.
 
 ### 2. Branch + commit (both repos)
 - `git checkout -b release/vX.Y.Z` in each repo (or the user's branch name).
