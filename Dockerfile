@@ -143,9 +143,16 @@ USER braintwin
 
 EXPOSE 8000
 
-# Health is the public route — no bearer token needed.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl -fsS http://localhost:8000/health || exit 1
+# No image-level HEALTHCHECK on purpose. This image runs BOTH services:
+# the `app` (uvicorn on :8000) and the `bot` (a Telegram long-poll worker
+# that listens on nothing — see the `command:` override in
+# docker-compose.yml / compute.ts). An image-level `curl localhost:8000`
+# check would pass for the app but permanently fail for the bot
+# (connection refused → "unhealthy"), even though the bot is working.
+# So health is defined per-service at the COMPOSE layer instead: the app
+# service carries the curl /health check (and the `depends_on:
+# service_healthy` gates key off it); the bot service intentionally has
+# none and relies on `restart: unless-stopped`.
 
 # Default command — the FastAPI app. The `bot` service in
 # docker-compose.yml overrides this via `command:`.

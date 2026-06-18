@@ -1351,6 +1351,64 @@ For now, the operational discipline is: **any PR that touches
 manual unblock" PR**. Routine work (image tags, secret rotation)
 never touches user-data.
 
+### 14.5 The Docker-on-EC2 IMDS hop limit
+
+EC2 instance metadata (IMDS) at `169.254.169.254` is the credential
+source the AWS SDK falls back to when no env vars or shared-config
+file is present. With IMDSv2 required (which we do for security —
+see §14 elsewhere), AWS introduces a `HttpPutResponseHopLimit`
+parameter that bounds how far the metadata response can travel.
+
+The default is **1**, which is correct for processes on the host
+but **wrong** for any process inside a Docker container — the
+docker0 bridge counts as one hop, leaving the IMDS response with
+zero hops budget to deliver back. The symptom is the AWS SDK
+erroring with:
+
+```
+NoCredentialProviders: no valid providers in chain.
+```
+
+We hit this at M.5 when Litestream (running in a container, using
+the AWS SDK's default credential chain) couldn't reach IMDS to
+authenticate to S3.
+
+**The invariant:** any time we run a container on the EC2 that
+needs AWS credentials and we want it to use the instance role
+(rather than baking credentials into the container or env vars),
+the LaunchTemplate's `HttpPutResponseHopLimit` must be **at least
+2**. We bump it to exactly 2 — enough for Docker, still small
+enough to cap a metadata-exfil attack's blast radius.
+
+This isn't a CDK L2-construct knob; the `requireImdsv2: true`
+shortcut sets `HttpTokens: required` but leaves the hop limit at
+default. We apply the override via a CDK Aspect in `compute.ts`
+that finds the auto-created CfnLaunchTemplate and calls
+`addPropertyOverride`. Tested.
+
+### 14.6 The container-UID and cap_drop interaction
+
+Containers running with `cap_drop: ALL` (our default hardening)
+lose `CAP_DAC_OVERRIDE` — the capability that lets root bypass
+file permission checks. Combined with our convention of chowning
+the data dir to UID 10001 (the BrainTwin app's container user),
+this means: **any other container that runs as root will be
+unable to write files in the data dir**, even though it's
+"root."
+
+SQLite reports this failure as `"attempt to write a readonly
+database"`, which is misleading — the DB isn't read-only, the
+container just can't write to it. We hit this with Litestream
+during M.5 because the official Litestream image runs as root.
+
+**The invariant:** every container we add to the compose template
+that reads or writes `/var/lib/braintwin/data` must either run as
+UID 10001 (via a `user: "10001:10001"` line in the service
+block), or have a Dockerfile that sets `USER 10001:10001` itself.
+The capability route (re-adding `DAC_OVERRIDE`) is a worse
+trade-off — it widens the container's blast radius for not much
+operational benefit.
+
 ---
 
 *Author: Sabya (with Claude as design partner). Decisions captured
