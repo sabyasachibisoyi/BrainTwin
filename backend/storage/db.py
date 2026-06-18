@@ -109,8 +109,53 @@ def get_engine() -> AsyncEngine:
             echo=settings.database_echo,
             future=True,
         )
+
+        # Phase 4.0.6 M.5: turn on SQLite WAL mode so Litestream can
+        # stream the WAL to S3. WAL also gives us concurrent readers +
+        # one writer, which is friendlier under load than the default
+        # rollback journal. synchronous=NORMAL is the standard pairing
+        # with WAL (FULL is overkill because WAL is already crash-safe
+        # for one fsync per checkpoint, not per transaction). The
+        # busy_timeout gives SQLite 5s to wait for the WAL lock before
+        # returning SQLITE_BUSY — under our single-writer model this
+        # mostly affects the Telegram bot retrying around app writes.
+        #
+        # PRAGMAs are set per-connection (SQLite scope). aiosqlite holds
+        # one connection per session, so we wire this on the underlying
+        # sync engine's connect event — fires for every new connection.
+        if url.startswith("sqlite+aiosqlite:///"):
+            _configure_sqlite_pragmas(_engine)
+
         logger.info("Created SQL engine: %s", _safe_url(url))
     return _engine
+
+
+def _configure_sqlite_pragmas(engine: AsyncEngine) -> None:
+    """Wire a connect-event listener that sets WAL + tuning PRAGMAs on
+    every new SQLite connection.
+
+    M.5 — Litestream requires journal_mode=WAL; we co-set synchronous=
+    NORMAL and busy_timeout=5000 because that's the Litestream-recommended
+    pairing and a sane default for our single-writer workload.
+
+    The PRAGMA state is per-connection in SQLite, but `journal_mode=WAL`
+    is recorded in the file header and persists across reopens — so the
+    first successful connection flips the file's mode permanently. The
+    other two PRAGMAs are connection-local and must be set every time;
+    that's why we hook the `connect` event instead of running them once
+    in `init_db`.
+    """
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_pragmas(dbapi_connection, _connection_record):  # noqa: ARG001
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
