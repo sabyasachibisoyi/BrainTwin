@@ -271,6 +271,8 @@ crosses a 10x size threshold.
 | `chroma-backup.timer` doesn't list a next run | Timer not enabled | `sudo systemctl enable --now braintwin-chroma-backup.timer` |
 | Restore command errors `no replica found` | Litestream hasn't had time to upload anything yet | Wait 5 min, retry. Check `aws s3 ls s3://.../litestream/` |
 | CloudWatch namespace empty | Agent not running | `sudo systemctl status amazon-cloudwatch-agent`, restart with `sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s` |
+| Bot reports `Up (healthy)` but Telegram messages aren't flowing | Healthcheck self-match — pattern was `backend.telegram_bot` (unbracketed); the shell running the probe matches itself, so the check always passes regardless of bot state | Fixed in source post-M.12: the pattern is bracketed (`[b]ackend.telegram_bot`). For a running instance that pre-dates the fix, edit `/etc/braintwin/docker-compose.yml`, bracket the pattern in the bot service's healthcheck, then `docker compose up -d bot`. See design doc §14.7. |
+| User-data aborts at boot with `aws s3 cp ... failed` | Transient S3 / DNS / NAT failure during M.12 asset download. Pre-fix there was no retry | Fixed in source post-M.12: each asset cp goes through an `s3cp_retry` helper (5 attempts + backoff). For instances provisioned before the helper landed, manual workaround is to re-run the cp from a Session Manager shell, then re-run /usr/local/bin/braintwin-refresh.sh. See design doc §14.8. |
 
 ---
 
