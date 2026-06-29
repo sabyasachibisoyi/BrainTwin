@@ -1409,6 +1409,134 @@ The capability route (re-adding `DAC_OVERRIDE`) is a worse
 trade-off — it widens the container's blast radius for not much
 operational benefit.
 
+### 14.7 The cmdline-grep self-match
+
+Any healthcheck or watchdog that decides aliveness by grepping
+`/proc/<pid>/cmdline` for a known substring is vulnerable to
+matching itself. Docker runs `["CMD-SHELL", "grep -l X /proc/*/cmdline"]`
+via an intermediate `sh -c "grep -l X /proc/*/cmdline"`. That
+shell process has `X` as a literal argument in its OWN cmdline.
+`grep` scans every running process, finds the shell, reports a
+match, exits 0. The healthcheck reports `healthy` regardless of
+whether the real target process is alive or dead.
+
+This silently broke the bot healthcheck during M.0 — the check
+went green even when the bot crashed.
+
+**The invariant:** any `/proc/*/cmdline` grep pattern used in a
+healthcheck must be transformed so the literal pattern string
+won't match itself when scanned. The standard idiom is to bracket
+one character of the pattern:
+
+```yaml
+test: ["CMD-SHELL", "grep -l [b]ackend.telegram_bot /proc/*/cmdline >/dev/null 2>&1"]
+```
+
+The regex `[b]ackend.telegram_bot` matches the literal substring
+`backend.telegram_bot` (because `[b]` is a one-char character
+class). But the shell's own cmdline contains the bracketed literal
+`[b]ackend.telegram_bot`, which the regex does NOT match (the
+substring `backend` is absent from that literal). The real bot
+process (`python -m backend.telegram_bot.bot`) still matches.
+
+This trick is decades old in `ps | grep` chains and applies
+verbatim here. Same rule for any future watchdog that scans
+`/proc`.
+
+### 14.8 Boot-time S3 fetches need idempotent retry
+
+After M.12, the EC2 downloads four config files from the CDK
+bootstrap S3 bucket as part of user-data. Before M.12 those files
+were inlined: their presence was guaranteed by the same mechanism
+that delivered user-data itself. After M.12 they become a network
+fetch, and `set -euxo pipefail` is unforgiving — a single
+transient `aws s3 cp` failure (slow NAT warm-up at first boot,
+S3 throttling, intermittent DNS) aborts the entire user-data
+script. The instance never finishes provisioning, CFN marks the
+stack `UPDATE_FAILED`, and we end up in the §14.1 EBS-deadlock
+dance for a non-deterministic reason.
+
+**The invariant:** every boot-time fetch from a remote endpoint
+inside user-data must be wrapped in a retry loop with a sensible
+backoff and a loud fail-after-N-attempts. We use a single
+`s3cp_retry` helper at the top of user-data that all the M.12
+asset downloads go through. The same pattern was already in place
+for the Cloudflare Origin Pull CA cert (which has its own retry
+loop) — formalize the pattern instead of duplicating it per
+fetch. New asset downloads call `s3cp_retry <s3-url> <dest>`,
+which retries 5 times with a 5 s sleep between attempts and exits
+non-zero with a clear log message if all attempts fail.
+
+The same invariant applies in spirit to other boot-time pulls
+(ECR login + docker pull, apt-get update + install, etc.) — most
+already have their own retry logic via the underlying tool. New
+ones don't, so we wrap them ourselves.
+
+### 14.9 Discovery is convention; renames are still ceremony
+
+After M.10 the refresh script reads every parameter under
+`/braintwin/` via `get-parameters-by-path --recursive
+--with-decryption` and writes each value to `/etc/braintwin/secrets.env`
+as `<BASENAME_UPPERCASED>=<value>`. Adding a new SSM parameter
+becomes a two-command operation that doesn't touch CDK at all:
+
+```
+./scripts/put-secrets.sh new_thing      # creates /braintwin/new_thing
+./scripts/deploy.sh                     # SSM RunCommand → refresh
+```
+
+The new env var lands as `NEW_THING=…` in the next compose pull.
+
+**The convention:** an SSM parameter at `/braintwin/<name>` is
+expected to be consumed by the app as the env var `<NAME_UPPER>`.
+The refresh script is the only place that enforces this — there
+is no schema. Two carve-outs:
+
+1. **`image_tag` and `caddy_image_tag` are NOT secrets** — they
+   live under `/braintwin/` for namespace consistency but are
+   pointers to immutable image versions, not credentials. The
+   refresh script skips them in the secrets loop and reads each
+   one explicitly into a bash var. New non-secret params under
+   `/braintwin/` need either a new explicit fetcher OR a skip
+   entry in the discovery loop's case statement. There's no
+   "config" subtree today; if we add more non-secret params,
+   moving everything to `/braintwin/secrets/` becomes worth the
+   refactor.
+
+2. **Three legacy renames** (`anthropic_key` →
+   `ANTHROPIC_API_KEY`, `bearer_token` → `BACKEND_BEARER_TOKEN`,
+   `telegram_token` → `TELEGRAM_BOT_TOKEN`) sit in an alias
+   `case` block inside the refresh script. They exist because
+   these three secrets were created before M.10 with names that
+   don't match the app-side env var names. Renaming the SSM
+   params themselves would have meant updating put-secrets.sh,
+   re-creating five SecureStrings, AND touching the app's env
+   contract — too much for a refactor. The alias makes the SSM
+   side stable.
+
+**The invariant — what's friction-free vs ceremonial:**
+
+| Operation | Effort | Why |
+|-----------|--------|-----|
+| Add a new secret with name = uppercased basename | `put-secrets.sh` + `deploy.sh` | Discovery loop picks it up automatically. |
+| Rotate an existing secret | `put-secrets.sh` + `deploy.sh` | Same — the value changes, name stays. |
+| Add a non-secret param under `/braintwin/` | CDK edit (skip-list or explicit fetch) → EBS-deadlock dance | Discovery loop would otherwise leak it into secrets.env. |
+| Rename an existing secret's env-var name | CDK edit (alias-table entry) → EBS-deadlock dance | Aliases live in user-data; refresh script is user-data. |
+
+This is the right shape. Most operational work falls in the top
+two rows (frequent, friction-free); the rare ceremony lives in
+the bottom two (CDK edits that you'd want a PR review for
+anyway).
+
+The defensive check at the end of the discovery loop (`for k in
+ANTHROPIC_API_KEY BACKEND_BEARER_TOKEN …; do grep -q "^${k}=" …
+|| exit 1`) is what catches "operator forgot to put a required
+key" — the only failure mode that gets worse when fetches are
+implicit. With the check, the failure is a clear FATAL with a
+"did you run scripts/put-secrets.sh?" message; without it, the
+containers boot and crash with cryptic `KeyError` deep in the
+app.
+
 ---
 
 *Author: Sabya (with Claude as design partner). Decisions captured
@@ -1427,4 +1555,15 @@ M.7 (Chrome extension cutover with CORS=*), M.7.5 (5th SSM param
 for Telegram allowlist) shipped. Added §14 capturing the
 EBS-deadlock + user-data-immutability invariants discovered through
 two consecutive deploys that hit the same root cause. M.10 follow-up
-task created for the discovery-pattern refactor.*
+task created for the discovery-pattern refactor. Revised 2026-06-19:
+M.5 shipped (Litestream + Chroma backups + CW Agent) with §14.5
+(IMDS hop-limit-2 for in-container AWS SDK) and §14.6 (container
+UID × cap_drop interaction) added. Revised 2026-06-22: Phase
+4.0.6.1 polish underway — M.0 (bot healthcheck) and M.12 (s3.Asset
+refactor for 4 static files) shipped, with §14.7 (cmdline-grep
+self-match invariant) and §14.8 (boot-time S3 fetches need
+idempotent retry) added after a code-review pass caught both as
+latent bugs in M.0 and M.12 respectively. Revised 2026-06-23: M.10
+shipped (discovery refresh script via get-parameters-by-path), with
+§14.9 added documenting the convention/ceremony split between
+frictionless secret rotations and the rare CDK-touching renames.*

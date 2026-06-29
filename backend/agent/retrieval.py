@@ -49,6 +49,7 @@ from typing import Optional
 
 import numpy as np
 
+from backend.observability import timed
 from backend.storage import (
     Capture,
     CaptureRepository,
@@ -294,12 +295,19 @@ class RetrievalService:
         """Vector ranker with its own error boundary. A Chroma failure
         degrades to BM25-only rather than failing the whole recall."""
         try:
-            return await self._vector_store.query(
-                COLLECTION_CHUNKS,
-                embedding=embedding,
-                where={"user_id": user_id},
-                top_k=top_k,
-            )
+            # M.11 — EMF span on Chroma. `error="none"` on success,
+            # `error=<ExcType>` on raise → the dashboard can graph
+            # vector-only-recall-rate by filtering on error != "none".
+            async with timed(
+                "chroma_query_latency_ms",
+                dimensions={"collection": COLLECTION_CHUNKS, "top_k": str(top_k)},
+            ):
+                return await self._vector_store.query(
+                    COLLECTION_CHUNKS,
+                    embedding=embedding,
+                    where={"user_id": user_id},
+                    top_k=top_k,
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "recall: vector ranker failed, continuing BM25-only: %s", e,

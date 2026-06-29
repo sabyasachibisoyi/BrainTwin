@@ -21,6 +21,7 @@ from typing import Any
 import anthropic
 
 from backend.config import reveal, settings
+from backend.observability import timed
 
 
 logger = logging.getLogger(__name__)
@@ -82,12 +83,19 @@ class LLMClient:
         model-mechanic only — no business logic here.
         """
         try:
-            response = await self._client.messages.create(
-                model=self._enrichment_model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
+            # M.11 — emit one CloudWatch EMF line per Anthropic call.
+            # Dimensions: endpoint + model. Captures latency and (via the
+            # auto-attached `error` dim) failure type per call site.
+            async with timed(
+                "anthropic_latency_ms",
+                dimensions={"endpoint": "enrich", "model": self._enrichment_model},
+            ):
+                response = await self._client.messages.create(
+                    model=self._enrichment_model,
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
         except anthropic.APIConnectionError as e:
             raise TransientLLMError(f"connection: {e}") from e
         except anthropic.RateLimitError as e:
@@ -163,12 +171,19 @@ class LLMClient:
         """
         chosen_model = model or settings.agent_model
         try:
-            response = await self._client.messages.create(
-                model=chosen_model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
+            # M.11 — same EMF instrumentation as enrich() above, separate
+            # `endpoint` dim so the recall vs enrichment latencies graph
+            # independently in the dashboard.
+            async with timed(
+                "anthropic_latency_ms",
+                dimensions={"endpoint": "complete_json", "model": chosen_model},
+            ):
+                response = await self._client.messages.create(
+                    model=chosen_model,
+                    max_tokens=max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
         except anthropic.APIConnectionError as e:
             raise TransientLLMError(f"connection: {e}") from e
         except anthropic.RateLimitError as e:
