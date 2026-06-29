@@ -191,14 +191,29 @@ The downside: the secrets.env file becomes the source of truth for
 for flexibility. For a 1-2 person project that trade is the right
 call; in a 20-person org you'd want the explicit list.
 
-**Test:** new test in `compute.test.ts` that the refresh script
-uses `get-parameters-by-path` (not a hardcoded list of `get-parameter`
-calls). Keep the existing five-param assertion — backwards compat
-during the transition.
+**Test:** new tests in `compute.test.ts` that the refresh script
+uses `get-parameters-by-path` with the right path + flags, that
+the image-tag params are filtered out of the loop, that the three
+alias renames are present, and that the defensive grep-check
+covers all five expected env var names. New test in
+`secrets.test.ts` that the IAM grant scopes `ssm:GetParametersByPath`
+to `/braintwin/*` (and not `*`).
 
-**Risk:** medium. Same EBS-deadlock dance as M.12. If we bundle
-M.0 + M.12 + M.10 into a single user-data change, we do the dance
-*once* and unlock everything.
+**What shipped (2026-06-23):**
+
+| Decision | What we did |
+|----------|------------|
+| Two-phase or full migration | **Full migration to discovery.** Backwards-compat hardcoded fetches would have been confusing dead code. The grep-check defence catches the worst-case "missing param" failure mode loudly. |
+| Where the env-var rename happens | **Refresh script alias table.** Three renames live inline as a `case "$key" in ANTHROPIC_KEY) key=ANTHROPIC_API_KEY ;; …` block. The alternative — renaming the SSM params themselves — would have required a deploy that touches both put-secrets.sh and the app's env-var contract. The alias keeps the SSM-side stable. |
+| Skipping the image-tag params | **`case $base in image_tag\|caddy_image_tag) continue ;;`** at the top of the loop. They live under `/braintwin/` so `get-parameters-by-path --recursive` returns them; without the skip they'd leak into secrets.env as `IMAGE_TAG=` lines. |
+| Defensive "all required keys present" check | **Post-loop `for k in … ; do grep -q "^${k}=" ; done` with FATAL exit.** Catches the "forgot put-secrets.sh on a fresh account" or "typo on rotation" cases at boot rather than letting a container start with a missing env. |
+| User-data byte cost | **+459 bytes vs M.12** (15,504 → 15,963; margin 880 → 421 bytes). The discovery loop is slightly larger than 5 hardcoded fetches because of the case statement + defensive check. Acceptable. |
+
+**Risk:** medium. Same EBS-deadlock dance as M.12. After M.10
+lands, adding a 6th secret is `./scripts/put-secrets.sh new_thing
++ ./scripts/deploy.sh` — refresh-only, no instance churn. Renaming
+an EXISTING secret's env-var name still touches the alias table
+(and thus user-data); design doc §14.9 records that nuance.
 
 ### 2.3 M.13 — GitHub Actions CI/CD
 
@@ -300,6 +315,23 @@ JSON.
 dashboard (which is a refresh-friendly resource).
 
 **Time:** 2 days including the dashboard.
+
+### 2.4.1 What shipped (2026-06-23)
+
+Hit all four checkpoints from the design above. Notes on each
+choice:
+
+| Choice | What we did |
+|--------|-------------|
+| EMF lib vs raw JSON | **Raw JSON.** ~150 lines in `backend/observability/emf.py` (emit_metric helper, `timed` async context manager, `EMFMiddleware` ASGI middleware). Zero new deps. |
+| Where the middleware lands | **`app.add_middleware(EMFMiddleware)` AFTER CORSMiddleware** in `backend/main.py`. Order matters — middlewares apply in reverse-add, so EMFMiddleware wraps CORS too, capturing CORS rejection latency and status in the metric. |
+| What gets instrumented | **3 surfaces:** HTTP via middleware (every request), Anthropic via `timed(...)` around the two `messages.create` calls in LLMClient (`enrich` + `complete_json`), Chroma via `timed(...)` around the vector query in `RetrievalService._run_vector`. BM25 stays uninstrumented — it's just SQLite, well-covered by existing logs. |
+| Where errors land | **`error` dimension on `timed` context manager.** "none" on success, `type(exc).__name__` on raise. Dashboard error widgets filter on `error != "none"` rather than maintaining a separate counter. |
+| Dimensions | HTTP: `route` (template, NOT raw path — `/items/{id}` not `/items/42`), `method`, `status`. Anthropic: `endpoint` (enrich vs complete_json), `model`, `error`. Chroma: `collection`, `top_k`, `error`. |
+| Dashboard structure | One CDK dashboard named `BrainTwin-App`, 3 rows: HTTP latency (`/capture`, `/recall` side-by-side, p50/p95/p99), request count + 5xx by route, Anthropic latency by endpoint + Chroma latency. Output `AppDashboardUrl` gives the operator a click-through URL. |
+| Token-count tracking | **Deferred.** Anthropic's `response.usage` has input/output token counts; `emit_metric` already accepts `extra_metrics`. Wiring is ~5 lines and would let us graph spend per route. Deferred only because it adds Anthropic-SDK coupling to the metric path (`response.usage.input_tokens`) — worth doing but worth its own small PR. |
+| Test surface | 9 EMF behaviour checks (3 emit_metric, 3 timed, 3 middleware) + 4 CDK dashboard regression tests (count, namespace+metric names, pinned dims, output URL). Stdlib smoke-script in this commit confirmed all 9; pytest run on the Mac is the canonical verification. |
+| User-data impact | **Zero.** App-only change. The dashboard is a CFN resource that drops in via routine refresh deploys — no EBS-deadlock dance. |
 
 ---
 

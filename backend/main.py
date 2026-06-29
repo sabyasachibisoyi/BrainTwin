@@ -26,6 +26,7 @@ from backend.knowledge.enrichment_worker import (
     iter_unenriched_captures,
 )
 from backend.knowledge.llm_client import LLMClient, PermanentLLMError
+from backend.observability import EMFMiddleware
 from backend.storage import (
     DEFAULT_USER_ID,
     CaptureRepository,
@@ -96,6 +97,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Phase 4.0.6.1 M.11 — emit one CloudWatch EMF log line per HTTP
+# request (per-route latency + status). The line lands in stdout, the
+# docker-compose awslogs driver ships it to /braintwin/app, and
+# CloudWatch parses the EMF block at ingestion into the BrainTwin/App
+# namespace. No extra API calls, no separate metrics pipeline.
+#
+# Middlewares are applied in REVERSE add order, so this one wraps
+# CORS too — latency includes the CORS overhead, status reflects the
+# final response (including 4xx from CORS rejections).
+app.add_middleware(EMFMiddleware)
 
 
 # Phase 3.5 — captures + enrichments + hydrations now live in SQL +

@@ -1472,6 +1472,71 @@ The same invariant applies in spirit to other boot-time pulls
 already have their own retry logic via the underlying tool. New
 ones don't, so we wrap them ourselves.
 
+### 14.9 Discovery is convention; renames are still ceremony
+
+After M.10 the refresh script reads every parameter under
+`/braintwin/` via `get-parameters-by-path --recursive
+--with-decryption` and writes each value to `/etc/braintwin/secrets.env`
+as `<BASENAME_UPPERCASED>=<value>`. Adding a new SSM parameter
+becomes a two-command operation that doesn't touch CDK at all:
+
+```
+./scripts/put-secrets.sh new_thing      # creates /braintwin/new_thing
+./scripts/deploy.sh                     # SSM RunCommand → refresh
+```
+
+The new env var lands as `NEW_THING=…` in the next compose pull.
+
+**The convention:** an SSM parameter at `/braintwin/<name>` is
+expected to be consumed by the app as the env var `<NAME_UPPER>`.
+The refresh script is the only place that enforces this — there
+is no schema. Two carve-outs:
+
+1. **`image_tag` and `caddy_image_tag` are NOT secrets** — they
+   live under `/braintwin/` for namespace consistency but are
+   pointers to immutable image versions, not credentials. The
+   refresh script skips them in the secrets loop and reads each
+   one explicitly into a bash var. New non-secret params under
+   `/braintwin/` need either a new explicit fetcher OR a skip
+   entry in the discovery loop's case statement. There's no
+   "config" subtree today; if we add more non-secret params,
+   moving everything to `/braintwin/secrets/` becomes worth the
+   refactor.
+
+2. **Three legacy renames** (`anthropic_key` →
+   `ANTHROPIC_API_KEY`, `bearer_token` → `BACKEND_BEARER_TOKEN`,
+   `telegram_token` → `TELEGRAM_BOT_TOKEN`) sit in an alias
+   `case` block inside the refresh script. They exist because
+   these three secrets were created before M.10 with names that
+   don't match the app-side env var names. Renaming the SSM
+   params themselves would have meant updating put-secrets.sh,
+   re-creating five SecureStrings, AND touching the app's env
+   contract — too much for a refactor. The alias makes the SSM
+   side stable.
+
+**The invariant — what's friction-free vs ceremonial:**
+
+| Operation | Effort | Why |
+|-----------|--------|-----|
+| Add a new secret with name = uppercased basename | `put-secrets.sh` + `deploy.sh` | Discovery loop picks it up automatically. |
+| Rotate an existing secret | `put-secrets.sh` + `deploy.sh` | Same — the value changes, name stays. |
+| Add a non-secret param under `/braintwin/` | CDK edit (skip-list or explicit fetch) → EBS-deadlock dance | Discovery loop would otherwise leak it into secrets.env. |
+| Rename an existing secret's env-var name | CDK edit (alias-table entry) → EBS-deadlock dance | Aliases live in user-data; refresh script is user-data. |
+
+This is the right shape. Most operational work falls in the top
+two rows (frequent, friction-free); the rare ceremony lives in
+the bottom two (CDK edits that you'd want a PR review for
+anyway).
+
+The defensive check at the end of the discovery loop (`for k in
+ANTHROPIC_API_KEY BACKEND_BEARER_TOKEN …; do grep -q "^${k}=" …
+|| exit 1`) is what catches "operator forgot to put a required
+key" — the only failure mode that gets worse when fetches are
+implicit. With the check, the failure is a clear FATAL with a
+"did you run scripts/put-secrets.sh?" message; without it, the
+containers boot and crash with cryptic `KeyError` deep in the
+app.
+
 ---
 
 *Author: Sabya (with Claude as design partner). Decisions captured
@@ -1498,4 +1563,7 @@ UID × cap_drop interaction) added. Revised 2026-06-22: Phase
 refactor for 4 static files) shipped, with §14.7 (cmdline-grep
 self-match invariant) and §14.8 (boot-time S3 fetches need
 idempotent retry) added after a code-review pass caught both as
-latent bugs in M.0 and M.12 respectively.*
+latent bugs in M.0 and M.12 respectively. Revised 2026-06-23: M.10
+shipped (discovery refresh script via get-parameters-by-path), with
+§14.9 added documenting the convention/ceremony split between
+frictionless secret rotations and the rare CDK-touching renames.*
