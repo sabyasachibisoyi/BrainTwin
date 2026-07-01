@@ -1537,6 +1537,125 @@ implicit. With the check, the failure is a clear FATAL with a
 containers boot and crash with cryptic `KeyError` deep in the
 app.
 
+### 14.10 Bounded-cardinality dimensions for internet-facing metric emitters
+
+CloudWatch's pricing model is per unique tuple of (namespace, metric
+name, dimension set). Each fresh combination becomes a new "custom
+metric" priced at ~$0.30/month for the first 10K, $0.10/each after.
+A metric whose dimension values come from internet input — anything
+an unauthenticated outside actor can vary at will — is **uncapped
+from outside**. A single Shodan scan or a routine botnet probe
+burst can mint hundreds to thousands of unique metric tuples in
+minutes, each one a new line item on the bill and a new column of
+noise in dashboards.
+
+The original M.11 `EMFMiddleware` route dimension was derived from
+`scope["path"]` as a fallback. The intent was to use the matched
+route template (`/items/{id}` not `/items/42`), but on the Starlette
+version we use `scope["route"]` is never populated, so the fallback
+was the always-path. Probes at `/.env`, `/wp-admin`, `/api/v1/<uuid>`
+each emit a distinct `route` value. Without a fix, a sustained scan
+could push the BrainTwin/App namespace past the AWS Budget alarms
+and pollute the dashboards.
+
+**The invariant:** any metric dimension whose value comes from an
+untrusted external source must be bounded to a known, small set
+**before it lands in the emit call**. For `EMFMiddleware`, we use
+`scope.get("endpoint")` as the discriminator — Starlette sets it
+during routing; presence means a route matched, absence means 404.
+Matched paths pass through to the metric (every current route is
+static, so the raw path IS the template); unmatched paths clamp to
+the sentinel `<unmatched>`, collapsing all noise into one dimension
+value.
+
+The pattern generalises:
+
+- Internet-facing dimensions need an explicit allowlist OR an
+  explicit clamp. Hopeful templates ("the framework will normalise
+  this") aren't enough.
+- The check belongs IN the metric path, not after the fact.
+  CloudWatch doesn't have a "drop noisy metrics" lever; once
+  emitted, you pay for them until they age out (15 months).
+- New parameterised routes (`/capture/{id}` etc.) break the
+  current shortcut. When we add one, the matched-path branch
+  must derive the template from `app.routes` (`route.matches(scope)
+  → route.path`), not use the raw path.
+
+We use AWS Budgets at $50 / $100 / $150 thresholds as a backstop
+(see §3 / Observability construct), but those are post-hoc alerts;
+the dimension clamp prevents the spend from happening in the first
+place. Both layers are necessary; neither is sufficient.
+
+### 14.11 Don't tag custom metrics with instance-lifetime dimensions
+
+Twin to §14.10 but for the *other* class of metric source: the
+CloudWatch Agent (M.5). The agent emits OS-level metrics — CPU,
+memory, disk, network — into the `BrainTwin/System` namespace. Its
+default behaviour is to tag every metric with **`InstanceId`** (via
+`append_dimensions`) **and `host`** (the EC2's internal hostname,
+added automatically per metric collector).
+
+Both dimensions sound informative. Both are **instance-lifetime**:
+they change each time CFN replaces the EC2 (the §14.1 EBS-deadlock
+dance, every user-data change). And CloudWatch retains custom
+metrics for **15 months**.
+
+For a multi-instance fleet this is correct — you want to distinguish
+which physical machine ran hot. For a **single-EC2 architecture**
+like ours, it's the wrong call: every replacement mints a fresh set
+of metric tuples that:
+
+- Persist for 15 months whether you query them or not, costing
+  $0.30/metric/month each
+- Appear as ghost lines in every dashboard SEARCH expression for
+  weeks/months after the replacement
+- Mislead anyone (current you, future you, reviewer) into thinking
+  the chart shows multiple instances when in fact only one ever ran
+  at a time
+
+We saw this immediately after the M.10+M.11 deploys: the new System
+dashboard widgets showed two or more lines per CPU, per disk, per
+memory metric — old InstanceId lines fading alongside the new
+instance's data. Concerning visually, mildly concerning for cost,
+fully avoidable.
+
+**The invariant:** in a single-instance architecture, the CW Agent
+config must drop both `append_dimensions: { InstanceId: ... }` and
+`omit_hostname: true`. Without those two lines, metric tuples are
+stable across instance replacements:
+
+```json
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "omit_hostname": true
+  },
+  "metrics": {
+    "namespace": "BrainTwin/System",
+    "metrics_collected": { ... }
+    // NOTE: no append_dimensions block
+  }
+}
+```
+
+Dashboard SEARCH expressions correspondingly drop both from their
+dimension schemas — bind only to dimensions that describe physical
+resources (`cpu`, `path`, `device`, `fstype`, `name`).
+
+**When this invariant flips:** if/when we move to a multi-instance
+fleet (Phase 5+ horizontal scaling per §13), put a *stable* label
+back — e.g., `node-role` (primary / standby) or `az`. NOT
+`InstanceId` — that re-introduces the same cardinality problem
+once instance churn becomes routine in a fleet.
+
+**Historical residue.** Existing metric tuples emitted before this
+fix persist until their 15-month retention expires. They won't
+appear in the new SEARCH (different schema) but they will continue
+to be billable for ~15 months from their last data point. The
+fading-line problem will continue on Console "All metrics" views
+until those tuples age out, but the dashboard widgets read only
+from the new schema and stay clean immediately.
+
 ---
 
 *Author: Sabya (with Claude as design partner). Decisions captured
@@ -1566,4 +1685,17 @@ idempotent retry) added after a code-review pass caught both as
 latent bugs in M.0 and M.12 respectively. Revised 2026-06-23: M.10
 shipped (discovery refresh script via get-parameters-by-path), with
 §14.9 added documenting the convention/ceremony split between
-frictionless secret rotations and the rare CDK-touching renames.*
+frictionless secret rotations and the rare CDK-touching renames.
+Revised 2026-06-29: M.11 shipped (FastAPI EMF middleware + CloudWatch
+dashboard). Added §14.10 (bounded-cardinality dimensions for
+internet-facing metric emitters) after the route-clamp fix that
+landed in code review — the original middleware would have let
+scanner probes mint one CloudWatch custom metric per unique
+unmatched path. Revised 2026-06-29 (later same day): added System
+metric widgets to the dashboard from the M.5 CW Agent. Discovered
+old InstanceId-tagged metrics persisting across replacements (15-
+month retention), added §14.11 (don't tag custom metrics with
+instance-lifetime dimensions) and dropped both `InstanceId` and
+`host` from CW Agent's output, plus pruned them from dashboard
+SEARCH schemas. Pair of guards for the same class of
+cardinality-explosion problem under different metric sources.*

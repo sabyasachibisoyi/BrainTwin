@@ -1,0 +1,967 @@
+# Phase 4.1 — Multi-user (private beta, allowlist-gated)
+
+> **Status:** design, milestones not yet started. Created 2026-06-29
+> after a friend asked to try BrainTwin. Scope is deliberately
+> minimal: turn a working single-user product into a private beta
+> that supports 1-10 friends, without opening the cost blast radius
+> of "anyone with a Google account can rack up my Anthropic bill."
+> Runs in parallel with Phase 4.0.5 (eval); the two can be worked on
+> concurrently, with two coordination seams — the `/recall` auth
+> contract and the shared `response.usage` metering — that the
+> *second* phase to merge must reconcile (§7.4).
+
+---
+
+## 0. The one-line problem
+
+The current product is authenticated by a single shared bearer
+token. To let a friend use BrainTwin, either they get my token
+(gives them read/write access to my entire corpus) or I let them
+in through a proper per-user auth boundary. This phase builds the
+per-user auth boundary — with a cost-safe onboarding gate — so
+friends can use the product against their own corpus.
+
+---
+
+## 1. Why now, and why this shape
+
+**Real product signal.** A friend has asked to use BrainTwin. When
+someone who isn't building the product wants to use it, that's the
+first honest quality signal a personal product gets — better than
+any dashboard metric.
+
+**Why not "just enable Google sign-in."** Google OAuth accepts
+every Google user on the internet. If I enable it naively, one
+Hacker News post could deposit hundreds of curious strangers into
+my Anthropic bill overnight. Enrichment alone at ~10 captures per
+user per day at Haiku's rates is ~$0.05/user/day; recall at Sonnet
+is more. 100 curious strangers = ~$5-15/day of stranger-driven
+Anthropic spend that I can't monetize. The whole point of Phase
+4.1 is to make cost blast radius equal exactly the users I chose
+to admit — no more, no less.
+
+**Why not build a proper self-serve signup with paid tiers.** Two
+answers. First, at 1-10 friends the ceremony (billing integration,
+tiers, invoicing, tax) costs more than the friction it removes.
+Second, and more honestly: I don't want to run a business right
+now. I want friends to be able to use my thing. That's a
+different product goal.
+
+**Why now over Phase 4.0.7 (Postgres migration).** Postgres would
+close the §14.1 EBS-deadlock class of downtime, which becomes
+worse when real users depend on the service. For a **private beta
+with one friend from India**, the EBS-dance downtime (~30 min
+during rare deploys) is acceptable — he signed up for beta. If the
+friend count grows past 3-4, that calculus flips and 4.0.7 becomes
+urgent. See §7.1 for the deferred-until-then trigger.
+
+---
+
+## 2. The design in one paragraph
+
+Add Google OAuth as the identity provider. Add an `email` column
+to the existing `users` table with a unique index. Add
+`get_current_user` as a FastAPI dependency that reads a JWT from
+the `Authorization` header, looks the email up in `users`, and
+returns the row (or 403). Every route that currently hardcodes
+`DEFAULT_USER_ID = 1` gets a `user: User = Depends(get_current_user)`
+parameter and uses `user.id` instead. The Chrome extension gains
+a "Sign in with Google" button; the Telegram bot gains a `/link
+<code>` flow that binds a Telegram user ID to an app user. Admin
+CRUD is a pair of shell scripts (`add-user.sh`, `remove-user.sh`)
+that operate directly on the `users` table. Rate limiting is a
+`usage_counters` table keyed by `(user_id, date_utc)` with hard
+daily caps on captures, recalls, and Anthropic input tokens. A
+minimal landing page at `braintwin.net` shows only a "Sign in
+with Google" button (no request-access CTA visible); the actual
+onboarding walkthrough lives at a hidden URL (`/join/<slug>`)
+whose slug is a runtime SSM secret. Requests for access go to
+sabya.bisoyi@gmail.com out-of-band. A `DELETE /account` endpoint
+cascade-deletes all of a user's captures, chunks, and Chroma
+vectors. That's the whole phase.
+
+---
+
+## 3. Scope
+
+### 3.1 In scope
+
+| Item | What it does |
+|------|--------------|
+| Google OAuth | Identity: proves who someone is |
+| Allowlist gate (via `users` table) | Authorization: proves they're allowed to use BrainTwin |
+| Per-user data isolation | Every SELECT/INSERT scoped by `user_id`; Chroma already filters on `user_id` (retrieval.py) |
+| JWT sessions | Stateless auth token the extension and web can carry |
+| Chrome extension sign-in | "Sign in with Google" button + JWT storage |
+| Telegram bot `/link <code>` | Binds Telegram user to app user |
+| Landing page at `braintwin.net` | What it is + how to request access + sign in |
+| `add-user.sh` / `remove-user.sh` | Admin CRUD via CLI (adds/removes email from `users`) |
+| Per-user daily quotas | Hard cap on captures, recalls, Anthropic tokens |
+| `DELETE /account` | Cascade-delete a user's captures, chunks, Chroma vectors |
+| Short privacy note | Plain-English "what is stored, who sees it, how to delete" |
+
+### 3.2 Out of scope (explicit)
+
+| Item | Why not |
+|------|---------|
+| Self-serve signup | Anyone-can-sign-up is precisely what we're avoiding. Request-access is out-of-band by design. |
+| Request-queue database or admin panel | At 1-10 friends the manual out-of-band flow (email/WhatsApp → I run a script) is less work than any UI |
+| Multiple OAuth providers (GitHub, Apple, etc.) | Google covers every friend I have. Add another if a specific friend can't use Google. |
+| Password auth | Nobody wants to manage another password. OAuth-only. |
+| Team accounts, sharing captures | Multi-user ≠ collaboration. Deferred. |
+| Billing / paid tiers | See §1 — I'm not running a business right now |
+| Formal ToS with legal review | Plain-English privacy note is enough for a friend-only beta |
+| Formal user admin panel | CLI scripts. Add a panel when there are enough users that CLI is annoying. |
+| Rate limiting for abuse | Quotas are for *cost cap*, not abuse — the allowlist means no adversaries |
+
+---
+
+## 4. Auth architecture
+
+### 4.1 Data model
+
+Add to the existing `users` table:
+
+```sql
+ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT '';
+-- NOTE: SQLite forbids adding a UNIQUE column via ALTER TABLE ADD
+-- COLUMN ("Cannot add a UNIQUE column"). Add the column plain, then
+-- enforce uniqueness with a separate CREATE UNIQUE INDEX below.
+ALTER TABLE users ADD COLUMN oauth_google_sub TEXT;  -- Google's stable subject id
+ALTER TABLE users ADD COLUMN added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;  -- bumped to revoke live JWTs (§4.3)
+CREATE UNIQUE INDEX users_email_idx ON users(email);
+CREATE UNIQUE INDEX users_oauth_sub_idx ON users(oauth_google_sub);
+```
+
+The `oauth_google_sub` starts NULL — populated on first successful
+Google sign-in. That way `add-user.sh someone@gmail.com` doesn't
+need to know their Google `sub` upfront; it's discovered on their
+first sign-in. SQLite treats NULLs as distinct in a unique index, so
+many not-yet-signed-in users can coexist with `oauth_google_sub =
+NULL` under `users_oauth_sub_idx`.
+
+**Migration ordering.** Backfill Sabya's real email (§7.3) BEFORE
+creating `users_email_idx` — the `DEFAULT ''` would otherwise leave
+the single existing row at `email = ''`, which is fine for one row
+but collides the instant a second `''` appears. Create the index
+after the backfill so the invariant is real from the start.
+
+> **⚠️ Foreign keys must be enabled or every cascade below is a
+> silent no-op.** SQLite defaults `PRAGMA foreign_keys = OFF` *per
+> connection*, and `backend/storage/db.py::_configure_sqlite_pragmas`
+> currently sets only `journal_mode` / `synchronous` / `busy_timeout`
+> — NOT `foreign_keys`. Until we add `PRAGMA foreign_keys = ON` to
+> that connect-event listener, every `ON DELETE CASCADE` in the tables
+> below does nothing and account deletion leaves orphaned rows —
+> directly breaking the privacy promise in §5.3. **M.M.1 must add the
+> pragma**, and deletion (§5.2, `DELETE /account`) must *also* issue
+> explicit per-table `DELETE`s rather than trusting cascades alone.
+
+New table for Telegram binding (small, orthogonal):
+
+```sql
+CREATE TABLE telegram_bindings (
+  telegram_user_id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  link_code TEXT UNIQUE  -- temporary one-time code, NULL after linked
+);
+```
+
+New table for rate limiting:
+
+```sql
+CREATE TABLE usage_counters (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  date_utc TEXT NOT NULL,  -- YYYY-MM-DD
+  captures INTEGER DEFAULT 0,
+  recalls INTEGER DEFAULT 0,
+  anthropic_input_tokens INTEGER DEFAULT 0,
+  anthropic_output_tokens INTEGER DEFAULT 0,
+  PRIMARY KEY (user_id, date_utc)
+);
+```
+
+### 4.2 OAuth flow
+
+Standard Google OAuth 2.0 authorization code + PKCE:
+
+```
+Friend clicks "Sign in with Google" (extension or landing page)
+  ↓
+Browser redirects to https://accounts.google.com/o/oauth2/v2/auth
+with our client_id + scope=openid email + PKCE challenge
+  ↓
+Friend authenticates on Google
+  ↓
+Google redirects to https://braintwin.net/auth/google/callback?code=…
+  ↓
+Backend exchanges code for id_token via Google's token endpoint
+  ↓
+Backend verifies `state` matches the cookie (CSRF), then exchanges
+the code using the stored PKCE `code_verifier`
+  ↓
+Backend verifies id_token signature + issuer + audience
+  ↓
+Backend reads `email`, `email_verified`, and `sub` from id_token.
+REJECT if `email_verified != true` — we allowlist on email, so an
+unverified email claim must not grant access.
+  ↓
+Backend looks up `SELECT * FROM users WHERE email = ?`
+  ├─ found:    UPDATE users SET oauth_google_sub = ? WHERE id = ?
+  │            → mint JWT, return to client
+  └─ NOT found: return 403 "Access by invitation only"
+                page tells the visitor to email
+                sabya.bisoyi@gmail.com (or WhatsApp) with their
+                Google email address to request access. This is
+                the ONLY place the request channel is disclosed.
+```
+
+**Backend routes:**
+- `GET /auth/google/start?next=<where-to-return>` — generates the PKCE
+  `code_verifier` + `state`, stores BOTH server-side-bound (a signed,
+  `HttpOnly`, `SameSite=Lax` cookie carrying `state` + `code_verifier`,
+  or a short-lived server row keyed by `state`), redirects to Google.
+  The `code_verifier` MUST survive to the callback — it's required to
+  complete the token exchange.
+- `GET /auth/google/callback?code=…&state=…` — verifies `state` equals
+  the cookie value (reject otherwise), exchanges `code` with the stored
+  `code_verifier`, verifies id_token (sig + iss + aud + `email_verified`),
+  mints JWT or 403s.
+
+**JWT contents:**
+- `sub`: `str(user.id)` — JWT `sub` is a string per RFC 7519; cast on
+  mint and `int()` on read so PyJWT doesn't surprise you.
+- `email`: for debugging
+- `tv`: `user.token_version` — checked on every request (§4.3) so a
+  single-user revoke is possible without rotating the global secret.
+- `iat`, `exp`: 30 days
+- signed with `HS256` using a secret from SSM at `/braintwin/jwt_secret`
+
+30-day sessions are generous, but rotating JWTs mid-session for
+a private beta of friends adds ceremony without value. If the
+beta grows or a session leaks, we can rotate the JWT signing
+secret and log everyone out at once.
+
+### 4.3 `get_current_user` dependency
+
+```python
+async def get_current_user(
+    # Header(None), not Header(...): a required header makes a missing
+    # token a 422 validation error. We want a clean 401.
+    authorization: str | None = Header(None),
+    session: AsyncSession = Depends(session_scope),
+) -> User:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except jwt.PyJWTError as e:
+        raise HTTPException(401, f"invalid token: {e}")
+    user = await UserRepository(session).get(int(payload["sub"]))
+    if user is None:
+        raise HTTPException(403, "user not found")
+    # Live-revocation check: a JWT is only valid while its `tv` claim
+    # matches the user's current token_version. Bumping token_version
+    # (revoke) invalidates every outstanding JWT for THAT user without
+    # rotating the global signing secret (which logs everyone out).
+    if payload.get("tv") != user.token_version:
+        raise HTTPException(401, "token revoked — sign in again")
+    return user
+```
+
+> **Revocation, corrected.** An earlier draft claimed nulling
+> `oauth_google_sub` forces re-auth. It does **not** — this dependency
+> never reads that column, so a compromised 30-day JWT keeps working.
+> The `token_version` claim above is the actual per-user revoke lever:
+> `UPDATE users SET token_version = token_version + 1 WHERE id = ?`
+> invalidates that user's live tokens immediately. Nulling
+> `oauth_google_sub` only forces a fresh Google `sub` binding on next
+> sign-in; it is not a session-revocation mechanism.
+
+Every route that currently uses `DEFAULT_USER_ID` gets:
+
+```python
+@app.post("/capture")
+async def capture(
+    payload: CapturePayload,
+    user: User = Depends(get_current_user),
+):
+    # ... user.id instead of DEFAULT_USER_ID ...
+```
+
+### 4.4 Chrome extension changes
+
+Extension gains a "Sign in" state:
+
+- **Unsigned-in state:** popup shows "Sign in with Google" button →
+  opens a new tab at `https://braintwin.net/auth/google/start?next=extension`
+  → after successful OAuth, callback page shows the JWT and a
+  "Copy to extension" button → user pastes into extension → extension
+  stores it in `chrome.storage.local`
+- **Signed-in state:** popup shows "Signed in as friend@gmail.com" +
+  sign-out button. Captures + recalls send the stored JWT.
+
+The paste-JWT UX is deliberately clunky-but-honest for MVP.
+Chrome's extension OAuth story is fiddly (chrome.identity API,
+manifest v3 constraints, etc.); a proper in-extension flow is a
+week of its own. Paste-the-JWT works today, no manifest changes.
+
+> **Known risk — don't display the 30-day token itself.** A 30-day
+> bearer JWT rendered as copyable text lands in the clipboard (and
+> possibly screenshots / browser history), and any script on the
+> callback page can read it. Prefer showing a **short-lived one-time
+> code** (minutes-TTL, single-use) that the extension POSTs back to
+> exchange for the real JWT — the long-lived token then never touches
+> the clipboard or the page DOM. Same paste UX, far smaller blast
+> radius if the code leaks. This is a small addition to M.M.3, not a
+> separate milestone.
+
+### 4.5 Telegram bot linking
+
+Binding a Telegram account to an app user:
+
+1. Friend signs in on the web
+2. Web UI shows: "Your Telegram link code: **ABC12345** (valid 10 min).
+   Send `/link ABC12345` to @BrainTwinBot on Telegram."
+3. Backend stores `(user_id=X, link_code=ABC12345, expires_at=+10min)`
+4. Bot receives `/link ABC12345`, looks up the code, records
+   `telegram_bindings(telegram_user_id, user_id)`, clears link_code
+5. All future messages from that Telegram user route to that app user
+
+Unbinding is `/unlink` — sets the row's user_id to NULL or deletes
+the row. Idempotent.
+
+The old `ALLOWED_TELEGRAM_USER_IDS` env var goes away entirely —
+it's a broken model (shared allowlist across all app users).
+
+---
+
+## 5. Web pages + admin
+
+### 5.0 Tech stack + repo layout (decided 2026-06-29)
+
+**Stack:** vanilla HTML + Tailwind CSS via CDN + a few lines of
+vanilla JavaScript for copy-to-clipboard interactions. No build
+step, no npm, no framework. Total surface is 5-6 nearly-static
+pages; anything more is over-engineering.
+
+**Not React, not TypeScript for this surface.** Zero interactive
+state to manage; ~30 lines of JS across all pages. TypeScript on
+30 lines is signalling, not engineering. If the surface ever grows
+into a real interactive app, a Chrome-extension rewrite is a much
+better home for TS + Preact/React than the landing page.
+
+**Repo:** `BrainTwin/web/` directory in the app repo — not a
+separate repo. Web content is product code; it changes in the
+same PR as backend routes it depends on. `BrainTwinCDK/` is
+separate for real reasons (deploy story, different reviewers,
+ops cadence); the landing page has none of those needs.
+
+**Serving:** Caddy bind-mounts `BrainTwin/web/` and serves static
+files for the paths listed below. FastAPI handles the ONE dynamic
+route (`GET /join/{slug}`, §5.4).
+
+### 5.1 Landing page (`braintwin.net`)
+
+Single page, deliberately minimal. **No "request access" CTA
+visible.** A visitor who arrives without an invite doesn't see any
+onboarding instructions — the site presents itself as a gated
+product they either have access to or don't. Content:
+
+- **Hero:** "BrainTwin — a personal knowledge twin that remembers
+  what you read."
+- **Sign in with Google button** — the only interactive element.
+  Redirects to `/auth/google/start`.
+- **Footer link to** `/privacy` (§5.3).
+
+That's it. No screenshot, no marketing copy, no request-access
+form or contact info. Someone who lands here without a link sees
+a sign-in gate. If they sign in and aren't on the allowlist, they
+get a friendly 403 that says:
+
+> **Access is by invitation only.**
+> If you know Sabya, message him at **sabya.bisoyi@gmail.com** (or
+> WhatsApp) with your Google email address to request access.
+
+That's the ONLY place the request channel is disclosed to
+someone-who-signed-in-and-was-rejected — no hint of it on the
+landing page itself.
+
+**Why minimal:** the beta shouldn't feel like a marketing page
+that just happens to be gated. It should feel like a product a
+friend told you about, where you sign in and use it. When we
+ever open it up, the landing page gets rewritten. Until then, we
+don't invest UX effort in a page 3 people will see.
+
+### 5.2 Admin CLI
+
+Two scripts in `BrainTwin/scripts/`:
+
+```bash
+# scripts/add-user.sh
+# Usage: ./scripts/add-user.sh friend@gmail.com "Ramesh"
+#
+# Adds a row to the users table. Idempotent - re-running with the
+# same email is a no-op. Prints the row afterwards for verification.
+```
+
+```bash
+# scripts/remove-user.sh
+# Usage: ./scripts/remove-user.sh friend@gmail.com
+#
+# Issues EXPLICIT DELETEs per table (captures, enrichments, chunks,
+# telegram_bindings, usage_counters) then the users row — plus a
+# Chroma `.delete(where={"user_id": X})` for the vector store. Do NOT
+# rely on ON DELETE CASCADE alone: it silently no-ops unless
+# `PRAGMA foreign_keys = ON` is set on the connection (§4.1 warning).
+# Explicit deletes are correct whether or not the pragma landed, and
+# they let us print an affected-row count per table for verification.
+# Wrap all deletes + the Chroma call in one transaction where possible
+# so a partial failure doesn't leave a half-deleted user.
+```
+
+`DELETE /account` (the self-serve path, §3.1) uses the **same**
+explicit-delete routine as `remove-user.sh` — factor it into one
+`delete_user(user_id)` function called by both, so the privacy
+promise (§5.3) has a single, tested implementation rather than two
+that can drift.
+
+Both scripts run against the production SQLite via SSM Session
+Manager (SSH into EC2, run script). No admin HTTP endpoint —
+scripts run inside the box, no auth-on-auth complexity.
+
+### 5.3 Privacy note (plain English)
+
+Draft to live at `braintwin.net/privacy`:
+
+> **What BrainTwin stores about you**
+>
+> When you capture an article, page, video, or Telegram message,
+> BrainTwin stores its URL, title, the text of the content, and
+> an LLM-generated summary and entity list. It also stores the
+> vector embeddings of the text so it can find the capture again
+> when you ask.
+>
+> **Where it lives**
+>
+> Everything is stored on Sabya's AWS account, in an EC2 instance
+> and S3 bucket in Oregon (us-west-2). Captured content is
+> encrypted at rest and only accessible to you (via your signed-in
+> account) and to Sabya (as the system operator).
+>
+> **What we send to Anthropic**
+>
+> When your capture is enriched, or when you run a recall, the
+> content of your captures is sent to Anthropic's API to be
+> processed by Claude (Haiku for enrichment, Sonnet for recall).
+> Anthropic's data-use policy applies to that content.
+>
+> **How to delete**
+>
+> Sign in and visit `/account/delete`, or ask Sabya. Deletion is
+> permanent and cascades to every table (captures, enrichments,
+> vectors, backups within 7 days).
+>
+> **Contact**
+>
+> Email: **sabya.bisoyi@gmail.com** (WhatsApp on request).
+
+Not a lawyer document. Honest and short.
+
+### 5.4 The onboarding page — hidden URL, walkthrough content
+
+The landing page (§5.1) doesn't tell anyone *how* to request access
+or *how* the pieces fit together after they're approved. That
+information lives on a separate onboarding page at an unguessable
+path — the URL is a runtime secret, never in the repo.
+
+**Threat model.** The BrainTwin repo is public. Any URL hardcoded
+in code, Caddyfile, or HTML lives in git and is discoverable by
+anyone browsing the source. So the slug can't live in code. It has
+to be a runtime secret rotated via the same M.10 discovery pattern
+we use for API keys.
+
+**The pattern.**
+
+1. **Slug lives in SSM** at `/braintwin/join_slug`. Value is a
+   random string chosen by Sabya, e.g., `friends-x7k9zq4n`.
+2. **M.10 discovery refresh** picks it up automatically as
+   `$JOIN_SLUG` in `/etc/braintwin/secrets.env` — no CDK change, no
+   deploy. Same mechanism as every other secret.
+3. **FastAPI route** validates the slug:
+
+   ```python
+   @app.get("/join/{slug}")
+   async def onboarding_page(slug: str):
+       expected = os.environ.get("JOIN_SLUG")
+       if not expected or slug != expected:
+           raise HTTPException(404)
+       return FileResponse("web/join.html")
+   ```
+
+4. **Rotation** is one command; no code change, no deploy:
+
+   ```bash
+   ./scripts/put-secrets.sh join_slug "friends-new-slug-value"
+   ./scripts/refresh.sh   # SSM RunCommand → refresh
+   # Old URL 404s within ~10 seconds. New URL is live.
+   ```
+
+5. **Distribution** is out-of-band: Sabya sends the URL over email,
+   WhatsApp, iMessage, or a signed post-it note. Never posts it
+   publicly. If it leaks, rotate.
+
+**Threat model, honestly:**
+
+- Defends against casual repo-browsers, drive-by URL scanners, and
+  ordinary search-engine indexing (the page 404s without the slug).
+- Doesn't defend against someone with SSM read access on
+  `494567491756` — but that's only Sabya, and even if the value
+  leaked they'd still hit the allowlist gate at sign-in time (no
+  product access, only knowledge of the invite URL).
+- Doesn't defend against a friend who shares the URL. That's a
+  social contract, not a technical control. The onboarding page
+  itself says "please don't share this URL."
+
+**Onboarding page content** (`web/join.html`):
+
+> ### Welcome to BrainTwin (private beta)
+>
+> You've been invited to try a personal knowledge twin — capture
+> what you read across the web and Telegram, ask it questions
+> weeks later in natural language when you only half-remember the
+> topic.
+>
+> **To join:**
+>
+> **Step 1 — Request access.** Email Sabya at
+> **sabya.bisoyi@gmail.com** (or WhatsApp if you have his number)
+> with your Google email address. Sabya will confirm when you're
+> approved — usually within a day.
+>
+> **Step 2 — Sign in.** Once approved, go to
+> [braintwin.net](https://braintwin.net) and click "Sign in with
+> Google." Sign in with the same Google account whose email you
+> shared in Step 1.
+>
+> **Step 3 — Link your Telegram (optional).** After signing in
+> you'll see a short link code on the screen. Send
+> `/link <code>` to
+> [@BrainTwinBot](https://t.me/BrainTwinBot) on Telegram. From
+> then on, forwarding a URL to the bot will capture it into your
+> BrainTwin.
+>
+> **Step 4 — Install the Chrome extension (optional).**
+> [Download link when available.] Sign in with your Google account
+> inside the extension popup. You'll then be able to capture the
+> page you're reading with one click.
+>
+> **Step 5 — Try it.** Capture 5-10 things you've read recently.
+> Wait an hour (background enrichment). Then ask the extension
+> popup or the Telegram bot a vague question like "what did I read
+> about X" — should surface the right capture.
+>
+> ---
+>
+> **Private beta — please don't share this URL.** If a friend of
+> yours wants to try, ask Sabya first.
+>
+> **Privacy:** [link to /privacy] — plain-English summary of what's
+> stored and how to delete.
+>
+> **Something broken?** Email sabya.bisoyi@gmail.com. This is a
+> hobby project; response times reflect that.
+
+**Rotation policy (default):** no scheduled rotation. Rotate only
+if a leak is suspected — someone posts the URL online, the SSM
+value shows up in a screenshot, a friend inadvertently shares.
+Manual, reactive. If we ever ship this to more than 10 friends,
+scheduled quarterly rotation becomes appropriate hygiene.
+
+---
+
+## 6. Cost cap: per-user daily quotas
+
+Simple counters in the `usage_counters` table. Hard limits (rejects
+the request if exceeded, not warnings):
+
+| Action | Daily cap | Rough Anthropic cost at cap |
+|--------|-----------|-----------------------------|
+| Captures | 100 | ~$0.05 at Haiku rates |
+| Recalls | 50 | ~$0.25 at Sonnet rates |
+| Anthropic input tokens | 500,000 | Backstop; the two above should be tighter |
+
+Implementation is a small middleware or a check in each route:
+
+```python
+async def check_quota(user: User, action: str, session):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    counters = await UsageCountersRepository(session).get_or_create(
+        user_id=user.id, date_utc=today
+    )
+    if action == "capture" and counters.captures >= CAPTURE_CAP:
+        raise HTTPException(429, "daily capture cap reached")
+    # ... similar for recall + tokens ...
+    counters.captures += 1
+    await session.commit()
+```
+
+Tokens are counted from the Anthropic response's `usage` field
+(which the M.11 EMF work already reads at the wire level — see
+`llm_client.py`; deferred there for time, gets picked up here).
+
+> **The token cap is reactive, by construction.** You only know a
+> call's token count *after* it returns, so the 500k cap can't reject
+> a request pre-emptively — it trips on the *next* request once the
+> running total is already over. That's fine as a backstop (a single
+> request can't overshoot by much), but say so: captures/recalls are
+> the *preventive* caps; tokens are the *catch-all after the fact*.
+
+> **Capture over quota: reject (429), don't silently accept.** This
+> endpoint's existing contract returns 200 even on a persist failure
+> (the non-blocking-capture invariant). Quota is different — an
+> over-cap capture must **429 and not run**, because the whole point
+> is to not spend. Resolve the tension explicitly: the quota check is
+> a *synchronous gate at the top of the route* that 429s **before**
+> the row is persisted and **before** the background enrichment task
+> is scheduled. Non-blocking persistence applies only *after* the
+> request is admitted; the quota gate sits in front of it. (Enrichment
+> is a background task — if the gate ran after scheduling, the cap
+> wouldn't actually cap the Anthropic spend.)
+
+**Reset behaviour:** hard reset at 00:00 UTC. No rolling window.
+For a friend beta this is fine; if we ever go paid, a rolling
+30-day-window quota is the right upgrade.
+
+**Adjusting limits per user:** the caps are constants for MVP. If
+a friend needs more, I bump the constant and redeploy. When there
+are 5+ friends and they diverge, add a `daily_capture_cap` column
+to `users`. Not now.
+
+### 6.1 The missing backstop — a global Anthropic spend cap
+
+Per-user quotas bound *one* user. They do **not** bound the sum, and
+the failure modes that motivate this whole phase are aggregate:
+N friends all maxing caps, or one bug (a recall loop, a retry storm)
+multiplied across users. Worst case at the current caps is
+~$0.30–1.05/user/day; the phase should not depend on every per-user
+counter being correct to avoid a runaway bill.
+
+Two aggregate controls, both cheap, neither in the design yet:
+
+1. **A hard monthly spend limit on the Anthropic org / API key**
+   (Anthropic Console → usage limits). This is the real ceiling — it
+   caps *total* spend regardless of how many users or how buggy the
+   code. Set it before onboarding the first friend. **Note the AWS
+   budget alarms (M.2.h) do NOT see Anthropic API spend** — it's a
+   separate vendor, so nothing today watches this axis.
+2. **A global daily counter** (a single `usage_counters` row with a
+   sentinel `user_id`, or a process-level tally) that trips a FATAL /
+   read-only mode if org-wide daily tokens exceed a ceiling — defense
+   in depth behind the Console limit.
+
+(1) is a 2-minute config and is the single highest-leverage cost
+safeguard in this phase — do it in M.M.1. (2) is optional hardening.
+
+> Dollar *totals* (per-user, eval, AWS) are deferred until a real
+> one-month bill exists — this subsection is about the **control**,
+> not the estimate.
+
+---
+
+## 7. Deployment considerations
+
+### 7.1 Phase 4.0.7 (Postgres) — deferred, with a trigger
+
+The §14.1 EBS-deadlock class of downtime (~30 min per deploy that
+touches user-data) is acceptable for a beta of 1-3 friends. It
+becomes user-hostile once:
+
+- **5+ active friends** with regular daily usage, OR
+- **A friend uses BrainTwin professionally** (during a workday, needs it up), OR
+- **A user complains about a specific outage window**
+
+At any of those triggers, Phase 4.0.7 (SQLite → Postgres on RDS)
+moves ahead of any other Phase 4.1 work. Until then, the private
+beta accepts the trade-off.
+
+### 7.2 First deploy of Phase 4.1
+
+Estimated as **one user-data change** (adding OAuth env vars, JWT
+secret path in the refresh script) → one EBS-deadlock dance.
+
+The Google OAuth `client_id` + `client_secret` land in SSM via
+`put-secrets.sh` (M.10 discovery picks them up automatically —
+zero CDK changes). The JWT signing secret does too.
+
+### 7.3 Data model migration
+
+The `users` table schema changes (`ALTER TABLE ADD COLUMN`) are
+idempotent-friendly. Migration runs at app startup (see the
+existing `init_db` in `backend/storage/db.py`). Backfill:
+- Existing `user_id=1` (Sabya) gets `email=sabya@gmail.com`,
+  `is_admin=TRUE`
+- Existing captures/enrichments/chunks already carry `user_id=1`
+  — no data migration needed
+- The old `ALLOWED_TELEGRAM_USER_IDS` env var (single row that was
+  Sabya's Telegram id) becomes a row in `telegram_bindings` for
+  Sabya
+
+The migration script (`scripts/migrate-to-multi-user.py` or
+similar) runs once, idempotent, then can be deleted.
+
+### 7.4 Coupling with Phase 4.0.5 (eval) — not fully independent
+
+The status note calls 4.0.5 and 4.1 "independent, either can land
+first." That's *mostly* true but has two real seams — worth naming
+so whoever lands second isn't surprised:
+
+1. **Auth contract.** Today every route uses `require_bearer_token`
+   (`main.py`), and the eval harness authenticates to `/recall` with
+   the single shared `/braintwin/bearer_token`. Phase 4.1 replaces
+   that with per-user Google JWTs. **If 4.1 lands first, the nightly
+   eval breaks** — the shared bearer no longer authenticates. Decide
+   now: keep a **service-account path for the eval runner** (a
+   long-lived eval JWT for Sabya's user, or a retained bearer route
+   scoped to the eval runner's IAM role). Cheapest: mint a
+   non-expiring JWT for `user_id=1` and hand it to the eval workflow's
+   SSM secret. This is a one-line decision but a hard dependency.
+2. **Shared `response.usage` metering.** Eval's token-spend metric and
+   this phase's token quota both read the Anthropic `usage` field and
+   both touch `llm_client.py`. Whoever lands second inherits a small
+   merge — factor the usage read into one helper so it isn't written
+   twice.
+
+Neither blocks parallel work; both need a five-minute coordination
+before the *second* phase merges.
+
+---
+
+## 8. Milestones (M.M.1 through M.M.5)
+
+Sequential; the phase is short enough that parallel work isn't
+worth the coordination.
+
+### M.M.1 — Data model + Google OAuth backend (~3 days)
+
+- Add `PRAGMA foreign_keys = ON` to
+  `db.py::_configure_sqlite_pragmas` (§4.1) — *first*, so cascades and
+  deletion actually work.
+- Migrations for `users.email` (+ index after backfill),
+  `users.oauth_google_sub` (plain column + separate unique index — no
+  inline `UNIQUE`), `users.token_version`, `usage_counters`,
+  `telegram_bindings`
+- `GET /auth/google/start` + `GET /auth/google/callback` — with
+  `state` cookie, PKCE `code_verifier` persistence, and
+  `email_verified` enforcement (§4.2)
+- `get_current_user` dependency — `Header(None)` → 401, `token_version`
+  revocation check (§4.3)
+- JWT mint + verify (`sub` as string)
+- `add-user.sh` + `remove-user.sh` (explicit per-table deletes, §5.2);
+  shared `delete_user()` used by both the script and `DELETE /account`
+- Seed Sabya as user_id=1 with email + admin flag
+- **Set the Anthropic Console monthly spend limit (§6.1) before any
+  friend is onboarded** — the aggregate backstop, 2-minute config
+- Unit tests for JWT (incl. revocation via `token_version`), OAuth
+  callback (mocked id_token, incl. `email_verified=false` → 403 and
+  bad-`state` → reject), quota enforcement, and `delete_user()`
+  leaving zero orphaned rows across all tables + Chroma
+
+### M.M.2 — Route migration + quota enforcement (~1 day)
+
+- Every route that uses `DEFAULT_USER_ID` grows a
+  `user: User = Depends(get_current_user)` parameter
+- `check_quota()` inserted before each Anthropic call
+- `DELETE /account` endpoint
+- Integration test: sign-in → capture → recall → delete cycle
+
+### M.M.3 — Chrome extension sign-in flow (~1 day)
+
+- "Sign in" button, opens new tab at `/auth/google/start?next=extension`
+- Callback page shows JWT + "Copy" button (paste UX for MVP)
+- Extension stores JWT in `chrome.storage.local`
+- All requests carry `Authorization: Bearer <jwt>`
+- Signed-out state clearly indicated; sign-out button
+
+### M.M.4 — Telegram bot `/link` flow (~0.5 day)
+
+- Web UI shows generated link code after sign-in
+- Bot handles `/link <code>` — looks up code in `users`, writes to
+  `telegram_bindings`
+- Bot handles `/unlink` — deletes the binding
+- All bot messages now route to `telegram_bindings.user_id` instead
+  of the shared allowlist
+- Delete the old `ALLOWED_TELEGRAM_USER_IDS` env var + SSM param
+
+### M.M.5 — Web pages + first-friend onboarding (~1-1.5 days)
+
+Web content stack: **vanilla HTML + Tailwind via CDN + a few
+lines of vanilla JS** (§5.0). Location: `BrainTwin/web/` in the
+same repo, served by Caddy (static) + one FastAPI route (dynamic
+slug validation).
+
+- **Static pages** in `BrainTwin/web/`:
+  - `index.html` — landing (§5.1). Sign-in button only. No
+    request-access CTA visible. No screenshot / marketing.
+  - `privacy.html` — the privacy note (§5.3). Plain-English, short.
+  - `join.html` — the onboarding walkthrough (§5.4). Steps 1-5,
+    contact info (sabya.bisoyi@gmail.com), "please don't share
+    this URL" note.
+  - `403-not-approved.html` — the friendly 403 shown to Google
+    users who signed in but aren't on the allowlist. Discloses
+    sabya.bisoyi@gmail.com as the request channel.
+- **Caddy config** — bind-mount `BrainTwin/web/` into the Caddy
+  container; site block serves static files for `/`, `/privacy`,
+  and `/403-not-approved.html`. Everything else proxies to app:8000.
+- **FastAPI dynamic route** — `GET /join/{slug}` reads `$JOIN_SLUG`
+  from env (SSM-discovered via M.10), returns `web/join.html` if
+  match else 404. See §5.4.
+- **Provision the slug**:
+  `./scripts/put-secrets.sh join_slug "friends-<random-token>"`.
+  Refresh script picks it up automatically.
+- **Real friend onboarding**:
+  `./scripts/add-user.sh friend@gmail.com "Ramesh"` against prod.
+  Send friend the `braintwin.net/join/<slug>` URL via
+  sabya.bisoyi@gmail.com. Walk them through in real time.
+- Friend signs in, does one capture, does one recall, links
+  Telegram — end-to-end smoke.
+- Take a screenshot of the friend using it for portfolio purposes.
+
+Total estimate: **~6.5-7 days of focused work** (M.M.1 bumped from 2
+to 3 days once OAuth is hardened — state/PKCE, `email_verified`, the
+FK pragma, `token_version` revocation, and the spend-cap config are
+real work, not happy-path). Treat this as optimistic and carry a
+**~8-9 day** contingency: the security-sensitive OAuth path and the
+MV3 extension sign-in are the two most likely to overrun, and this is
+an auth boundary — getting it wrong is worse than shipping it a day
+late.
+
+---
+
+## 9. What we learn from this phase
+
+Beyond just shipping multi-user:
+
+- **Real-user quality signal.** The friend's recall complaints
+  become rows in the Phase 4.0.5 golden set. Two phases feed each
+  other.
+- **Anthropic cost at 2 users.** Per-user quotas give us actual
+  numbers on "what does one active user cost per month." Feeds the
+  decision on whether to open the beta wider.
+- **What's genuinely single-user in the UX.** The
+  `ConversationStore` is in-memory per process today. Two users
+  running concurrent recall don't conflict, but a restart drops
+  both. Whether that matters is a real-user-driven question.
+
+---
+
+## 10. Open decisions deferred
+
+- **How does the friend actually authenticate the Chrome extension?**
+  Paste-the-JWT is the MVP shape. Chrome's `chrome.identity` API is
+  the proper answer; ~1 week of its own. Do the proper flow only
+  if the paste UX is a real friction point after the first friend.
+- **Do we host our own JWT verification, or use Cloudflare Access?**
+  Cloudflare Access can offload the entire OAuth dance for a small
+  monthly fee (or free at low seat counts). Cleaner for
+  observability + audit, more infra to reason about. Deferred:
+  MVP does its own JWT.
+- **When does the friend beta become an "opt-in from anywhere"
+  beta?** Cost story has to change first (either paid, or a
+  hard-cap sponsored tier). Not this phase.
+- **How do we revoke one user's live session?** Bump
+  `users.token_version` (§4.3) — every outstanding JWT for that user
+  fails its `tv` check on the next request. `oauth_google_sub` is NOT
+  a revocation lever (nulling it doesn't touch a live JWT); it only
+  re-binds the Google `sub` on next sign-in. Global "log everyone out"
+  is still available via rotating `/braintwin/jwt_secret`.
+
+---
+
+## 11. Success criteria
+
+Phase 4.1 is done when:
+
+- A friend I've never given credentials to can sign in with their
+  own Google account, capture an article from Chrome, and recall
+  it from the extension popup — end-to-end, no Sabya-side
+  intervention beyond running `add-user.sh` once
+- The friend can link their Telegram to their app account and
+  forward a URL to the bot; it lands as their capture, not mine
+- A Google user NOT on the allowlist gets a clear 403 with
+  instructions on how to request access, and their attempt does
+  not touch Anthropic or Chroma
+- Per-user daily quotas actually block a hypothetical caffeinated
+  friend at the 101st capture of the day
+- I can delete a friend's account with one CLI command and verify
+  their captures + chunks + Chroma vectors are gone
+- The Phase 4.1 deploy uses one EBS-deadlock dance (adding OAuth
+  env vars is a user-data change; everything else after that ships
+  via refresh)
+
+---
+
+## 12. References
+
+- Main cloud deployment design: `phase4.0.6-deployment-design.md`
+  (§14.1 in particular — the EBS-deadlock that becomes worse with
+  real users)
+- Polish phase: `phase4.0.6.1-polish-design.md` (M.7.5 established
+  the pattern of adding SSM parameters via the discovery loop,
+  which M.M.1 leans on for the Google OAuth secrets)
+- Eval phase: `phase4.0.5-eval-design.md` (the friend's recall
+  complaints become golden-set rows)
+- Local-first ideation (out-of-band): `local-first-design.md` —
+  §7 there notes that multi-user is **fundamentally incompatible**
+  with local-first. Choosing 4.1 explicitly closes that direction
+  for the primary product. Local-first, if it ever ships, is a
+  separate product with a separate roadmap.
+
+---
+
+*Author: Sabya (with Claude as design partner). Created 2026-06-29
+after a friend from India asked to try BrainTwin, and I realized
+the shared-bearer-token architecture had zero honest answer.
+Scoped deliberately as a private beta with allowlist-gated OAuth
+— open enough to actually onboard the friend, closed enough that
+strangers can't drive my Anthropic bill. Runs in parallel with
+Phase 4.0.5 (eval); the two phases are independent and either can
+land first.*
+
+*Revised 2026-06-29 (later same day) after a read-through: (1) main
+landing page (§5.1) simplified to a sign-in gate with no
+request-access CTA visible — the beta shouldn't feel like a gated
+marketing page; (2) added §5.0 tech-stack decision (vanilla HTML +
+Tailwind CDN + BrainTwin/web/); (3) added §5.4 for a hidden
+onboarding URL at `/join/<slug>` whose slug is a runtime SSM
+secret (BrainTwin repo is public → any hardcoded slug is
+discoverable, so the slug can't live in code); (4) request-access
+channel updated from Telegram to email (sabya.bisoyi@gmail.com)
+throughout — email is universal, Telegram is not; (5) M.M.5
+milestone rescoped to reflect the four static pages + one dynamic
+route.*
+
+*Revised 2026-07-01 after an engineer+manager review pass grounded in
+the current storage layer. Fixes: (1) `oauth_google_sub` can't be a
+`UNIQUE` ADD COLUMN on SQLite — split into a plain column + separate
+unique index; (2) `PRAGMA foreign_keys` is OFF in
+`_configure_sqlite_pragmas`, so every `ON DELETE CASCADE` was a silent
+no-op — M.M.1 now enables it and deletion uses explicit per-table
+DELETEs behind a shared `delete_user()`; (3) the revocation story was
+wrong (nulling `oauth_google_sub` doesn't kill a live JWT) — replaced
+with a `token_version` claim checked in `get_current_user`; (4) OAuth
+flow made complete — `state`/PKCE-`code_verifier` persistence and
+`email_verified` enforcement; (5) `Header(...)`→`Header(None)` for a
+clean 401; (6) §6 reconciled the over-quota-capture 429 against the
+non-blocking-capture contract and flagged the token cap as reactive;
+(7) added §6.1 — a global Anthropic Console spend cap as the aggregate
+backstop the per-user quotas lack (AWS budget alarms don't see
+Anthropic spend); (8) added §7.4 — the auth-contract + usage-metering
+coupling with Phase 4.0.5 that the "independent" claim understated;
+(9) M.M.1 → ~3 days and total → ~6.5-7 (contingency ~8-9), since
+hardened OAuth is real work on an auth boundary. Dollar totals
+deferred until a real one-month bill exists.*
