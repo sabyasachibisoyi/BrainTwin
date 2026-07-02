@@ -333,6 +333,35 @@ choice:
 | Test surface | 9 EMF behaviour checks (3 emit_metric, 3 timed, 3 middleware) + 4 CDK dashboard regression tests (count, namespace+metric names, pinned dims, output URL). Stdlib smoke-script in this commit confirmed all 9; pytest run on the Mac is the canonical verification. |
 | User-data impact | **Zero.** App-only change. The dashboard is a CFN resource that drops in via routine refresh deploys — no EBS-deadlock dance. |
 
+### 2.4.2 Follow-up (2026-07-01) — Anthropic AuthenticationError alarm
+
+The M.11 dashboard makes failures *visible* (widget row 3.5, "Anthropic
+errors by class") but doesn't *page* on them. Anthropic credit is
+recharged manually — no auto-renewal, deliberate blast-radius cap —
+so a silent "credit hit zero at 2am" would surface as a friend
+saying "recall doesn't work anymore." The alarm closes that gap.
+
+| Choice | What we did |
+|--------|-------------|
+| Alarm scope | **`error=AuthenticationError` only.** Anthropic SDK maps 401 → `AuthenticationError`; that's what surfaces when prepaid credit is exhausted OR the API key is invalid/revoked. Deterministic, needs human action, very low false-positive rate. RateLimit / connection errors self-recover and aren't alarm-worthy. |
+| Metric shape | **`FILL(m1, 0) + FILL(m2, 0)` MathExpression** over two explicit `Metric` refs — one per `(endpoint, model)` tuple (`enrich × Haiku` and `complete_json × Sonnet`), each with `statistic=SampleCount` and `dimensions.error=AuthenticationError`. First tried `SUM(SEARCH(...))` — CloudFormation rejected it at deploy time with *"SEARCH is not supported on Metric Alarms"* (alarms need deterministic bindings; SEARCH's variable metric set fails that contract). SEARCH-based widgets stay on the dashboard where they're fine. Model-name coupling is the trade-off: a Sonnet/Haiku bump needs updating **both** the alarm metric and the row-3 success-latency widget (both places already pin the same strings; `backend/config.py` docstring flags the coupling). |
+| Threshold | **≥ 1 in a 5-minute window** (`evaluationPeriods=1`, `datapointsToAlarm=1`, `GreaterThanOrEqualToThreshold=1`). Any auth error is real. `treatMissingData: NOT_BREACHING` so the alarm stays OK when the app is idle (rare-event metric). |
+| Delivery | **New SNS topic** `BrainTwin-Alerts` in the observability construct. Alarm action wires to it; email subscription is auto-added if `BRAINTWIN_ALERT_EMAIL` is set at synth time (same env var Budgets uses — one inbox for all ops alerts). If unset the topic exists with no subscribers so the alarm is still visible in the console. |
+| Fix path baked into the description | Alarm `AlarmDescription` names the two most-likely causes and links `https://console.anthropic.com/settings/billing` — the SNS email body then reads as "here's what to do" rather than "here's a state change." |
+| Dashboard widget delta | New row 3.5 renders SampleCount per 5-min window for **five** error classes (AuthenticationError, RateLimitError, APIConnectionError, APIStatusError, BadRequestError) via SEARCH expressions. Shows *why* calls are failing when the alarm fires — a real "credit out" event should light up AuthenticationError specifically, not the others. If credit-exhaustion ever surfaces as a different class (SDK-version drift, Anthropic-side error-code changes), the widget shows which class to swap into the alarm. |
+| Cost impact | Alarm past the 10-free tier: **~$0.10 / month**. Zero-subscriber SNS topic: free. Total additional CloudWatch bill: ~$0.10 / month, comfortably inside task #87's ceiling. |
+| Test surface | 10 new CDK tests: SNS topic present, no subscription when env var unset (jest.setup.ts pins `""`), alarm count, name, MathExpression contains `SEARCH`+`anthropic_latency_ms`+`AuthenticationError`+`SampleCount`, threshold/comparison/eval periods, `NOT_BREACHING`, alarm action references the topic, description mentions credit + `console.anthropic.com`, outputs advertise both topic ARN and alarm name. All pass alongside the existing 28. |
+| User-data impact | **Zero.** Ships via routine `cdk deploy` refresh — no EC2 replacement, no EBS-deadlock dance. |
+| Deploy prerequisite | Set `BRAINTWIN_ALERT_EMAIL=sabya.bisoyi@gmail.com` before `./scripts/deploy.sh`. Same env var also fixes the pre-existing "budget alerts going to `@example.invalid`" warning that has been dormant since M.2.h. Two birds, one deploy. |
+
+Files touched: `lib/constructs/observability.ts` (imports + two public
+fields + dashboard row + SNS topic + alarm + outputs);
+`test/constructs/observability.test.ts` (10 new tests in a new
+`Anthropic AuthenticationError alarm` describe block + 1 extended
+dashboard test for the error widget). Nothing in `BrainTwin/backend/`
+— the metric was already emitted by M.11's `timed()` wrapper; this
+delta just makes it visible + actionable.
+
 ---
 
 ## 3. Sequencing and dependencies
