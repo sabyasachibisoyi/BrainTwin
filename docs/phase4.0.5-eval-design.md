@@ -436,6 +436,25 @@ plus deliberate additions when we want to test new territory.
    nothing on the eval user's side of the DB.
 7. Mint a JWT for the eval user with a long TTL, store in SSM at
    `/braintwin/eval_bearer_token`, wire into the eval harness.
+   (The param itself exists from Day 0 holding the shared bearer;
+   this step swaps the *value*. ⚠️ Bumping the eval user's
+   `token_version` silently kills this token — the nightly run
+   starts 401ing. Treat eval-run 401s as an alarm condition, and
+   re-mint + re-put the secret after any deliberate bump.)
+
+> **Sequencing unblock (added 2026-07-02): M.E.1 does NOT wait for
+> the eval user.** Steps 1-7 depend on Phase 4.1's data model, but
+> the golden set doesn't have to: bootstrap and curate it (M.E.1)
+> against **Sabya's current capture_ids today**, then when the eval
+> user is provisioned, remap every `relevant_captures[].capture_id`
+> through `eval_capture_lineage` (source → eval UUID) with a ~20-line
+> script. The lineage table was designed for tracing; it doubles as
+> the remap key. This is what lets 4.0.5 and 4.1 genuinely run in
+> parallel — without it, M.E.1 (the longest-wall-clock milestone,
+> because curation is human-paced) chains behind 4.1 M.M.1. The
+> retrieval-only harness (§2.4) can likewise run against the current
+> single-user corpus before 4.1 lands — same labels, no remap needed
+> until the eval user exists.
 
 **What normal usage does *not* do.** Sabya (as user_id = 1) keeps
 capturing normally. The eval user's corpus stays exactly as
@@ -573,7 +592,10 @@ Four distinct contexts:
 - Generate the golden set automatically (that's a one-time-ish
   Claude-assisted exercise per §3.1)
 - Run during normal user traffic (it doesn't share the recall
-  ConversationStore, it doesn't share rate-limit budgets)
+  ConversationStore, it doesn't share rate-limit budgets — the
+  latter is *implemented* in Phase 4.1 M.M.2 as an explicit
+  `is_eval` quota exemption; without it the weekly end-to-end run
+  of ~90-110 recalls trips 4.1's 50-recalls/day cap mid-run)
 - Replace manual judgement — the metrics are inputs to decisions,
   not the decisions themselves
 
@@ -593,8 +615,12 @@ uncertainty will have you chasing ghosts. What we do instead:
   *same* queries, use a **paired** test, not an unpaired one — for the
   binary hit/miss metrics (recall@k, precision@1) that's **McNemar's
   test** on the discordant pairs (queries one system got and the other
-  missed). For continuous metrics (latency, judge scores) a paired
-  bootstrap or Wilcoxon signed-rank.
+  missed). **At our n (~70), discordant counts will often be small
+  (b + c < ~25), where the χ² approximation is unreliable — use the
+  exact (binomial) form of McNemar in that regime**; `compare.py`
+  should pick exact-vs-χ² automatically from b + c. For continuous
+  metrics (latency, judge scores) a paired bootstrap or Wilcoxon
+  signed-rank.
 - **State the minimum detectable effect (MDE)** at the current n in
   the baseline report, so a reader knows the eval's resolution — e.g.
   "at n=70, we can detect a ≥10pt recall@5 change at p<0.05; smaller
@@ -837,7 +863,11 @@ Scope:
 
 - IAM OIDC identity provider for `token.actions.githubusercontent.com`
 - Eval-runner IAM role with scoped permissions:
-  - Read `/braintwin/bearer_token` from SSM (to authenticate to /recall)
+  - Read `/braintwin/eval_bearer_token` from SSM (to authenticate to
+    /recall). **Created on Day 0 with the current shared bearer as its
+    value; when Phase 4.1 lands, the *value* is swapped to the eval
+    user's long-lived JWT (§3.5 step 7, 4.1 §7.4) — same param name,
+    so no IAM or workflow rework at swap time.**
   - Write objects to `s3://braintwin-state-.../eval-results/`
   - Write CloudWatch custom metrics to `BrainTwin/Eval` namespace
 - Trust policy condition: `repo:sabyasachibisoyi/BrainTwin:ref:refs/heads/main`
@@ -875,18 +905,23 @@ jobs:
       - name: Fetch bearer token
         run: |
           TOKEN=$(aws ssm get-parameter \
-            --name /braintwin/bearer_token --with-decryption \
+            --name /braintwin/eval_bearer_token --with-decryption \
             --query Parameter.Value --output text)
           echo "::add-mask::$TOKEN"   # mask in logs before exporting
           echo "BACKEND_BEARER_TOKEN=$TOKEN" >> $GITHUB_ENV
       - name: Determine run mode
-        # Nightly cron → retrieval-only; Sunday cron → end-to-end w/ Haiku
-        # judge; manual dispatch respects the `judge` input if given.
+        # Branch on WHICH cron fired (github.event.schedule), NOT on the
+        # calendar date: on Sundays BOTH crons fire, and a date-based
+        # check would classify both runs as end-to-end — double judge
+        # cost, duplicate S3/CloudWatch datapoints skewing the weekly
+        # trend, and a Sunday-shaped hole in the nightly retrieval-only
+        # series. With the schedule check, Sunday correctly gets one
+        # retrieval-only run AND one end-to-end run.
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ inputs.mode || 'end_to_end' }}"
             JUDGE="${{ inputs.judge || 'haiku' }}"
-          elif [ "$(date -u +%u)" = "7" ]; then      # 7 = Sunday
+          elif [ "${{ github.event.schedule }}" = "0 6 * * 0" ]; then
             MODE="end_to_end"; JUDGE="haiku"
           else
             MODE="retrieval_only"; JUDGE="none"
@@ -1055,9 +1090,11 @@ Phase 4.0.5 is done when:
 - The LLM judge has been **validated against human labels** on a
   ~20-30 sample (report the Cohen's κ); if κ is poor we say so rather
   than quoting the judge metric as fact (§2.3)
-- Langfuse is reachable at `https://langfuse.braintwin.net` with
-  Authenticated Origin Pulls; the UI shows traces from real recall
-  calls
+- Lightweight tracing (Option C, §5.0) is live: a real recall's
+  trace line lands in `s3://braintwin-state-.../traces/`, and
+  `eval/trace.py` renders its candidate→re-rank Mermaid diagram
+  (the Langfuse criterion from the original draft is retired with
+  the §5.0 decision — it returns only if Option A is ever taken)
 - The nightly GitHub Actions run has executed for ≥7 consecutive
   nights without manual intervention; the CloudWatch alarms
   haven't false-fired
@@ -1402,6 +1439,12 @@ McNemar statistic (with continuity correction) = (|b - c| - 1)² / (b + c)
 p-value = 1 - χ²_cdf(statistic, df=1)
 ```
 
+**Small-sample regime (b + c < ~25 — likely at our n):** the χ²
+approximation above is unreliable; use the **exact binomial test**
+instead — under H₀ each discordant pair is a fair coin, so
+`p = 2 · P(X ≤ min(b, c))` for `X ~ Binomial(b + c, 0.5)` (capped
+at 1). `compare.py` selects exact vs χ² automatically from b + c.
+
 **Interpretation:** if `b == c` the two systems disagree equally
 often — no signal. If `b >> c` or `c >> b`, one system is
 systematically beating the other on the disagreements. p < 0.05
@@ -1480,6 +1523,21 @@ section:
 | **§3.5 eval user provisioning + freeze semantics** | Golden-set labels reference specific `capture_id`s. If the corpus keeps changing under those labels, metrics drift for reasons unrelated to code. Freeze at creation, refresh only as a ceremonial event. Also names the Phase 4.1 dependency (the eval user is provisioned as part of M.M.1). |
 | **Appendix — Worked math** (recall@k, MRR, nDCG w/ IDCG, faithfulness, answer relevancy, bootstrap CIs, McNemar) | Every number in the baseline report should be traceable back to a formula worked on a concrete example. Removes "trust me it's right" from the eval story. |
 | **§6.0 cost-driven cadence** (nightly retrieval-only + weekly end-to-end w/ Haiku judge + on-demand Sonnet judge) | Naive nightly full-eval is $120-170/mo — more than the entire rest of BrainTwin's infra combined. The split schedule keeps regression detection at 24-hour latency for the retrieval layer (where most tuning happens anyway) and 7-day latency for the answer layer, at ~$10-15/mo. Anchored to the ~$45-50/mo project-wide cost ceiling. |
+
+### 12.2 Third pass — cross-phase integration review (2026-07-02)
+
+A reviewer pass focused on the seams *between* this phase and Phase
+4.1 (implemented concurrently), plus doc-internal contradictions:
+
+| Change | Why |
+|--------|-----|
+| **§9 Langfuse success criterion retired** | Contradicted the §5.0 Option C decision — the criterion predated it. Replaced with the JSONL-trace + Mermaid smoke criterion. |
+| **§6.2 Sunday double-fire fix** (branch on `github.event.schedule`) | Both crons fire Sunday 06:00; the date-based check ran end-to-end twice (double judge cost, duplicate datapoints) and skipped retrieval-only entirely on Sundays. |
+| **§6.1/§6.2 SSM param → `/braintwin/eval_bearer_token`** | The IAM scope and workflow referenced the old shared `/braintwin/bearer_token` while §3.5 minted to `eval_bearer_token`. One name from Day 0 (value swapped post-4.1) avoids IAM/workflow rework and the "4.1 lands first, nightly breaks" trap (4.1 §7.4). |
+| **§3.5 sequencing unblock** (golden set against current capture_ids, remap via lineage) | As written, M.E.1 chained behind 4.1 M.M.1 (eval-user UUIDs). The lineage table doubles as a remap key, so curation — the longest human-paced milestone — starts immediately. |
+| **§4.4/A.9 exact McNemar for small discordant counts** | At n≈70, b+c is often < 25 where the χ² approximation misleads — on exactly the number a reviewer probes. |
+| **§4.3 quota-exemption cross-ref** | "Doesn't share rate-limit budgets" was an unimplemented promise: the weekly e2e run (~90-110 recalls) exceeds 4.1's 50/day cap. Named the implementing mechanism (4.1 M.M.2 `is_eval` exemption). |
+| **§3.5 step 7 revocation warning** | Bumping the eval user's `token_version` silently 401s every nightly run — flagged as an alarm condition with a re-mint procedure. |
 
 ---
 
