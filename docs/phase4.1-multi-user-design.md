@@ -131,6 +131,7 @@ ALTER TABLE users ADD COLUMN oauth_google_sub TEXT;  -- Google's stable subject 
 ALTER TABLE users ADD COLUMN added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE;
 ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;  -- bumped to revoke live JWTs (§4.3)
+ALTER TABLE users ADD COLUMN is_eval BOOLEAN DEFAULT FALSE;  -- quota-exempt eval user (§6, eval doc §4.3)
 CREATE UNIQUE INDEX users_email_idx ON users(email);
 CREATE UNIQUE INDEX users_oauth_sub_idx ON users(oauth_google_sub);
 ```
@@ -230,6 +231,25 @@ Backend looks up `SELECT * FROM users WHERE email = ?`
   the cookie value (reject otherwise), exchanges `code` with the stored
   `code_verifier`, verifies id_token (sig + iss + aud + `email_verified`),
   mints JWT or 403s.
+
+> **id_token verification: use `google-auth`, don't hand-roll (added
+> 2026-07-02).** Signature verification means fetching + caching
+> Google's JWKS, selecting the right key by `kid`, and checking
+> sig/iss/aud/exp — `google-auth`'s
+> `id_token.verify_oauth2_token(token, request, CLIENT_ID)` does all
+> of it in one audited call. The learning value in this phase is the
+> *flow* (state, PKCE, allowlist, revocation), which we do own;
+> reimplementing signature verification on an auth boundary is where
+> hand-rolling turns from learning into risk.
+
+> **Consent-screen publishing status (added 2026-07-02).** Leave the
+> Google OAuth app in "Testing" mode and every friend must ALSO be
+> hand-added as a test user in Google Console — a shadow allowlist
+> (capped at 100) duplicating the `users` table, plus a scary
+> warning screen. With only non-sensitive scopes (`openid email`),
+> the consent screen can be set to **"In production" without
+> Google's verification review** — do that during M.M.1 setup. The
+> `users` table remains the only allowlist.
 
 **JWT contents:**
 - `sub`: `str(user.id)` — JWT `sub` is a string per RFC 7519; cast on
@@ -337,6 +357,47 @@ the row. Idempotent.
 
 The old `ALLOWED_TELEGRAM_USER_IDS` env var goes away entirely —
 it's a broken model (shared allowlist across all app users).
+
+### 4.5.1 Bot→backend auth — per-user JWT minting (decided 2026-07-02)
+
+Linking answers "which app user is this Telegram user"; it does NOT
+answer how the bot *authenticates to the backend* afterwards. The bot
+is a separate container that POSTs to the app over HTTP using the
+shared bearer (`backend/telegram_bot/client.py`) — a credential
+M.M.2 removes from every route. Post-migration, each bot request must
+carry *whose corpus* it touches, both for data isolation and so
+quotas attribute Anthropic spend to the right friend.
+
+**Decision: the bot mints a short-lived per-user JWT per request**,
+rather than keeping a service token + trusted `X-User-Id` header:
+
+1. On each message, resolve `telegram_user_id → user_id` via
+   `telegram_bindings` (the bot already bind-mounts the same SQLite).
+2. Read the user's current `token_version` at mint time — so a
+   revoked friend gets at most the token TTL of grace.
+3. Sign `{sub: str(user_id), tv, iat, exp: +5 min}` with the same
+   `JWT_SECRET` the backend validates — already available to the bot
+   via the shared `secrets.env`. Cache per user until expiry.
+4. Send as `Authorization: Bearer <jwt>` on `/capture` (and `/recall`
+   when the bot grows it).
+
+**Why this over service-token + user-id header:** the backend keeps
+exactly ONE auth path — `get_current_user` cannot even tell a bot
+request from an extension request — so quotas, `token_version`
+revocation, and any future middleware apply to bot traffic with zero
+special-casing. And what travels the wire is a 5-minute single-user
+token, not an eternal all-users skeleton key. Compromise of the bot
+box is equivalent under both options (it holds `JWT_SECRET` either
+way); the win is backend uniformity + wire blast radius, not
+bot-compromise resistance. Note this makes the bot the second
+*minter* alongside the OAuth callback (and the eval provisioning
+script the third) — many minters, one validator is the intended
+shape.
+
+**Degradation:** unknown/unlinked `telegram_user_id` → no binding row
+→ the bot replies "send `/link <code>` to connect your account" and
+never calls the backend. A removed friend degrades the same way once
+their binding is deleted.
 
 ---
 
@@ -495,10 +556,14 @@ we use for API keys.
 3. **FastAPI route** validates the slug:
 
    ```python
+   import hmac
+
    @app.get("/join/{slug}")
    async def onboarding_page(slug: str):
        expected = os.environ.get("JOIN_SLUG")
-       if not expected or slug != expected:
+       # constant-time compare — a plain `!=` leaks the slug
+       # byte-by-byte via response timing
+       if not expected or not hmac.compare_digest(slug, expected):
            raise HTTPException(404)
        return FileResponse("web/join.html")
    ```
@@ -603,12 +668,32 @@ async def check_quota(user: User, action: str, session):
     counters = await UsageCountersRepository(session).get_or_create(
         user_id=user.id, date_utc=today
     )
+    if user.is_eval:
+        return  # eval user is quota-exempt; see note below
     if action == "capture" and counters.captures >= CAPTURE_CAP:
         raise HTTPException(429, "daily capture cap reached")
     # ... similar for recall + tokens ...
-    counters.captures += 1
+    # Atomic increment — do NOT read-modify-write in Python
+    # (`counters.captures += 1` undercounts under concurrency);
+    # let the DB do the arithmetic:
+    await session.execute(
+        update(UsageCounters)
+        .where(UsageCounters.user_id == user.id,
+               UsageCounters.date_utc == today)
+        .values(captures=UsageCounters.captures + 1)
+    )
     await session.commit()
 ```
+
+> **Eval-user exemption (added 2026-07-02).** The Phase 4.0.5 weekly
+> end-to-end eval runs ~90-110 recalls in a single pass (positive +
+> negative + conversational sets) — roughly double the 50/day recall
+> cap, so without an exemption the Sunday eval 429s mid-run, every
+> week. Eval doc §4.3 promises eval traffic "doesn't share rate-limit
+> budgets"; the `is_eval` check above is where that promise is
+> implemented. Counters are still *recorded* for the eval user (cost
+> visibility), just never enforced. Only the provisioned eval user
+> (eval doc §3.5) ever has `is_eval = TRUE`.
 
 Tokens are counted from the Anthropic response's `usage` field
 (which the M.11 EMF work already reads at the wire level — see
@@ -694,6 +779,15 @@ beta accepts the trade-off.
 Estimated as **one user-data change** (adding OAuth env vars, JWT
 secret path in the refresh script) → one EBS-deadlock dance.
 
+> **Bundle the pending CDK diff into the same dance (added
+> 2026-07-02).** The M.10 + M.11 CDK infra changes are built but not
+> yet deployed (app code went live via snapshot; `cdk deploy`
+> replaces the instance). The Phase 4.1 user-data change forces that
+> instance replacement anyway — fold the outstanding M.10/M.11 diff
+> into this deploy so we pay for ONE EBS dance, not two. Verify with
+> `cdk diff` before the dance that the combined change set is what's
+> expected.
+
 The Google OAuth `client_id` + `client_secret` land in SSM via
 `put-secrets.sh` (M.10 discovery picks them up automatically —
 zero CDK changes). The JWT signing secret does too.
@@ -724,12 +818,19 @@ so whoever lands second isn't surprised:
    (`main.py`), and the eval harness authenticates to `/recall` with
    the single shared `/braintwin/bearer_token`. Phase 4.1 replaces
    that with per-user Google JWTs. **If 4.1 lands first, the nightly
-   eval breaks** — the shared bearer no longer authenticates. Decide
-   now: keep a **service-account path for the eval runner** (a
-   long-lived eval JWT for Sabya's user, or a retained bearer route
-   scoped to the eval runner's IAM role). Cheapest: mint a
-   non-expiring JWT for `user_id=1` and hand it to the eval workflow's
-   SSM secret. This is a one-line decision but a hard dependency.
+   eval breaks** — the shared bearer no longer authenticates.
+   **Decided 2026-07-02:** a dedicated SSM param
+   `/braintwin/eval_bearer_token` is created on **Day 0** with the
+   current shared bearer as its value, and the eval IAM role +
+   workflow are scoped to that name from the start. When this phase
+   lands, only the *value* is swapped — to a long-lived JWT minted
+   for the **dedicated eval user** (eval doc §3.5 step 7), NOT for
+   `user_id=1` — so eval traffic stays out of Sabya's corpus, gets
+   the `is_eval` quota exemption (§6), and can be excluded from prod
+   dashboards. No IAM or workflow rework at swap time. ⚠️ Bumping
+   the eval user's `token_version` silently kills this token and the
+   nightly run starts 401ing — treat eval 401s as an alarm, re-mint
+   and re-put the secret after any deliberate bump.
 2. **Shared `response.usage` metering.** Eval's token-spend metric and
    this phase's token quota both read the Anthropic `usage` field and
    both touch `llm_client.py`. Whoever lands second inherits a small
@@ -753,8 +854,12 @@ worth the coordination.
   deletion actually work.
 - Migrations for `users.email` (+ index after backfill),
   `users.oauth_google_sub` (plain column + separate unique index — no
-  inline `UNIQUE`), `users.token_version`, `usage_counters`,
-  `telegram_bindings`
+  inline `UNIQUE`), `users.token_version`, `users.is_eval`,
+  `usage_counters`, `telegram_bindings`
+- Google Cloud setup: OAuth client + consent screen set to "In
+  production" (non-sensitive scopes — no review needed, no shadow
+  test-user allowlist; §4.2 note). id_token verification via
+  `google-auth`, not hand-rolled (§4.2 note)
 - `GET /auth/google/start` + `GET /auth/google/callback` — with
   `state` cookie, PKCE `code_verifier` persistence, and
   `email_verified` enforcement (§4.2)
@@ -775,7 +880,8 @@ worth the coordination.
 
 - Every route that uses `DEFAULT_USER_ID` grows a
   `user: User = Depends(get_current_user)` parameter
-- `check_quota()` inserted before each Anthropic call
+- `check_quota()` inserted before each Anthropic call — with the
+  `is_eval` exemption and atomic DB-side increments (§6)
 - `DELETE /account` endpoint
 - Integration test: sign-in → capture → recall → delete cycle
 
@@ -787,7 +893,7 @@ worth the coordination.
 - All requests carry `Authorization: Bearer <jwt>`
 - Signed-out state clearly indicated; sign-out button
 
-### M.M.4 — Telegram bot `/link` flow (~0.5 day)
+### M.M.4 — Telegram bot `/link` flow + per-user JWT minting (~1 day)
 
 - Web UI shows generated link code after sign-in
 - Bot handles `/link <code>` — looks up code in `users`, writes to
@@ -795,6 +901,12 @@ worth the coordination.
 - Bot handles `/unlink` — deletes the binding
 - All bot messages now route to `telegram_bindings.user_id` instead
   of the shared allowlist
+- **`mint_user_jwt(telegram_user_id)` helper in the bot** (§4.5.1):
+  binding lookup + `token_version` read at mint time, 5-min TTL,
+  cached until expiry; `CaptureClient` sends it per request instead
+  of the shared bearer. Unlinked sender → "send /link" reply, no
+  backend call. Unit test: minted token passes `get_current_user`;
+  bumped `token_version` fails within TTL grace
 - Delete the old `ALLOWED_TELEGRAM_USER_IDS` env var + SSM param
 
 ### M.M.5 — Web pages + first-friend onboarding (~1-1.5 days)
@@ -831,11 +943,12 @@ slug validation).
   Telegram — end-to-end smoke.
 - Take a screenshot of the friend using it for portfolio purposes.
 
-Total estimate: **~6.5-7 days of focused work** (M.M.1 bumped from 2
+Total estimate: **~7-7.5 days of focused work** (M.M.1 bumped from 2
 to 3 days once OAuth is hardened — state/PKCE, `email_verified`, the
 FK pragma, `token_version` revocation, and the spend-cap config are
-real work, not happy-path). Treat this as optimistic and carry a
-**~8-9 day** contingency: the security-sensitive OAuth path and the
+real work, not happy-path; M.M.4 bumped from 0.5 to 1 day for the
+per-user JWT minting, §4.5.1). Treat this as optimistic and carry a
+**~9 day** contingency: the security-sensitive OAuth path and the
 MV3 extension sign-in are the two most likely to overrun, and this is
 an auth boundary — getting it wrong is worse than shipping it a day
 late.
@@ -965,3 +1078,21 @@ coupling with Phase 4.0.5 that the "independent" claim understated;
 (9) M.M.1 → ~3 days and total → ~6.5-7 (contingency ~8-9), since
 hardened OAuth is real work on an auth boundary. Dollar totals
 deferred until a real one-month bill exists.*
+
+*Revised 2026-07-02 after a cross-phase integration review (both this
+doc and the eval doc, implemented concurrently): (1) added §4.5.1 —
+the bot→backend auth contract was unspecified; post-M.M.2 the bot's
+shared bearer stops working, so the bot now mints short-lived
+per-user JWTs with the shared `JWT_SECRET` (one validator, many
+minters; M.M.4 0.5→1 day, total ~7-7.5); (2) added the `is_eval`
+quota exemption (§4.1, §6, M.M.2) — the weekly eval run of ~90-110
+recalls would otherwise trip the 50/day cap every Sunday; (3) §7.4
+eval-token contract made concrete — `/braintwin/eval_bearer_token`
+created Day 0 (value = shared bearer, swapped to the dedicated eval
+user's JWT post-landing), with the token_version-kills-eval warning;
+(4) §4.2 notes — id_token verification via `google-auth`, consent
+screen to "In production" (avoids the shadow test-user allowlist);
+(5) §5.4 slug compare → `hmac.compare_digest`; §6 counter increments
+made atomic DB-side; (6) §7.2 — bundle the undeployed M.10/M.11 CDK
+diff into the Phase 4.1 EBS dance so one instance replacement covers
+both.*
