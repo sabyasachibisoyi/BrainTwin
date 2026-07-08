@@ -35,8 +35,16 @@ if you want to understand how it's deployed. The split rationale is in
 
 ## Quick Start
 
+> **New machine?** For a full step-by-step setup — Homebrew tools, the
+> Apple-Silicon-vs-Intel differences, the whisper model, `.env` gotchas, and
+> the pre-commit hook — see **[docs/local-dev-setup.md](docs/local-dev-setup.md)**.
+> The condensed version is below.
+
 ### Prerequisites
-- Python 3.11+
+- Python 3.11+ (3.12 recommended — matches the Docker image)
+- Homebrew system tools: `brew install python@3.12 whisper-cpp ffmpeg`
+  (native binaries the app shells out to; see the setup doc for the
+  Apple-Silicon `whisper-cli` path override)
 - Cursor IDE (recommended)
 - Chrome browser
 - Claude API key from [console.anthropic.com](https://console.anthropic.com)
