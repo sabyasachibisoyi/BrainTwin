@@ -27,11 +27,68 @@ from typing import Any, Optional
 
 @dataclass(frozen=True)
 class User:
-    """Multi-tenant root. id=1 is reserved for Sabya per B.5.4."""
+    """Multi-tenant root. id=1 is reserved for Sabya per B.5.4.
+
+    Phase 4.1 M.M.1.a additions (see docs/phase4.1-multi-user-design.md
+    §4.1). All new fields default to None / 0 so pre-4.1 code paths
+    that still construct a `User` don't need to know about them; the
+    OAuth backend fills them in on sign-in.
+
+    Field notes:
+      - `oauth_google_sub`: Google's stable `sub` claim, populated on
+        first sign-in. None for pre-4.1 rows (including the seeded
+        `user_id=1` — Sabya signs in via OAuth like every other user
+        once M.M.1.d ships).
+      - `added_at`: when Sabya added the user to the allowlist. ISO
+        8601 string (matches `created_at`'s convention).
+      - `is_admin`: True only for Sabya. Gates admin-facing routes.
+      - `token_version`: bumped to revoke every live JWT for this user
+        in one write (Codex Fix 3). `get_current_user` compares this to
+        the `tv` claim on the JWT and 401s on mismatch.
+      - `is_eval`: True only for the dedicated eval user (eval doc
+        §3.5). Quota check skips this user (Fable §6, Codex Fix 6).
+    """
     id: int
     email: str
     display_name: Optional[str]
     created_at: str  # ISO 8601
+    # Phase 4.1 M.M.1.a additions --------------------------------------
+    oauth_google_sub: Optional[str] = None
+    added_at: Optional[str] = None  # ISO 8601
+    is_admin: bool = False
+    token_version: int = 0
+    is_eval: bool = False
+
+
+# ---- Usage counters + Telegram bindings (Phase 4.1) -------------------
+
+@dataclass(frozen=True)
+class UsageCounters:
+    """One row per (user, date_utc). Bumped atomically at the DB level
+    on every /capture, /recall, and Anthropic call — see design doc
+    §6 for the atomic-update pattern (Fable: never do read-modify-write
+    in Python; let the DB do the arithmetic under a row lock).
+
+    Counters are for the CURRENT day only; the nightly sweep drops
+    rows older than the retention window."""
+    user_id: int
+    date_utc: str  # ISO date "YYYY-MM-DD" UTC
+    captures: int
+    recalls: int
+    tokens: int
+
+
+@dataclass(frozen=True)
+class TelegramBinding:
+    """telegram_user_id → user_id binding, created via /link flow
+    (design doc §4.5, Fable §4.5.1). One Telegram account binds to at
+    most one BrainTwin user; rebinding means /unlink then /link.
+
+    linked_at is ISO 8601 — useful for the admin dashboard when
+    diagnosing "when did this friend connect?" questions."""
+    telegram_user_id: int
+    user_id: int
+    linked_at: str  # ISO 8601
 
 
 # ---- Captures ---------------------------------------------------------
@@ -188,6 +245,8 @@ class ChunkAttachment:
 
 __all__ = [
     "User",
+    "UsageCounters",
+    "TelegramBinding",
     "Capture",
     "Hydration",
     "Enrichment",
