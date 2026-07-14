@@ -53,10 +53,30 @@ metadata = MetaData()
 
 
 # ---------------------------------------------------------------------
-# Users — multi-tenant from day one (A.2)
+# Users — multi-tenant from day one (A.2). Extended for Phase 4.1 M.M.1.a
 # ---------------------------------------------------------------------
 # id=1 is reserved for the original single-user (Sabya, B.5.4). Other
 # students get id=2, 3, ... when use case A goes live.
+#
+# Phase 4.1 additions (see docs/phase4.1-multi-user-design.md §4.1):
+#   - oauth_google_sub — Google's stable subject claim, populated on
+#     first sign-in; join key when the same email is re-issued. Plain
+#     column + separate unique index (Codex Fix 1 — SQLite forbids
+#     inline UNIQUE on ALTER TABLE ADD COLUMN).
+#   - added_at — when Sabya added the user to the allowlist. ISO 8601
+#     TEXT to match `created_at`'s convention (no TIMESTAMP type in this
+#     schema; matches Postgres-portability rule at the top of the file).
+#   - is_admin — Sabya-only flag; gates admin-facing routes. INTEGER
+#     (0/1) — this schema doesn't use BOOLEAN.
+#   - token_version — bumped to revoke every live JWT for the user in
+#     one write (Codex Fix 3). Without it, stateless JWTs can't be
+#     invalidated before their exp — a 30-day open window after any
+#     compromise. `get_current_user` compares this to the `tv` claim
+#     and 401s on mismatch.
+#   - is_eval — quota-exempt eval-user flag (Fable §4.5.1 / eval doc
+#     §4.3). Weekly e2e eval run is ~90-110 recalls, which trips the
+#     50/day recall cap without this exemption. Only the dedicated
+#     eval user ever has is_eval=1.
 users = Table(
     "users",
     metadata,
@@ -64,6 +84,77 @@ users = Table(
     Column("email", TEXT, unique=True, nullable=False),
     Column("display_name", TEXT),
     Column("created_at", TEXT, nullable=False),  # ISO 8601
+    # Phase 4.1 M.M.1.a additions ------------------------------------
+    Column("oauth_google_sub", TEXT),               # nullable; unique via idx below
+    Column("added_at", TEXT),                       # ISO 8601; NULL for pre-4.1 rows
+    Column("is_admin", INTEGER, nullable=False, server_default="0"),
+    Column("token_version", INTEGER, nullable=False, server_default="0"),
+    Column("is_eval", INTEGER, nullable=False, server_default="0"),
+    # oauth_google_sub uniqueness enforced as a named index rather than
+    # `unique=True` on the Column so the migration sweep can create it
+    # via CREATE UNIQUE INDEX IF NOT EXISTS on an already-populated DB
+    # (SQLite's ALTER TABLE ADD COLUMN can't add UNIQUE inline).
+    Index("users_oauth_sub_idx", "oauth_google_sub", unique=True),
+)
+
+
+# ---------------------------------------------------------------------
+# usage_counters — per-user daily rate-limit + spend accounting (4.1 §6)
+# ---------------------------------------------------------------------
+# One row per (user_id, date_utc). Bumped atomically at the DB level
+# (Fable §6 — Python-side `counters.captures += 1` undercounts under
+# concurrency; UPDATE ... SET x = x + 1 lets SQLite do the arithmetic
+# under a row lock).
+#
+# Caps enforced BEFORE persistence + enrichment (Codex Fix 6 — the
+# non-blocking-capture invariant otherwise defeats the cap: a rejected
+# request that already persisted the capture has already paid the cost
+# we were trying to avoid).
+#
+# tokens is INTEGER — Anthropic's response.usage returns integer input/
+# output token counts; the caller sums input+output before writing.
+#
+# Counter rows are retained for a rolling window (design doc §6.2) —
+# the delete sweep runs from a nightly job, not from this table's DDL.
+usage_counters = Table(
+    "usage_counters",
+    metadata,
+    Column("user_id", INTEGER, ForeignKey("users.id"), primary_key=True),
+    Column("date_utc", TEXT, primary_key=True),        # ISO date "YYYY-MM-DD" UTC
+    Column("captures", INTEGER, nullable=False, server_default="0"),
+    Column("recalls", INTEGER, nullable=False, server_default="0"),
+    Column("tokens", INTEGER, nullable=False, server_default="0"),
+    Index("idx_usage_counters_date_utc", "date_utc"),  # for the nightly sweep
+)
+
+
+# ---------------------------------------------------------------------
+# telegram_bindings — telegram_user_id → user_id (4.1 §4.5)
+# ---------------------------------------------------------------------
+# Replaces the M.7.5 shared ALLOWED_TELEGRAM_USER_IDS env var — a
+# broken model (one allowlist across all app users). Now every
+# Telegram sender is mapped to exactly one app user via /link, or the
+# bot refuses to touch the backend (see Fable §4.5.1).
+#
+# telegram_user_id is Telegram's stable numeric user id (INTEGER,
+# well within int64 range). It's the primary key: one Telegram
+# account binds to at most one BrainTwin user at a time. The unique
+# index on user_id enforces the reverse direction — one BrainTwin
+# user holds at most one binding, so get_by_user() is deterministic.
+# Rebinding either side goes through set_binding(), which replaces
+# the old row.
+#
+# Deletion cascades happen via the shared delete_user() helper in
+# db.py (Codex Fix 2 — existing FKs don't carry ON DELETE CASCADE,
+# so we walk children explicitly with foreign_keys=ON as a
+# defense-in-depth guard).
+telegram_bindings = Table(
+    "telegram_bindings",
+    metadata,
+    Column("telegram_user_id", INTEGER, primary_key=True),
+    Column("user_id", INTEGER, ForeignKey("users.id"), nullable=False),
+    Column("linked_at", TEXT, nullable=False),         # ISO 8601
+    Index("idx_telegram_bindings_user_id", "user_id", unique=True),
 )
 
 
@@ -341,6 +432,8 @@ CHUNKS_FTS_DDL: tuple[tuple[str, str], ...] = (
 __all__ = [
     "metadata",
     "users",
+    "usage_counters",
+    "telegram_bindings",
     "captures",
     "hydrations",
     "enrichments",

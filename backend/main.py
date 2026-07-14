@@ -272,8 +272,16 @@ async def _ensure_default_user() -> None:
                 email="sabya.bisoyi@gmail.com",
                 display_name="Sabya",
                 user_id=DEFAULT_USER_ID,
+                is_admin=True,
             )
             logger.info("Seeded default user_id=%s (Sabya)", DEFAULT_USER_ID)
+        elif not existing.is_admin:
+            # Pre-4.1 row: the ADD COLUMN sweep backfills is_admin=0,
+            # but user_id=1 is the admin (design doc §M.M.1).
+            await repo.set_admin(DEFAULT_USER_ID, True)
+            logger.info(
+                "Granted is_admin to default user_id=%s", DEFAULT_USER_ID
+            )
         else:
             logger.debug("Default user_id=%s already present", DEFAULT_USER_ID)
 

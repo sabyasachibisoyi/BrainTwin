@@ -154,6 +154,19 @@ def _configure_sqlite_pragmas(engine: AsyncEngine) -> None:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.execute("PRAGMA busy_timeout=5000")
+            # Phase 4.1 M.M.1.a (Codex Fix 2) — foreign_keys is OFF by
+            # default per SQLite connection. Without it, every
+            # `ForeignKey(...)` declaration in schema.py is a purely
+            # documentary hint: FK constraint violations don't raise,
+            # and ON DELETE CASCADE is a silent no-op. Turning it on
+            # here means an accidental cross-user reference on write
+            # fails loudly, AND it acts as a defense-in-depth guard for
+            # the delete_user() helper — any table we forget to walk
+            # explicitly triggers an IntegrityError on the user delete
+            # instead of leaving orphan rows behind, which would break
+            # the §5.3 privacy promise ("delete my account" must
+            # actually delete everything).
+            cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
 
@@ -212,6 +225,13 @@ async def init_db() -> None:
         # add new columns to a table that already exists. This sweep
         # closes the gap without bringing in alembic for one column set.
         await conn.run_sync(_apply_pending_column_adds)
+        # Phase 4.1 M.M.1.a — indexes on the just-added `users` columns.
+        # Must run AFTER `_apply_pending_column_adds` because it CREATE
+        # INDEXes on columns that sweep is responsible for adding on
+        # upgrade paths (the columns exist from `create_all` on fresh
+        # installs, but the sweep is what backfills them onto pre-4.1
+        # DBs, and the index has to point at an existing column).
+        await conn.run_sync(_apply_pending_index_adds)
         # Phase 4 M.1 — FTS5 virtual table + triggers for BM25 retrieval.
         # SQLAlchemy Core doesn't model virtual tables, so the DDL is raw
         # strings declared in schema.py. Same idempotent CREATE-IF-NOT-EXISTS
@@ -230,11 +250,49 @@ async def init_db() -> None:
 # is the trigger for adopting alembic.
 _PENDING_COLUMN_ADDS: tuple[tuple[str, str, str], ...] = (
     # (table_name, column_name, column_ddl)
+    # Phase 3.5 — captures content columns
     ("captures", "clean_text", "TEXT"),
     ("captures", "transcript", "TEXT"),
     ("captures", "image_text", "TEXT"),
     ("captures", "image_descriptions_json", "TEXT"),
     ("captures", "text_source", "TEXT"),
+    # Phase 4.1 M.M.1.a — users columns for OAuth allowlist + revocation
+    # + eval-user exemption. NB: `email` already exists on `users` from
+    # Phase 3 (TEXT UNIQUE NOT NULL) — the design doc had "ALTER ... ADD
+    # COLUMN email" which was a spec error; skipping here.
+    #
+    # `is_admin`, `token_version`, `is_eval` land with NOT NULL + DEFAULT 0
+    # via the DDL below — SQLite accepts NOT NULL on ADD COLUMN as long
+    # as a constant default is provided (existing rows get the default).
+    ("users", "oauth_google_sub", "TEXT"),
+    ("users", "added_at", "TEXT"),
+    ("users", "is_admin", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "token_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "is_eval", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+# Phase 4.1 M.M.1.a — narrow per-startup index migration. Same shape
+# as `_PENDING_COLUMN_ADDS` but for indexes: an index name + the CREATE
+# statement. Applied idempotently via CREATE [UNIQUE] INDEX IF NOT
+# EXISTS, so re-running is a cheap no-op.
+#
+# Why not just declare `Index(..., unique=True)` in schema.py and let
+# `create_all` handle it? create_all runs the index CREATE against the
+# table it's declared on — but on a fresh install the index is created
+# without issue, and on an upgrade path where the column was added by
+# the sweep above, SQLAlchemy's metadata.create_all doesn't detect the
+# missing index. Declaring it in schema.py (fresh installs) AND
+# repeating here (upgrade path) covers both cases. The Index() at the
+# top of schema.py stays as documentation; the CREATE below is what
+# actually runs on an already-existing DB.
+_PENDING_INDEX_ADDS: tuple[tuple[str, str], ...] = (
+    # (index_name, create_ddl)
+    (
+        "users_oauth_sub_idx",
+        "CREATE UNIQUE INDEX IF NOT EXISTS users_oauth_sub_idx "
+        "ON users(oauth_google_sub)",
+    ),
 )
 
 
@@ -269,6 +327,43 @@ def _apply_pending_column_adds(sync_conn) -> None:
         logger.info(
             "Phase 3.5 migration: added column %s.%s (%s)",
             table, column, ddl,
+        )
+
+
+# ---- Phase 4.1 M.M.1.a — Idempotent index sweep --------------------
+#
+# Same shape as `_apply_pending_column_adds`: check each index by name
+# in sqlite_master, only issue the CREATE if absent. Cheap re-run — a
+# single lookup per index. Currently the only entry is
+# `users_oauth_sub_idx` (unique index on the Phase 4.1 column added
+# above); when future migrations need their own indexes, add them here.
+
+def _apply_pending_index_adds(sync_conn) -> None:
+    """Idempotently create indexes declared in `_PENDING_INDEX_ADDS`.
+
+    Consults `sqlite_master` for each index name and only issues the
+    CREATE if the index doesn't already exist. Non-SQLite dialects
+    are skipped — the equivalent index setup for Postgres lives in
+    the Postgres migration path (Phase 3 decision A.7)."""
+    from sqlalchemy import text
+
+    dialect_name = sync_conn.dialect.name
+    if dialect_name != "sqlite":
+        logger.debug(
+            "_apply_pending_index_adds: skipping on dialect=%s", dialect_name,
+        )
+        return
+
+    for index_name, ddl in _PENDING_INDEX_ADDS:
+        existing = sync_conn.execute(text(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name = :name"
+        ), {"name": index_name}).first()
+        if existing is not None:
+            continue
+        sync_conn.execute(text(ddl))
+        logger.info(
+            "Phase 4.1 M.M.1.a migration: created index %s", index_name,
         )
 
 

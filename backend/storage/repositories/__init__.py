@@ -39,6 +39,12 @@ from backend.storage.repositories.topic_repo import (
     TopicRepository,
     normalize_slug,
 )
+from backend.storage.repositories.telegram_binding_repo import (
+    TelegramBindingRepository,
+)
+from backend.storage.repositories.usage_counters_repo import (
+    UsageCountersRepository,
+)
 from backend.storage.repositories.user_repo import UserRepository
 
 
@@ -55,6 +61,9 @@ __all__ = [
     "ChunkRepository",
     "TopicRepository",
     "EntityRepository",
+    # Phase 4.1 M.M.1.a
+    "UsageCountersRepository",
+    "TelegramBindingRepository",
     # helpers
     "normalize_slug",
     "ENTITY_TYPES",
