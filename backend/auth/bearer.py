@@ -1,9 +1,9 @@
-"""Bearer-token auth dependency — Phase 4.0.6 M.1.
+"""Bearer-token auth dependency — Phase 4.0.6 M.1 (retained during 4.1 transition).
 
 Shipped before any cloud resource exists. The single shared bearer
 token gates everything that mutates or reads sensitive state:
 
-  /capture, /recall, /stats, /failures   → protected
+  /capture, /recall, /stats, /failures   → protected (during 4.0.6 - 4.1 M.M.1.*)
   /, /health                              → public (UptimeRobot, smoke tests)
 
 Threat model in scope for this dep:
@@ -14,11 +14,21 @@ Threat model in scope for this dep:
 
 Threat model NOT in scope (per design §11):
   - Replay protection (use TLS — Cloudflare + Caddy both encrypt)
-  - Per-user accounts / OAuth (Phase 4.1, use case A)
+  - Per-user accounts / OAuth (Phase 4.1 M.M.2 flips every route to
+    `Depends(get_current_user)` from `backend.auth.deps` — that's where
+    the shared-bearer story ends)
   - Token rotation without restart (Phase 4.0.6.1)
 
 The token is compared with `hmac.compare_digest` to avoid leaking
 timing information to an attacker brute-forcing.
+
+Phase 4.1 M.M.1.c note: this file used to be `backend/auth.py`. It was
+promoted into a package (`backend/auth/` with `bearer.py`, `jwt.py`,
+`deps.py`, `pkce.py`) when the JWT primitives landed alongside. The
+public import path `from backend.auth import require_bearer_token`
+still works via `backend/auth/__init__.py` re-exports — every existing
+route wiring stayed unchanged. When M.M.2 flips those routes to
+`get_current_user`, this module becomes dead code and gets removed.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ import hmac
 import logging
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Header, HTTPException, status
 
 from backend.config import reveal, settings
 
