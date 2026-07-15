@@ -129,6 +129,44 @@ usage_counters = Table(
 
 
 # ---------------------------------------------------------------------
+# oauth_state — PKCE code_verifier persistence (4.1 §4.2, Codex Fix 4)
+# ---------------------------------------------------------------------
+# The Google OAuth authorization-code flow with PKCE splits into two
+# HTTP requests:
+#   1. GET /auth/google/start   — server generates code_verifier +
+#                                  code_challenge; sends challenge to
+#                                  Google; MUST remember the verifier.
+#   2. GET /auth/google/callback — Google redirects back with the auth
+#                                  code; server exchanges code +
+#                                  original verifier for id_token.
+#
+# Between (1) and (2), the browser bounces off Google — so the
+# `code_verifier` cannot live in a Python variable. Options:
+#   - Cookie: doesn't survive across devices / private mode nicely, and
+#     Google's redirect back to us doesn't carry our cookies reliably
+#     on the FIRST request from a strict-SameSite browser.
+#   - In-memory dict: dies on every restart / doesn't work across the
+#     multiple bot + backend containers on the same host.
+#   - SQLite table: survives restarts, works cross-container via the
+#     shared DB, and gives us a natural place to sweep expired rows.
+#
+# Cost is tiny (one INSERT + one DELETE per sign-in, TTL a few minutes).
+# `state` is the CSRF token in the auth URL — used as PK because it's
+# already unique-per-attempt by design and lets `consume_state` be a
+# single DELETE by PK. `expires_at` indexed so a nightly sweep is O(log
+# N) instead of full-scan.
+oauth_state = Table(
+    "oauth_state",
+    metadata,
+    Column("state", TEXT, primary_key=True),
+    Column("code_verifier", TEXT, nullable=False),
+    Column("created_at", TEXT, nullable=False),  # ISO 8601
+    Column("expires_at", TEXT, nullable=False),  # ISO 8601
+    Index("idx_oauth_state_expires_at", "expires_at"),
+)
+
+
+# ---------------------------------------------------------------------
 # telegram_bindings — telegram_user_id → user_id (4.1 §4.5)
 # ---------------------------------------------------------------------
 # Replaces the M.7.5 shared ALLOWED_TELEGRAM_USER_IDS env var — a
@@ -434,6 +472,7 @@ __all__ = [
     "users",
     "usage_counters",
     "telegram_bindings",
+    "oauth_state",
     "captures",
     "hydrations",
     "enrichments",

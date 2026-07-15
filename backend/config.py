@@ -42,7 +42,43 @@ class Settings(BaseSettings):
     # with a 503 ("auth not configured") — that's the fail-closed
     # default. In cloud, this is fetched from SSM Parameter Store at
     # boot; locally, set it in .env. SecretStr — read via config.reveal().
+    #
+    # Phase 4.1 M.M.2 flips every protected route from
+    # `Depends(require_bearer_token)` → `Depends(get_current_user)` — this
+    # setting becomes vestigial then, but stays around during the M.M.1.*
+    # substeps so nothing breaks while OAuth is being built.
     backend_bearer_token: SecretStr = SecretStr("")
+
+    # ----- Phase 4.1 M.M.1.c — JWT signing + Google OAuth config ---------
+    # JWT for stateless per-user auth (design doc §4.3 + Codex Fix 3).
+    # Symmetric key (HS256) — the backend both mints and verifies, no
+    # third-party signature path in scope. Bumping this secret invalidates
+    # EVERY live JWT for EVERY user (harder reset than `bump_token_version`
+    # on one user, but occasionally useful for "we got compromised, sign
+    # everyone out"). SecretStr — read via config.reveal().
+    jwt_secret: SecretStr = SecretStr("")
+    # JWT lifetime. 30 days matches the pre-4.1 shared-bearer's effectively-
+    # unbounded lifetime, chosen for friend-scale UX (nobody wants to
+    # re-sign-in every day). Kept flexible so a future refresh-token flow
+    # can shorten this without a code change.
+    jwt_ttl_minutes: int = 30 * 24 * 60  # 30 days
+
+    # Google OAuth (M.M.1.d consumes; declared here so config stays one
+    # source of truth). client_id is technically public but SecretStr-ified
+    # for uniformity — see put-secrets.sh's comment. redirect_uri differs
+    # between local dev and prod; keep as plain str (no need to hide) and
+    # let .env override.
+    google_oauth_client_id: SecretStr = SecretStr("")
+    google_oauth_client_secret: SecretStr = SecretStr("")
+    google_oauth_redirect_uri: str = "http://localhost:8000/auth/google/callback"
+
+    # Hidden onboarding-page slug (Fable §5.4). The route
+    # `GET /join/{slug}` compares its path param to this value via
+    # `hmac.compare_digest` (constant-time). Empty = the route 404s
+    # unconditionally, effectively disabling onboarding — the fail-closed
+    # default. In cloud, set via SSM; share the /join/<slug> URL with
+    # friends privately (never in the repo).
+    join_slug: SecretStr = SecretStr("")
 
     # Capture
     dwell_time_threshold: int = 30
