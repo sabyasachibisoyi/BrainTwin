@@ -67,6 +67,16 @@ asyncpg==0.31.0                    # Postgres async driver, pulled in for cloud 
 # `google-auth` for Google id_token verification lands in M.M.1.d.
 pyjwt==2.10.1
 
+# Phase 4.1 M.M.1.d — Google id_token verification during OAuth callback.
+# Google's audited library — JWKS fetch + kid selection, RS256 signature
+# verify, iss/aud/exp checks in one call. (Note: it re-fetches Google's
+# certs per verification unless wrapped in a CacheControl session — we
+# accept that for now given sign-ins are rare.) We deliberately do NOT
+# hand-roll this (Fable §4.2): rolling our own JWKS fetcher + kid
+# selection on an auth boundary is exactly the "learning becomes risk"
+# line.
+google-auth==2.44.0
+
 # Testing
 pytest==9.0.3
 pytest-asyncio==1.3.0

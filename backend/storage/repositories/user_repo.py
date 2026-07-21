@@ -34,7 +34,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import delete, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.storage.models import User
@@ -143,8 +143,19 @@ class UserRepository(BaseRepository):
         return _row_to_user(row) if row else None
 
     async def get_by_email(self, email: str) -> Optional[User]:
+        """Look up by login email, case-insensitively.
+
+        Email addresses are case-insensitive in the local-part per
+        practice (and Google always returns lowercase), but an admin
+        seeding the allowlist by hand might type `Friend@Gmail.com`.
+        Comparing `lower(column) == lower(input)` means a casing mismatch
+        between the seeded row and Google's returned email doesn't produce
+        a spurious "not on the allowlist" 403. The allowlist table is
+        tiny, so not using the raw-email unique index here is free."""
         result = await self.session.execute(
-            select(users).where(users.c.email == email)
+            select(users).where(
+                func.lower(users.c.email) == email.strip().lower()
+            )
         )
         row = result.first()
         return _row_to_user(row) if row else None
@@ -190,6 +201,28 @@ class UserRepository(BaseRepository):
             raise ValueError(f"user_id={user_id} does not exist")
         await self.session.flush()
         return int(row.token_version)
+
+    async def set_oauth_sub(self, user_id: int, oauth_google_sub: str) -> None:
+        """Bind Google's stable `sub` to a user row.
+
+        The OAuth callback's first-sign-in backfill: a user allowlisted
+        by email (no `sub` yet) gets their `sub` written on the first
+        successful Google sign-in, so subsequent sign-ins short-circuit
+        to `get_by_oauth_sub`. The callback only calls this when the
+        existing `sub` is NULL — rebinding an already-bound row to a
+        different `sub` is a rejected security event handled upstream,
+        not a write this method performs.
+
+        Raises ValueError if the user doesn't exist (post-condition:
+        exactly one row updated)."""
+        result = await self.session.execute(
+            update(users)
+            .where(users.c.id == user_id)
+            .values(oauth_google_sub=oauth_google_sub)
+        )
+        if result.rowcount == 0:
+            raise ValueError(f"user_id={user_id} does not exist")
+        await self.session.flush()
 
     async def set_admin(self, user_id: int, is_admin: bool) -> None:
         """Set the admin flag for a user.

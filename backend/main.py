@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from backend.agent.recaller import Recaller
 from backend.agent.retrieval import RetrievalService
-from backend.auth import require_bearer_token
+from backend.auth import oauth_router, require_bearer_token
 from backend.capture.processor import CaptureInput, process
 from backend.config import reveal, settings
 from backend.knowledge.enrichment_worker import (
@@ -203,6 +203,21 @@ class RecallPayload(BaseModel):
 
 
 # --- Routes ---
+
+# Phase 4.1 M.M.1.d — Google OAuth authorization-code flow.
+# Two routes (GET /auth/google/start, GET /auth/google/callback) live
+# in backend/auth/routes.py under an APIRouter, kept separate from
+# main.py's business routes so the auth surface stays coherent. The
+# router adds both endpoints under /auth/google/*.
+#
+# NOTE: this ships the sign-in FLOW but does NOT enforce it on
+# /capture, /recall, /stats, /failures — those still Depends
+# require_bearer_token from M.1. The mechanical swap to
+# Depends(get_current_user) is M.M.2. Deploying M.M.1.d to prod is
+# therefore safe: existing behavior unchanged, one new capability
+# added (users who know the URLs can sign in and receive a JWT).
+app.include_router(oauth_router)
+
 
 @app.get("/")
 async def root():
