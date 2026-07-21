@@ -27,6 +27,12 @@ from backend.auth.bearer import (
     require_bearer_token,
 )
 from backend.auth.deps import get_current_user, get_session
+from backend.auth.google import (
+    IdTokenUnavailable,
+    InvalidIdToken,
+    VerifiedIdentity,
+    verify_google_id_token,
+)
 from backend.auth.jwt import (
     ExpiredToken,
     InvalidToken,
@@ -43,6 +49,7 @@ from backend.auth.pkce import (
     store_state,
     sweep_expired,
 )
+from backend.auth.routes import router as oauth_router
 from backend.config import settings  # re-exported for tests/test_auth.py
 
 
@@ -66,6 +73,12 @@ __all__ = [
     # M.M.1.c FastAPI deps
     "get_session",
     "get_current_user",
+    # M.M.1.d Google id_token verification + OAuth routes
+    "InvalidIdToken",
+    "IdTokenUnavailable",
+    "VerifiedIdentity",
+    "verify_google_id_token",
+    "oauth_router",
     # Re-exports for test compat
     "settings",
 ]
