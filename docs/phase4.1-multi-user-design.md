@@ -876,6 +876,124 @@ worth the coordination.
   bad-`state` → reject), quota enforcement, and `delete_user()`
   leaving zero orphaned rows across all tables + Chroma
 
+#### M.M.1 ✅ What shipped (2026-07-14 → 2026-07-21)
+
+Five substeps landed as four merged PRs (`M.M.1.a`, `.c`, `.d` in
+BrainTwin + `.b` in BrainTwinCDK for the SSM param names) plus this
+doc-only pass (`.e`). All on `main`; **NOT yet deployed to prod** —
+M.M.2 hasn't flipped routes to require the new JWT, so deploying
+M.M.1 today is a safe drop-in with zero user-facing behaviour change.
+
+Estimated ~3 days of focused work; elapsed ~1 week (2026-07-14 →
+2026-07-21) because sessions were interleaved with review passes and
+external Google Cloud setup. Actual coding time within the estimate.
+
+##### M.M.1.a — Data model + repositories (2026-07-14, PR #33)
+
+| Choice | What we did |
+|--------|-------------|
+| Schema evolution mechanism | **Extended the existing `_PENDING_COLUMN_ADDS` sweep in `backend/storage/db.py`** rather than pulling in Alembic. The Phase 3 codebase never adopted Alembic; adding it for 5 columns felt out of proportion. The sweep is idempotent (CREATE-IF-NOT-EXISTS pattern) and runs on every startup. |
+| `users` table extension | 5 new columns: `oauth_google_sub`, `added_at`, `is_admin`, `token_version`, `is_eval`. `email` already existed from Phase 3 (TEXT UNIQUE NOT NULL) so the design doc's ALTER for email was skipped — spec error caught during implementation. |
+| `users_oauth_sub_idx` | Named UNIQUE INDEX created via a new `_PENDING_INDEX_ADDS` sweep, called from `init_db` AFTER `_PENDING_COLUMN_ADDS` so the index-target column is guaranteed to exist. Codex Fix 1 — SQLite `ALTER TABLE` forbids inline `UNIQUE`. |
+| `foreign_keys=ON` pragma | Added to `_configure_sqlite_pragmas`. Codex Fix 2. Without it, every `ForeignKey(...)` declaration in `schema.py` was silently unenforced; ON DELETE CASCADE was a no-op. Defense-in-depth guard against a future `delete_user()` implementation missing a child table. |
+| `usage_counters` table | New (`user_id`, `date_utc`) composite-PK table for per-user daily rate-limit accounting. Backs M.M.2's `check_quota()`. |
+| `telegram_bindings` table | New `telegram_user_id` → `user_id` mapping, replacing the M.7.5 shared allowlist. Review fix: added UNIQUE index on `user_id` too, making the mapping 1:1 in both directions (without it, one user could hold two bindings and `get_by_user()` was nondeterministic). |
+| `delete_user()` cascade | Walks every user-owned table in FK-safe order (chunks_junctions → chunks → hydrations/enrichments → captures → usage_counters → telegram_bindings → users). Existing FKs don't carry ON DELETE CASCADE and SQLite can't ALTER them to add it; explicit walk + `foreign_keys=ON` guard is the correct pattern. |
+| `bump_token_version()` | Atomic `UPDATE ... SET token_version = token_version + 1 RETURNING`. Codex Fix 3 — the *only* way to invalidate stateless JWTs before their `exp`. `get_current_user` (built in M.M.1.c) compares JWT's `tv` claim against this. |
+| Atomic quota increments | `usage_counters.bump()` uses `INSERT ... ON CONFLICT DO UPDATE SET x = x + n` (Fable §6 + review fix — plain UPDATE matched 0 rows and silently dropped spend across UTC-midnight rollover). Never read-modify-write in Python. |
+| Admin seed | `_ensure_default_user` in `backend/main.py` now creates `user_id=1` with `is_admin=True` on fresh installs and backfills `is_admin` on the existing pre-4.1 row (review fix — the ADD COLUMN sweep initialises to 0, so without this Sabya would ship locked out of future admin-gated routes). |
+| Test surface | 13 tests in `tests/test_storage_mm1a.py` — pragma-is-on, migration idempotency, unique-oauth-sub-index behavior (including multi-NULL), user repo methods (get_by_oauth_sub, bump_token_version, delete_user idempotency), the full cascade-delete graph, usage counters (get_or_create + bump-creates-on-missing regression), telegram bindings (1:1 both directions). |
+
+##### M.M.1.b — Google Cloud OAuth + SSM secrets (2026-07-14)
+
+| Choice | What we did |
+|--------|-------------|
+| Google Cloud OAuth client | Created in `console.cloud.google.com` under project `braintwin`. Redirect URIs: `http://localhost:8000/auth/google/callback` (dev) + `https://braintwin.net/auth/google/callback` (prod). Scopes: `openid` + `email` only. |
+| Consent screen publishing status | **"In production"** immediately — Fable §4.2. With only non-sensitive scopes, Google does NOT require app verification. This avoids the 100-user test-user allowlist and the "This app hasn't been verified" warning screen that would otherwise ruin the friend-onboarding UX. |
+| SSM params (6 total) | `google_oauth_client_id`, `google_oauth_client_secret`, `jwt_secret`, `eval_bearer_token`, `join_slug` (5 from original design) + `google_oauth_redirect_uri` (Fable review fix — code default is localhost, prod OAuth would have hit `redirect_uri_mismatch` without this). All added to `BrainTwinCDK/scripts/put-secrets.sh` via commit `3bfbc2f`. |
+| `eval_bearer_token` Day-0 value | Set to the current shared bearer's value (Fable §7.4). Swaps to the eval user's long-lived JWT after M.M.1.d — same SSM param name, so no IAM or workflow rework at swap time. |
+| Retired param | `/braintwin/allowed_telegram_user_ids` removed from `put-secrets.sh` in the same commit. The shared allowlist model is replaced by `telegram_bindings` from M.M.4 onward. |
+| No CDK changes | The M.10 discovery mechanism from Phase 4.0.6.1 automatically picks up any `/braintwin/*` param at boot and injects it as an env var — zero CDK code needed. |
+| `.env` (local dev) parity | Local dev reads `.env`, not SSM. The M.M.1.d local smoke doc walks through fetching all 6 values via `aws ssm get-parameter --with-decryption` and pasting into `.env`. |
+
+##### M.M.1.c — JWT + PKCE + `get_current_user` (2026-07-14, PR #34)
+
+| Choice | What we did |
+|--------|-------------|
+| Package refactor | Promoted single-module `backend/auth.py` → package `backend/auth/` with `bearer.py` (the M.1 shared-bearer dep, retained until M.M.2), `jwt.py`, `pkce.py`, `deps.py`. `__init__.py` re-exports `require_bearer_token` + `get_current_user` + `settings`, so every pre-4.1 importer keeps working — nothing outside the package needed to change. |
+| JWT library | `pyjwt==2.10.1`, HS256 symmetric-key only. No RS256/asymmetric extras — the backend both mints and verifies with the same secret; no third-party signature path in scope. |
+| JWT_SECRET floor | ≥ 32 chars enforced at `_get_secret()` — every mint AND decode path passes through, so no code path can accidentally sign with a weak key. Fable review fix — HS256 is only as strong as the secret's entropy; `openssl rand -hex 32` (64 chars) is the recommended generation. |
+| Algorithm pinning | `pyjwt.decode(token, secret, algorithms=["HS256"])`. Rejects the classic `alg: "none"` unsigned-token CVE class where naive decoders trust the token's own `alg` header. |
+| JWT claims | `sub=str(user.id)` (RFC 7519 says string; cast on mint, `int()` on read), `email` (debug convenience; NOT trusted at read — `get_current_user` re-reads from DB), `tv=user.token_version` (Codex Fix 3 revocation), `iat`, `exp` (30-day TTL = `jwt_ttl_minutes` default). |
+| PKCE (RFC 7636) | `generate_verifier` (43-char base64url from 32 bytes CSPRNG), `derive_challenge` (S256 = base64url(SHA256(verifier))), `generate_state` (same generator, CSRF token). `oauth_state` table persists (state → code_verifier) across the Google redirect. |
+| `consume_state` atomic | Single `DELETE ... RETURNING` (Fable review fix — original SELECT-then-DELETE let two concurrent callbacks replaying the same state BOTH receive the verifier under WAL, defeating anti-replay). Works on SQLite ≥ 3.35 and Postgres unchanged. |
+| `store_state` self-cleaning | Piggybacks `sweep_expired` on every call (Fable review fix — `store_state` is the table's only growth path and `/auth/google/start` is unauthenticated, so reaping on insert bounds the table by construction with no external nightly task). |
+| `get_current_user` failure paths | 6 numbered paths, each mapping to the correct status: missing/wrong-scheme/empty bearer → 401 (Codex Fix 5: `Header(None)` NOT `Header(...)`, otherwise FastAPI 422s); expired → 401; invalid → 401; sub OR tv not int → 401 (review fix — tv was unguarded, would 500); user_id not in DB → 403; tv mismatch → 401. Plus a config path: unset/short JWT_SECRET → 503 "auth not configured" (Fable review fix — mirrors bearer.py's fail-closed contract). |
+| Test surface | 36 tests total. `test_auth_jwt.py` (12: roundtrip, TTL, unset+short secret RuntimeError, expiry, wrong-secret, alg=none rejection, malformed, missing sub/tv guards). `test_auth_pkce.py` (12: verifier/state shape+randomness+independence, deterministic S256, store→consume roundtrip via TWO fresh sessions, one-shot anti-replay, expired-state returns None + deletes row, `store_state` reaps regression lock, `sweep_expired` selectivity). `test_auth_deps.py` (12: happy path, 401 on missing/wrong-scheme/no-token/expired/invalid-sig/malformed/sub-not-int/tv-not-int/tv-mismatch, 503 on unset-secret, 403 on deleted user). |
+
+##### M.M.1.d — Google OAuth routes + local E2E smoke (2026-07-21, PR #35)
+
+| Choice | What we did |
+|--------|-------------|
+| Google id_token verification library | `google-auth==2.44.0` — audited library for JWKS fetch + RS256 sig verify + iss/aud/exp checks. Deliberately not hand-rolled per Fable §4.2 ("learning becomes risk" on an auth boundary). |
+| `email_verified` enforcement | WE enforce this — google-auth doesn't. Codex Fix 4 — impersonation defense: without it, an attacker registers a Google account claiming friend@x.com but never clicks the verification link, and we'd sign them in as the real friend. |
+| Clock-skew tolerance | 10s (Fable review fix). google-auth's default is 0 — zero tolerance — which 401s legitimate sign-ins when our server clock is even 1s behind Google's. The classic "OAuth mysteriously stopped working overnight" bug. |
+| Route packaging | FastAPI APIRouter in `backend/auth/routes.py`, `app.include_router(oauth_router)` in main.py. Keeps the OAuth surface in one file; future `/auth/*` routes (logout, whoami, DELETE /account) drop in here. |
+| CSRF state-cookie binding | `bt_oauth_state` cookie set in `/start` = state value; `/callback` requires the state query param to match the cookie via `secrets.compare_digest`. Fable review fix — critical login-CSRF hole: without it, ANY browser with any unconsumed state passes the callback check, letting an attacker log the victim into the attacker's account via a phishing link. Cookie is HttpOnly + SameSite=Lax + path=/auth/google + TTL = state TTL + Secure in prod (auto-derived from redirect_uri scheme). |
+| Transaction commit for anti-replay | `await session.commit()` right after `consume_state` returns success (Fable review fix). Without it, a downstream HTTPException (bad code, network flake) rolls back the whole session and RESTORES the deleted `oauth_state` row — anti-replay silently gone. Committing the delete on its own detaches replay-protection from the outcome. |
+| `IdTokenUnavailable` vs `InvalidIdToken` | New exception for `google-auth.TransportError` (JWKS unreachable) — maps to 503 retryable, not 401 "your credential is bad" (Fable review fix). Correct HTTP semantics so client libraries retry appropriately. |
+| Account-rebind detection | If `users.oauth_google_sub` is already set to a DIFFERENT sub than the incoming id_token's, reject with 403 (Fable review fix). Real edge case — Google's docs say sub is stable but email isn't; without this, a re-issued email could silently hijack another friend's account and all their captures. |
+| Malformed token-response body | `token_response.json()` wrapped in try/except ValueError → 401 "google response malformed" (Fable review fix). Most likely cause: egress proxy / captive portal returning HTML. Was 500 before. |
+| Backfill logic | On first successful sign-in for an email-allowlisted user (no `sub` yet), `UserRepository.set_oauth_sub()` binds the sub so future sign-ins short-circuit to `get_by_oauth_sub`. Uses `dataclasses.replace()` on the in-memory frozen User for consistency. |
+| Success UX | Redirect to `LANDING_PATH#token=<jwt>` — fragment (not query) so the token doesn't hit access logs. Client-side JS grabs from `window.location.hash`. State cookie deleted on the way out. |
+| Local E2E smoke doc | `docs/phase4.1-m1d-local-smoke.md` — 7-step runbook: prereqs → tests → uvicorn boot → hit /start in real browser → sign in with real Google → land back with JWT → curl temporary /whoami route → verify oauth_google_sub backfilled → verify revocation via bump_token_version. Includes failure-mode troubleshooting for each step. |
+| Test surface | 20 tests total. `test_auth_google.py` (8: happy path, unset client_id RuntimeError, `email_verified=false` regression lock, missing email_verified defaults to reject, missing sub / missing email guards, google-auth ValueError translation, TransportError → IdTokenUnavailable regression lock). `test_auth_routes.py` (12 via FastAPI TestClient with mocked httpx + google-auth: happy path returns 302 with JWT in fragment + JWT decodes, /start has all required params + persists state row, unset config → 503, callback google-error → 400, missing code/state → 400, unknown/expired state → 400, google token exchange non-200 → 401, InvalidIdToken → 401, email not in allowlist → 403, first-signin sub backfill, unset client_secret → 503). |
+
+##### M.M.1.e — Milestone wrap-up (this section, 2026-07-21)
+
+| Choice | What we did |
+|--------|-------------|
+| Design doc "what shipped" | This §8 subsection. Per-substep tables covering every choice made and every fix from Codex + Fable review cycles. |
+| Baseline `cdk synth` | Confirmed no infrastructure changes leaked in — M.M.1.a-d are all backend-only. `BrainTwinCDK` only touched `scripts/put-secrets.sh` (parameter names, not CDK constructs). No stack changes, no deploy required at M.M.1's close. |
+| No prod deploy | Deliberate. The routes still `Depends(require_bearer_token)` from M.1; the new JWT + `get_current_user` are wired but unused by any production route. M.M.2 does the mechanical Depends() flip — THAT's the deploy that changes behavior. |
+
+##### Codex + Fable review fixes applied across M.M.1
+
+All 6 of Codex's original fixes are in the shipped code:
+
+| # | Fix | Where it landed |
+|---|-----|-----------------|
+| 1 | `oauth_google_sub` as plain column + separate `CREATE UNIQUE INDEX` (SQLite ALTER TABLE forbids inline UNIQUE) | M.M.1.a schema.py + `_PENDING_INDEX_ADDS` in db.py |
+| 2 | `PRAGMA foreign_keys = ON` per-connection | M.M.1.a `_configure_sqlite_pragmas` |
+| 3 | `token_version` JWT revocation via atomic UPDATE | M.M.1.a `bump_token_version` + M.M.1.c `get_current_user` `tv` check |
+| 4 | PKCE `code_verifier` persistence + `email_verified` enforcement | M.M.1.c `oauth_state` table + M.M.1.d `verify_google_id_token` |
+| 5 | `Header(None)` NOT `Header(...)` — 401 not 422 on missing bearer | M.M.1.c `get_current_user` |
+| 6 | Quota gate BEFORE persistence + reactive token cap | Data model shipped (M.M.1.a `usage_counters`); enforcement is M.M.2 |
+
+Plus Fable's cross-phase review passes added: `is_eval` quota exemption, `/braintwin/eval_bearer_token` SSM param + Day-0 value, `google-auth` for id_token verification, consent screen "In production", `hmac.compare_digest` for join_slug (M.M.5), atomic `INSERT ... ON CONFLICT` for quota increments, bundle M.10/M.11 CDK diff into 4.1 EBS dance (deferred to M.M.2 deploy), M.M.4 estimate bump 0.5→1 day.
+
+Plus Fable's M.M.1.c/d review passes added: JWT_SECRET 32-char floor, atomic `DELETE ... RETURNING` for `consume_state` (anti-replay under WAL), `store_state` self-reaping, transaction commit for anti-replay, CSRF state-cookie double-submit binding, clock-skew 10s tolerance, `IdTokenUnavailable` distinct from `InvalidIdToken` (503 vs 401), account-rebind 403, malformed-body 401 vs 500, `_extract_bearer` dedup, `.env.example` documentation, telegram_bindings 1:1 UNIQUE index.
+
+##### Aggregate M.M.1 test count
+
+**~76 tests** across the 4 M.M.1.* substeps in the BrainTwin repo:
+- 13 in `test_storage_mm1a.py` (data model + repos)
+- 12 in `test_auth_jwt.py` (M.M.1.c)
+- 12 in `test_auth_pkce.py` (M.M.1.c)
+- 12 in `test_auth_deps.py` (M.M.1.c)
+- 8 in `test_auth_google.py` (M.M.1.d)
+- 12 in `test_auth_routes.py` (M.M.1.d)
+- ~7 additional in pre-existing test files (test_auth.py, test_recall_endpoint.py) that continued passing through the package refactor
+
+All green on Sabya's Mac; the M.M.1.d local smoke was also driven manually end-to-end against real Google.
+
+##### Deferred to M.M.2
+
+- **Route flip.** Every `Depends(require_bearer_token)` on `/capture`, `/recall`, `/stats`, `/failures` becomes `Depends(get_current_user)`. Every hardcoded `user_id = DEFAULT_USER_ID` becomes `user_id = user.id`. Small mechanical diff; touches every route file.
+- **`check_quota()` enforcement.** The `usage_counters` machinery is built; the "call it before every /capture and /recall" wiring is M.M.2.
+- **`DELETE /account`.** The `UserRepository.delete_user` cascade is built; the route that exposes it (plus the `bump_token_version` to kill the caller's own JWT immediately) is M.M.2.
+- **Anthropic Console monthly spend cap.** External step (2-minute config on `console.anthropic.com`). Not code; scheduled for right before the first friend is onboarded (M.M.5).
+
 ### M.M.2 — Route migration + quota enforcement (~1 day)
 
 - Every route that uses `DEFAULT_USER_ID` grows a
@@ -952,6 +1070,17 @@ per-user JWT minting, §4.5.1). Treat this as optimistic and carry a
 MV3 extension sign-in are the two most likely to overrun, and this is
 an auth boundary — getting it wrong is worse than shipping it a day
 late.
+
+**Actual as of M.M.1 close (2026-07-21):** M.M.1's ~3-day estimate held
+in coded-time terms; wall-clock was ~1 week because of session
+scheduling + external Google Cloud setup + two full Fable review
+rounds (M.M.1.c and M.M.1.d). Coding effort per substep tracked to
+plan; the review cycles caught 3 would-be production bugs (login-CSRF
+state binding, `consume_state` race under WAL, clock-skew default of 0)
+and ~10 hardening improvements, none of which were in the original
+estimate — so total-elapsed being a week is closer to "estimate + review
+cost" than "underestimated coding." Rolling that lesson into M.M.2:
+assume a same-shape review round after the route flip lands.
 
 ---
 
@@ -1096,3 +1225,13 @@ screen to "In production" (avoids the shadow test-user allowlist);
 made atomic DB-side; (6) §7.2 — bundle the undeployed M.10/M.11 CDK
 diff into the Phase 4.1 EBS dance so one instance replacement covers
 both.*
+
+*Revised 2026-07-21 at M.M.1 close (M.M.1.e): added §8 "What shipped in
+M.M.1" — per-substep tables for `a`-`d` documenting every choice made
+and every fix landed from Codex (all 6) + Fable (2 review passes on
+`c` and `d`), plus test surface totals, cross-substep Codex/Fable fix
+tracker, and the deferred-to-M.M.2 list. Also revised the total-
+estimate footer with actual elapsed vs planned: ~3-day M.M.1 coding
+estimate held; ~1-week wall-clock reflects review round overhead, not
+underestimated coding. Rolling that lesson into M.M.2's planning:
+assume a same-shape review round after the route flip lands.*
